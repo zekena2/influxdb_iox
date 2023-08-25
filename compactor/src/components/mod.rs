@@ -1,19 +1,21 @@
 use std::sync::Arc;
 
 use self::{
-    changed_files_filter::ChangedFilesFilter, commit::Commit, df_plan_exec::DataFusionPlanExec,
-    df_planner::DataFusionPlanner, divide_initial::DivideInitial, file_classifier::FileClassifier,
-    ir_planner::IRPlanner, parquet_files_sink::ParquetFilesSink,
-    partition_done_sink::PartitionDoneSink, partition_files_source::PartitionFilesSource,
-    partition_filter::PartitionFilter, partition_info_source::PartitionInfoSource,
-    partition_stream::PartitionStream,
+    changed_files_filter::ChangedFilesFilter, commit::CommitToScheduler,
+    compaction_job_done_sink::CompactionJobDoneSink, compaction_job_stream::CompactionJobStream,
+    df_plan_exec::DataFusionPlanExec, df_planner::DataFusionPlanner, divide_initial::DivideInitial,
+    file_classifier::FileClassifier, ir_planner::IRPlanner, parquet_files_sink::ParquetFilesSink,
+    partition_files_source::PartitionFilesSource, partition_filter::PartitionFilter,
+    partition_info_source::PartitionInfoSource,
     post_classification_partition_filter::PostClassificationPartitionFilter,
     round_info_source::RoundInfoSource, round_split::RoundSplit, scratchpad::ScratchpadGen,
 };
 
 pub mod changed_files_filter;
-pub mod combos;
-pub mod commit;
+pub(crate) mod commit;
+pub mod compaction_job_done_sink;
+pub mod compaction_job_stream;
+pub mod compaction_jobs_source;
 pub mod df_plan_exec;
 pub mod df_planner;
 pub mod divide_initial;
@@ -21,24 +23,19 @@ pub mod file_classifier;
 pub mod file_filter;
 pub mod files_split;
 pub mod hardcoded;
-pub mod id_only_partition_filter;
 pub mod ir_planner;
 pub mod namespaces_source;
 pub mod parquet_file_sink;
 pub mod parquet_files_sink;
-pub mod partition_done_sink;
 pub mod partition_files_source;
 pub mod partition_filter;
 pub mod partition_info_source;
 pub mod partition_source;
-pub mod partition_stream;
-pub mod partitions_source;
 pub mod post_classification_partition_filter;
 pub mod report;
 pub mod round_info_source;
 pub mod round_split;
 pub mod scratchpad;
-pub mod skipped_compactions_source;
 pub mod split_or_compact;
 pub mod tables_source;
 pub mod timeout;
@@ -49,7 +46,7 @@ pub mod timeout;
 #[derive(Debug, Clone)]
 pub struct Components {
     /// Source of partitions for the compactor to compact
-    pub partition_stream: Arc<dyn PartitionStream>,
+    pub compaction_job_stream: Arc<dyn CompactionJobStream>,
     /// Source of information about a partition neededed for compaction
     pub partition_info_source: Arc<dyn PartitionInfoSource>,
     /// Source of files in a partition for compaction
@@ -60,10 +57,10 @@ pub struct Components {
     pub partition_filter: Arc<dyn PartitionFilter>,
     /// condition to avoid running out of resources during compaction
     pub post_classification_partition_filter: Arc<dyn PostClassificationPartitionFilter>,
-    /// Records "partition is done" status for given partition.
-    pub partition_done_sink: Arc<dyn PartitionDoneSink>,
-    /// Commits changes (i.e. deletion and creation) to the catalog.
-    pub commit: Arc<dyn Commit>,
+    /// Records "compaction job is done" status for given partition.
+    pub compaction_job_done_sink: Arc<dyn CompactionJobDoneSink>,
+    /// Commits changes (i.e. deletion and creation).
+    pub commit: Arc<CommitToScheduler>,
     /// Creates `PlanIR` that describes what files should be compacted and updated
     pub ir_planner: Arc<dyn IRPlanner>,
     /// Creates an Execution plan for a `PlanIR`

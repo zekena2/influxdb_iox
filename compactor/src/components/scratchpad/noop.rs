@@ -12,7 +12,7 @@ pub struct NoopScratchpadGen;
 
 impl NoopScratchpadGen {
     pub fn new() -> Self {
-        Self::default()
+        Self
     }
 }
 
@@ -33,6 +33,10 @@ struct NoopScratchpad;
 
 #[async_trait]
 impl Scratchpad for NoopScratchpad {
+    fn uuids(&self, files: &[ParquetFilePath]) -> Vec<Uuid> {
+        files.iter().map(|f| f.objest_store_id()).collect()
+    }
+
     async fn load_to_scratchpad(&self, files: &[ParquetFilePath]) -> Vec<Uuid> {
         files.iter().map(|f| f.objest_store_id()).collect()
     }
@@ -42,6 +46,8 @@ impl Scratchpad for NoopScratchpad {
     }
 
     async fn clean_from_scratchpad(&self, _files: &[ParquetFilePath]) {}
+
+    async fn clean_written_from_scratchpad(&self, _files: &[ParquetFilePath]) {}
 
     async fn clean(&self) {}
 }

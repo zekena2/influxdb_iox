@@ -1,11 +1,31 @@
-//! Implements the InfluxDB IOx Flight API and Arrow FlightSQL, based
-//! on Arrow Flight and gRPC. See [`FlightService`] for full detail.
+//! Implements the InfluxDB IOx "Native" Flight API and Arrow
+//! FlightSQL, based on Arrow Flight and gRPC. See [`FlightService`]
+//! for full detail.
 
+#![deny(rustdoc::broken_intra_doc_links, rustdoc::bare_urls, rust_2018_idioms)]
+#![allow(clippy::clone_on_ref_ptr)]
+#![warn(
+    missing_copy_implementations,
+    missing_debug_implementations,
+    clippy::explicit_iter_loop,
+    // See https://github.com/influxdata/influxdb_iox/pull/1671
+    clippy::future_not_send,
+    clippy::clone_on_ref_ptr,
+    clippy::todo,
+    clippy::dbg_macro,
+    unused_crate_dependencies
+)]
+
+use keep_alive::KeepAliveStream;
+// Workaround for "unused crate" lint false positives.
+use workspace_hack as _;
+
+mod keep_alive;
 mod request;
 
 use arrow::error::ArrowError;
 use arrow_flight::{
-    encode::{FlightDataEncoder, FlightDataEncoderBuilder},
+    encode::FlightDataEncoderBuilder,
     flight_descriptor::DescriptorType,
     flight_service_server::{FlightService as Flight, FlightServiceServer as FlightServer},
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo,
@@ -17,16 +37,19 @@ use datafusion::{error::DataFusionError, physical_plan::ExecutionPlan};
 use flightsql::FlightSQLCommand;
 use futures::{ready, Stream, StreamExt, TryStreamExt};
 use generated_types::influxdata::iox::querier::v1 as proto;
-use iox_query::{
-    exec::{ExecutionContextProvider, IOxSessionContext},
-    QueryCompletedToken, QueryNamespace,
-};
+use iox_query::{exec::IOxSessionContext, QueryCompletedToken, QueryNamespace};
 use observability_deps::tracing::{debug, info, warn};
 use prost::Message;
 use request::{IoxGetRequest, RunQuery};
 use service_common::{datafusion_error_to_tonic_code, planner::Planner, QueryNamespaceProvider};
 use snafu::{OptionExt, ResultExt, Snafu};
-use std::{fmt::Debug, pin::Pin, sync::Arc, task::Poll, time::Instant};
+use std::{
+    fmt::Debug,
+    pin::Pin,
+    sync::Arc,
+    task::Poll,
+    time::{Duration, Instant},
+};
 use tonic::{
     metadata::{AsciiMetadataValue, MetadataMap},
     Request, Response, Streaming,
@@ -46,6 +69,9 @@ const IOX_FLIGHT_SQL_DATABASE_HEADERS: [&str; 4] = [
     "bucket-name",
     "iox-namespace-name", // deprecated
 ];
+
+/// In which interval should the `DoGet` stream send empty messages as keep alive markers?
+const DO_GET_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Snafu)]
@@ -69,6 +95,7 @@ pub enum Error {
     ))]
     Query {
         namespace_name: String,
+        query: String,
         source: DataFusionError,
     },
 
@@ -93,8 +120,13 @@ pub enum Error {
     #[snafu(display("Failed to optimize record batch: {}", source))]
     Optimize { source: ArrowError },
 
+    #[snafu(display("Failed to encode schema: {}", source))]
+    EncodeSchema { source: ArrowError },
+
     #[snafu(display("Error while planning query: {}", source))]
     Planning {
+        namespace_name: String,
+        query: String,
         source: service_common::planner::Error,
     },
 
@@ -125,16 +157,18 @@ impl From<Error> for tonic::Status {
         // An explicit match on the Error enum will ensure appropriate
         // logging is handled for any new error variants.
         let msg = "Error handling Flight gRPC request";
+        let namespace = err.namespace();
+        let query = err.query();
         match err {
             Error::DatabaseNotFound { .. }
             | Error::InvalidTicket { .. }
             | Error::InvalidHandshake { .. }
             | Error::Unauthenticated { .. }
             | Error::PermissionDenied { .. }
-            // TODO(edd): this should be `debug`. Keeping at info while IOx in early development
-            | Error::InvalidDatabaseName { .. } => info!(e=%err, msg),
-            Error::Query { .. } => info!(e=%err, msg),
+            | Error::InvalidDatabaseName { .. }
+            | Error::Query { .. } => info!(e=%err, %namespace, %query, msg),
             Error::Optimize { .. }
+            | Error::EncodeSchema { .. }
             | Error::TooManyFlightSQLDatabases { .. }
             | Error::NoFlightSQLDatabase
             | Error::InvalidDatabaseHeader { .. }
@@ -143,9 +177,8 @@ impl From<Error> for tonic::Status {
             | Error::InternalCreatingTicket { .. }
             | Error::UnsupportedMessageType { .. }
             | Error::FlightSQL { .. }
-            | Error::Authz { .. }
-            => {
-                warn!(e=%err, msg)
+            | Error::Authz { .. } => {
+                warn!(e=%err, %namespace, %query, msg)
             }
         }
         err.into_status()
@@ -184,14 +217,63 @@ impl Error {
                 }
                 flightsql::Error::DataFusion { source } => datafusion_error_to_tonic_code(&source),
             },
-            Self::InternalCreatingTicket { .. } | Self::Optimize { .. } | Self::Authz { .. } => {
-                tonic::Code::Internal
-            }
+            Self::InternalCreatingTicket { .. }
+            | Self::Optimize { .. }
+            | Self::EncodeSchema { .. }
+            | Self::Authz { .. } => tonic::Code::Internal,
             Self::Unauthenticated => tonic::Code::Unauthenticated,
             Self::PermissionDenied => tonic::Code::PermissionDenied,
         };
 
         tonic::Status::new(code, msg)
+    }
+
+    /// returns the namespace name, if known, used for logging
+    fn namespace(&self) -> &str {
+        match self {
+            Error::InvalidTicket { .. }
+            | Error::InternalCreatingTicket { .. }
+            | Error::InvalidHandshake {}
+            | Error::TooManyFlightSQLDatabases { .. }
+            | Error::NoFlightSQLDatabase
+            | Error::InvalidDatabaseHeader { .. }
+            | Error::InvalidDatabaseName { .. }
+            | Error::Optimize { .. }
+            | Error::EncodeSchema { .. }
+            | Error::FlightSQL { .. }
+            | Error::Deserialization { .. }
+            | Error::UnsupportedMessageType { .. }
+            | Error::Unauthenticated
+            | Error::PermissionDenied
+            | Error::Authz { .. } => "<unknown>",
+            Error::DatabaseNotFound { namespace_name } => namespace_name,
+            Error::Query { namespace_name, .. } => namespace_name,
+            Error::Planning { namespace_name, .. } => namespace_name,
+        }
+    }
+
+    /// returns a query, if know, used for logging
+    fn query(&self) -> &str {
+        match self {
+            Error::InvalidTicket { .. }
+            | Error::InternalCreatingTicket { .. }
+            | Error::InvalidHandshake {}
+            | Error::TooManyFlightSQLDatabases { .. }
+            | Error::NoFlightSQLDatabase
+            | Error::InvalidDatabaseHeader { .. }
+            | Error::InvalidDatabaseName { .. }
+            | Error::Optimize { .. }
+            | Error::EncodeSchema { .. }
+            | Error::FlightSQL { .. }
+            | Error::Deserialization { .. }
+            | Error::UnsupportedMessageType { .. }
+            | Error::Unauthenticated
+            | Error::PermissionDenied
+            | Error::Authz { .. }
+            | Error::DatabaseNotFound { .. } => "NONE",
+            Error::Query { query, .. } => query,
+            Error::Planning { query, .. } => query,
+        }
     }
 
     fn unsupported_message_type(description: impl Into<String>) -> Self {
@@ -211,6 +293,7 @@ impl From<authz::Error> for Error {
     fn from(source: authz::Error) -> Self {
         match source {
             authz::Error::Forbidden => Self::PermissionDenied,
+            authz::Error::InvalidToken => Self::PermissionDenied,
             authz::Error::NoToken => Self::Unauthenticated,
             source => Self::Authz { source },
         }
@@ -221,6 +304,22 @@ type TonicStream<T> = Pin<Box<dyn Stream<Item = Result<T, tonic::Status>> + Send
 
 /// Concrete implementation of the IOx client protocol, implemented as
 /// a gRPC [Arrow Flight] Service API
+///
+/// Perhaps confusingly, this service also implements [FlightSQL] in
+/// addition to the IOx client protocol. This is done so clients can
+/// use the same Arrow Flight endpoint for either protocol. The
+/// difference between the two protocols is the specific messages
+/// passed to the Flight APIs (e.g. `DoGet` or `GetFlightInfo`).
+///
+/// The only way to run InfluxQL queries is to use the IOx client
+/// protocol. SQL queries can be run either using the IOx client
+/// protocol or FlightSQL.
+///
+/// Because FlightSQL is SQL specific, there is no way to specify a
+/// different language or dialect, and clients expect SQL semantics,
+/// thus it doesn't make sense to run InfluxQL over FlightSQL.
+///
+/// [FlightSQL]: https://arrow.apache.org/docs/format/FlightSql.html
 ///
 /// # Tickets
 ///
@@ -391,26 +490,35 @@ where
     async fn run_do_get(
         &self,
         span_ctx: Option<SpanContext>,
+        trace: String,
         permit: InstrumentedAsyncOwnedSemaphorePermit,
-        query: &RunQuery,
-        namespace: String,
+        query: RunQuery,
+        namespace_name: String,
+        is_debug: bool,
     ) -> Result<Response<TonicStream<FlightData>>, tonic::Status> {
         let db = self
             .server
-            .db(&namespace, span_ctx.child_span("get namespace"))
+            .db(
+                &namespace_name,
+                span_ctx.child_span("get namespace"),
+                is_debug,
+            )
             .await
             .context(DatabaseNotFoundSnafu {
-                namespace_name: &namespace,
+                namespace_name: &namespace_name,
             })?;
 
         let ctx = db.new_query_context(span_ctx);
-        let (query_completed_token, physical_plan) = match query {
+        let (query_completed_token, physical_plan) = match &query {
             RunQuery::Sql(sql_query) => {
                 let token = db.record_query(&ctx, "sql", Box::new(sql_query.clone()));
                 let plan = Planner::new(&ctx)
                     .sql(sql_query)
                     .await
-                    .context(PlanningSnafu)?;
+                    .context(PlanningSnafu {
+                        namespace_name: &namespace_name,
+                        query: query.to_string(),
+                    })?;
                 (token, plan)
             }
             RunQuery::InfluxQL(sql_query) => {
@@ -418,21 +526,43 @@ where
                 let plan = Planner::new(&ctx)
                     .influxql(sql_query)
                     .await
-                    .context(PlanningSnafu)?;
+                    .context(PlanningSnafu {
+                        namespace_name: &namespace_name,
+                        query: query.to_string(),
+                    })?;
                 (token, plan)
             }
             RunQuery::FlightSQL(msg) => {
                 let token = db.record_query(&ctx, "flightsql", Box::new(msg.to_string()));
                 let plan = Planner::new(&ctx)
-                    .flight_sql_do_get(&namespace, db, msg.clone())
+                    .flight_sql_do_get(&namespace_name, db, msg.clone())
                     .await
-                    .context(PlanningSnafu)?;
+                    .context(PlanningSnafu {
+                        namespace_name: &namespace_name,
+                        query: query.to_string(),
+                    })?;
                 (token, plan)
             }
         };
 
-        let output =
-            GetStream::new(ctx, physical_plan, namespace, query_completed_token, permit).await?;
+        let output = GetStream::new(
+            ctx,
+            physical_plan,
+            namespace_name.to_string(),
+            &query,
+            query_completed_token,
+            permit,
+        )
+        .await?;
+
+        // Log any error that happens *during* execution (other error
+        // handling in this file happen during planning)
+        let output = output.map(move |res| {
+            if let Err(e) = &res {
+                info!(%namespace_name, %query, %trace, %e, "Error executing query via DoGet");
+            }
+            res
+        });
 
         Ok(Response::new(Box::pin(output) as TonicStream<FlightData>))
     }
@@ -468,6 +598,7 @@ where
         let trace = external_span_ctx.format_jaeger();
         let span_ctx: Option<SpanContext> = request.extensions().get().cloned();
         let authz_token = get_flight_authz(request.metadata());
+        let mut is_debug = has_debug_header(request.metadata());
         let ticket = request.into_inner();
 
         // attempt to decode ticket
@@ -478,8 +609,9 @@ where
         };
 
         let request = request?;
-        let namespace_name = request.namespace_name();
+        let namespace_name = request.database();
         let query = request.query();
+        is_debug |= request.is_debug();
 
         let perms = match query {
             RunQuery::FlightSQL(cmd) => flightsql_permissions(namespace_name, cmd),
@@ -509,7 +641,14 @@ where
         );
 
         let response = self
-            .run_do_get(span_ctx, permit, query, namespace_name.to_string())
+            .run_do_get(
+                span_ctx,
+                trace.clone(),
+                permit,
+                query.clone(),
+                namespace_name.to_string(),
+                is_debug,
+            )
             .await;
 
         if let Err(e) = &response {
@@ -582,6 +721,7 @@ where
         let external_span_ctx: Option<RequestLogContext> = request.extensions().get().cloned();
         let span_ctx: Option<SpanContext> = request.extensions().get().cloned();
         let trace = external_span_ctx.format_jaeger();
+        let is_debug = has_debug_header(request.metadata());
 
         let namespace_name = get_flightsql_namespace(request.metadata())?;
         let authz_token = get_flight_authz(request.metadata());
@@ -599,7 +739,11 @@ where
 
         let db = self
             .server
-            .db(&namespace_name, span_ctx.child_span("get namespace"))
+            .db(
+                &namespace_name,
+                span_ctx.child_span("get namespace"),
+                is_debug,
+            )
             .await
             .context(DatabaseNotFoundSnafu {
                 namespace_name: &namespace_name,
@@ -607,9 +751,12 @@ where
 
         let ctx = db.new_query_context(span_ctx);
         let schema = Planner::new(&ctx)
-            .flight_sql_get_flight_info(&namespace_name, cmd.clone())
+            .flight_sql_get_flight_info_schema(&namespace_name, cmd.clone())
             .await
-            .context(PlanningSnafu);
+            .context(PlanningSnafu {
+                namespace_name: &namespace_name,
+                query: format!("{cmd:?}"),
+            });
 
         if let Err(e) = &schema {
             info!(%namespace_name, %cmd, %trace, %e, "Error running GetFlightInfo");
@@ -619,34 +766,18 @@ where
         let schema = schema?;
 
         // Form the response ticket (that the client will pass back to DoGet)
-        let ticket = IoxGetRequest::new(&namespace_name, RunQuery::FlightSQL(cmd))
+        let ticket = IoxGetRequest::new(&namespace_name, RunQuery::FlightSQL(cmd), is_debug)
             .try_encode()
             .context(InternalCreatingTicketSnafu)?;
 
-        // Flight says "Set these to -1 if unknown."
-        //
-        // https://github.com/apache/arrow-rs/blob/a0a5880665b1836890f6843b6b8772d81c463351/format/Flight.proto#L274-L276
-        let total_records = -1;
-        let total_bytes = -1;
+        let endpoint = FlightEndpoint::new().with_ticket(ticket);
 
-        let endpoint = vec![FlightEndpoint {
-            ticket: Some(ticket),
-            // "If the list is empty, the expectation is that the
-            // ticket can only be redeemed on the current service
-            // where the ticket was generated."
-            //
-            // https://github.com/apache/arrow-rs/blob/a0a5880665b1836890f6843b6b8772d81c463351/format/Flight.proto#L292-L294
-            location: vec![],
-        }];
-
-        let flight_info = FlightInfo {
-            schema,
+        let flight_info = FlightInfo::new()
+            .with_endpoint(endpoint)
             // return descriptor we were passed
-            flight_descriptor: Some(flight_descriptor),
-            endpoint,
-            total_records,
-            total_bytes,
-        };
+            .with_descriptor(flight_descriptor)
+            .try_with_schema(schema.as_ref())
+            .context(EncodeSchemaSnafu)?;
 
         Ok(tonic::Response::new(flight_info))
     }
@@ -667,6 +798,7 @@ where
         let external_span_ctx: Option<RequestLogContext> = request.extensions().get().cloned();
         let span_ctx: Option<SpanContext> = request.extensions().get().cloned();
         let trace = external_span_ctx.format_jaeger();
+        let is_debug = has_debug_header(request.metadata());
 
         let namespace_name = get_flightsql_namespace(request.metadata())?;
         let authz_token = get_flight_authz(request.metadata());
@@ -688,7 +820,11 @@ where
 
         let db = self
             .server
-            .db(&namespace_name, span_ctx.child_span("get namespace"))
+            .db(
+                &namespace_name,
+                span_ctx.child_span("get namespace"),
+                is_debug,
+            )
             .await
             .context(DatabaseNotFoundSnafu {
                 namespace_name: &namespace_name,
@@ -698,15 +834,12 @@ where
         let body = Planner::new(&ctx)
             .flight_sql_do_action(&namespace_name, db, cmd.clone())
             .await
-            .context(PlanningSnafu);
+            .context(PlanningSnafu {
+                namespace_name: &namespace_name,
+                query: format!("{cmd:?}"),
+            })?;
 
-        if let Err(e) = &body {
-            info!(%namespace_name, %cmd, %trace, %e, "Error running DoAction");
-        } else {
-            debug!(%namespace_name, %cmd, %trace, "Completed DoAction request");
-        };
-
-        let result = arrow_flight::Result { body: body? };
+        let result = arrow_flight::Result { body };
         let stream = futures::stream::iter([Ok(result)]);
 
         Ok(Response::new(stream.boxed()))
@@ -810,10 +943,20 @@ fn flightsql_permissions(namespace_name: &str, cmd: &FlightSQLCommand) -> Vec<au
     vec![authz::Permission::ResourceAction(resource, action)]
 }
 
+/// Check if request has IOx debug header set.
+fn has_debug_header(metadata: &MetadataMap) -> bool {
+    metadata
+        .get("iox-debug")
+        .and_then(|s| s.to_str().ok())
+        .map(|s| s.to_lowercase())
+        .map(|s| matches!(s.as_str(), "1" | "on" | "yes" | "y" | "true" | "t"))
+        .unwrap_or_default()
+}
+
 /// Wrapper over a FlightDataEncodeStream that adds IOx specfic
 /// metadata and records completion
 struct GetStream {
-    inner: FlightDataEncoder,
+    inner: KeepAliveStream,
     #[allow(dead_code)]
     permit: InstrumentedAsyncOwnedSemaphorePermit,
     query_completed_token: QueryCompletedToken,
@@ -825,6 +968,7 @@ impl GetStream {
         ctx: IOxSessionContext,
         physical_plan: Arc<dyn ExecutionPlan>,
         namespace_name: String,
+        query: &RunQuery,
         query_completed_token: QueryCompletedToken,
         permit: InstrumentedAsyncOwnedSemaphorePermit,
     ) -> Result<Self, tonic::Status> {
@@ -837,6 +981,7 @@ impl GetStream {
             .await
             .context(QuerySnafu {
                 namespace_name: namespace_name.clone(),
+                query: query.to_string(),
             })?
             .map_err(|e| {
                 let code = datafusion_error_to_tonic_code(&e);
@@ -848,6 +993,9 @@ impl GetStream {
             .with_schema(schema)
             .with_metadata(app_metadata.encode_to_vec().into())
             .build(query_results);
+
+        // add keep alive
+        let inner = KeepAliveStream::new(inner, DO_GET_KEEP_ALIVE_INTERVAL);
 
         Ok(Self {
             inner,
@@ -888,7 +1036,6 @@ impl Stream for GetStream {
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use arrow_flight::sql::ProstMessageExt;
@@ -1075,6 +1222,7 @@ mod tests {
                 Some(token) => match (&token as &dyn AsRef<[u8]>).as_ref() {
                     b"GOOD" => Ok(perms.to_vec()),
                     b"BAD" => Err(authz::Error::Forbidden),
+                    b"INVALID" => Err(authz::Error::InvalidToken),
                     b"UGLY" => Err(authz::Error::verification("test", "test error")),
                     _ => panic!("unexpected token"),
                 },
@@ -1086,7 +1234,7 @@ mod tests {
     #[tokio::test]
     async fn do_get_authz() {
         let test_storage = Arc::new(TestDatabaseStore::default());
-        test_storage.clone().db_or_create("bananas").await;
+        test_storage.db_or_create("bananas").await;
 
         let svc = FlightService {
             server: Arc::clone(&test_storage),
@@ -1110,7 +1258,7 @@ mod tests {
             authorization: &'static str,
         ) -> tonic::Request<arrow_flight::Ticket> {
             let mut req = tonic::Request::new(
-                IoxGetRequest::new("bananas".to_string(), query)
+                IoxGetRequest::new("bananas".to_string(), query, false)
                     .try_encode()
                     .unwrap(),
             );
@@ -1151,6 +1299,12 @@ mod tests {
             sql_request("Bearer BAD"),
         )
         .await;
+        assert_code(
+            &svc,
+            tonic::Code::PermissionDenied,
+            sql_request("Bearer INVALID"),
+        )
+        .await;
         assert_code(&svc, tonic::Code::Internal, sql_request("Bearer UGLY")).await;
 
         assert_code(&svc, tonic::Code::Unauthenticated, influxql_request("")).await;
@@ -1188,7 +1342,7 @@ mod tests {
     #[tokio::test]
     async fn get_flight_info_authz() {
         let test_storage = Arc::new(TestDatabaseStore::default());
-        test_storage.clone().db_or_create("bananas").await;
+        test_storage.db_or_create("bananas").await;
 
         let svc = FlightService {
             server: Arc::clone(&test_storage),

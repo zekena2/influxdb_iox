@@ -64,7 +64,7 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use chrono::Utc;
-    use data_types::{NamespaceId, PartitionId, TableId};
+    use data_types::{NamespaceId, PartitionId, TableId, TransitionPartitionId};
     use object_store::path::Path;
     use parquet_file::ParquetFilePath;
     use std::time::Duration;
@@ -133,6 +133,7 @@ mod tests {
                 location: new_object_meta_location(),
                 last_modified: Utc::now(),
                 size: 0,
+                e_tag: None,
             };
             os.put(&object_meta.location, Bytes::from(i.to_string()))
                 .await
@@ -146,7 +147,7 @@ mod tests {
         ParquetFilePath::new(
             NamespaceId::new(1),
             TableId::new(2),
-            PartitionId::new(4),
+            &TransitionPartitionId::Deprecated(PartitionId::new(4)),
             Uuid::new_v4(),
         )
         .object_store_path()

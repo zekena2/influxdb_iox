@@ -2,8 +2,11 @@ use std::{fmt::Debug, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use data_types::{
-    sequence_number_set::SequenceNumberSet, NamespaceId, ParquetFileParams, PartitionId, TableId,
+    sequence_number_set::SequenceNumberSet, NamespaceId, ParquetFileParams, TableId,
+    TransitionPartitionId,
 };
+
+use crate::wal::reference_tracker::WalReferenceHandle;
 
 /// An abstract observer of persistence completion events.
 ///
@@ -17,7 +20,7 @@ use data_types::{
 /// [`PartitionData::mark_persisted()`]:
 ///     crate::buffer_tree::partition::PartitionData::mark_persisted()
 #[async_trait]
-pub(crate) trait PersistCompletionObserver: Send + Sync + Debug {
+pub trait PersistCompletionObserver: Send + Sync + Debug {
     /// Observe the [`CompletedPersist`] notification for the newly persisted
     /// data.
     async fn persist_complete(&self, note: Arc<CompletedPersist>);
@@ -52,9 +55,9 @@ impl CompletedPersist {
         self.meta.table_id
     }
 
-    /// Returns the [`PartitionId`] of the persisted data.
-    pub(crate) fn partition_id(&self) -> PartitionId {
-        self.meta.partition_id
+    /// Returns the [`TransitionPartitionId`] of the persisted data.
+    pub(crate) fn partition_id(&self) -> &TransitionPartitionId {
+        &self.meta.partition_id
     }
 
     /// Returns the [`SequenceNumberSet`] of the persisted data.
@@ -106,8 +109,8 @@ impl CompletedPersist {
 }
 
 /// A no-op implementation of the [`PersistCompletionObserver`] trait.
-#[derive(Debug, Default)]
-pub(crate) struct NopObserver;
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NopObserver;
 
 #[async_trait]
 impl PersistCompletionObserver for NopObserver {
@@ -123,6 +126,13 @@ where
 {
     async fn persist_complete(&self, note: Arc<CompletedPersist>) {
         (**self).persist_complete(note).await
+    }
+}
+
+#[async_trait]
+impl PersistCompletionObserver for WalReferenceHandle {
+    async fn persist_complete(&self, note: Arc<CompletedPersist>) {
+        self.enqueue_persist_notification(note).await
     }
 }
 
@@ -156,19 +166,17 @@ pub(crate) mod mock {
 
 #[cfg(test)]
 mod tests {
-    use data_types::{ColumnId, ColumnSet, SequenceNumber, Timestamp};
-
     use super::*;
-
-    const NAMESPACE_ID: NamespaceId = NamespaceId::new(1);
-    const TABLE_ID: TableId = TableId::new(1);
-    const PARTITION_ID: PartitionId = PartitionId::new(1);
+    use crate::test_util::{
+        ARBITRARY_NAMESPACE_ID, ARBITRARY_TABLE_ID, ARBITRARY_TRANSITION_PARTITION_ID,
+    };
+    use data_types::{ColumnId, ColumnSet, SequenceNumber, Timestamp};
 
     fn arbitrary_file_meta() -> ParquetFileParams {
         ParquetFileParams {
-            namespace_id: NAMESPACE_ID,
-            table_id: TABLE_ID,
-            partition_id: PARTITION_ID,
+            namespace_id: ARBITRARY_NAMESPACE_ID,
+            table_id: ARBITRARY_TABLE_ID,
+            partition_id: ARBITRARY_TRANSITION_PARTITION_ID.clone(),
             object_store_id: Default::default(),
             min_time: Timestamp::new(42),
             max_time: Timestamp::new(42),
@@ -220,7 +228,7 @@ mod tests {
 
         assert_eq!(note.namespace_id(), meta.namespace_id);
         assert_eq!(note.table_id(), meta.table_id);
-        assert_eq!(note.partition_id(), meta.partition_id);
+        assert_eq!(note.partition_id(), &meta.partition_id);
 
         assert_eq!(note.column_count(), meta.column_set.len());
         assert_eq!(note.row_count(), meta.row_count as usize);

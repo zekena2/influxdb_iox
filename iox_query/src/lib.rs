@@ -5,30 +5,34 @@
     clippy::explicit_iter_loop,
     clippy::use_self,
     clippy::clone_on_ref_ptr,
+    // See https://github.com/influxdata/influxdb_iox/pull/1671
     clippy::future_not_send,
     clippy::todo,
-    clippy::dbg_macro
+    clippy::dbg_macro,
+    unused_crate_dependencies
 )]
+
+// Workaround for "unused crate" lint false positives.
+use workspace_hack as _;
 
 use arrow::{
     datatypes::{DataType, Field},
     record_batch::RecordBatch,
 };
 use async_trait::async_trait;
-use data_types::{ChunkId, ChunkOrder, DeletePredicate, InfluxDbType, PartitionId, TableSummary};
-use datafusion::{error::DataFusionError, prelude::SessionContext};
-use exec::{stringset::StringSet, IOxSessionContext};
-use hashbrown::HashMap;
-use observability_deps::tracing::{debug, trace};
+use data_types::{ChunkId, ChunkOrder, TransitionPartitionId};
+use datafusion::{
+    error::DataFusionError,
+    physical_plan::Statistics,
+    prelude::{Expr, SessionContext},
+};
+use exec::IOxSessionContext;
 use once_cell::sync::Lazy;
 use parquet_file::storage::ParquetExecInput;
-use predicate::{rpc_predicate::QueryNamespaceMeta, Predicate, PredicateMatch};
-use schema::{
-    sort::{SortKey, SortKeyBuilder},
-    Projection, Schema, TIME_COLUMN_NAME,
-};
-use std::{any::Any, collections::BTreeSet, fmt::Debug, iter::FromIterator, sync::Arc};
+use schema::{sort::SortKey, Projection, Schema};
+use std::{any::Any, fmt::Debug, sync::Arc};
 
+pub mod chunk_statistics;
 pub mod config;
 pub mod exec;
 pub mod frontend;
@@ -40,7 +44,6 @@ pub mod pruning;
 pub mod statistics;
 pub mod util;
 
-pub use frontend::common::ScanPlanBuilder;
 pub use query_functions::group_by::{Aggregate, WindowDuration};
 
 /// The name of the virtual column that represents the chunk order.
@@ -54,52 +57,41 @@ pub fn chunk_order_field() -> Arc<Field> {
     Arc::clone(&CHUNK_ORDER_FIELD)
 }
 
-/// Trait for an object (designed to be a Chunk) which can provide
-/// metadata
-pub trait QueryChunkMeta {
-    /// Return a summary of the data
-    fn summary(&self) -> Arc<TableSummary>;
+/// A single chunk of data.
+pub trait QueryChunk: Debug + Send + Sync + 'static {
+    /// Return a statistics of the data
+    fn stats(&self) -> Arc<Statistics>;
 
     /// return a reference to the summary of the data held in this chunk
     fn schema(&self) -> &Schema;
 
-    /// Return partition id for this chunk
-    fn partition_id(&self) -> PartitionId;
+    /// Return partition identifier for this chunk
+    fn partition_id(&self) -> &TransitionPartitionId;
 
     /// return a reference to the sort key if any
     fn sort_key(&self) -> Option<&SortKey>;
 
-    /// return a reference to delete predicates of the chunk
-    fn delete_predicates(&self) -> &[Arc<DeletePredicate>];
+    /// returns the Id of this chunk. Ids are unique within a
+    /// particular partition.
+    fn id(&self) -> ChunkId;
 
-    /// return true if the chunk has delete predicates
-    fn has_delete_predicates(&self) -> bool {
-        !self.delete_predicates().is_empty()
-    }
+    /// Returns true if the chunk may contain a duplicate "primary
+    /// key" within itself
+    fn may_contain_pk_duplicates(&self) -> bool;
 
-    /// return column names participating in the all delete predicates
-    /// in lexicographical order with one exception that time column is last
-    /// This order is to be consistent with Schema::primary_key
-    fn delete_predicate_columns(&self) -> Vec<&str> {
-        // get all column names but time
-        let mut col_names = BTreeSet::new();
-        for pred in self.delete_predicates() {
-            for expr in &pred.exprs {
-                if expr.column != schema::TIME_COLUMN_NAME {
-                    col_names.insert(expr.column.as_str());
-                }
-            }
-        }
+    /// Provides access to raw [`QueryChunk`] data.
+    ///
+    /// The engine assume that minimal work shall be performed to gather the `QueryChunkData`.
+    fn data(&self) -> QueryChunkData;
 
-        // convert to vector
-        let mut column_names = Vec::from_iter(col_names);
+    /// Returns chunk type. Useful in tests and debug logs.
+    fn chunk_type(&self) -> &str;
 
-        // Now add time column to the end of the vector
-        // Since time range is a must in the delete predicate, time column must be in this list
-        column_names.push(TIME_COLUMN_NAME);
+    /// Order of this chunk relative to other overlapping chunks.
+    fn order(&self) -> ChunkOrder;
 
-        column_names
-    }
+    /// Return backend as [`Any`] which can be used to downcast to a specific implementation.
+    fn as_any(&self) -> &dyn Any;
 }
 
 /// A `QueryCompletedToken` is returned by `record_query` implementations of
@@ -154,11 +146,11 @@ pub type QueryText = Box<dyn std::fmt::Display + Send + Sync>;
 ///
 /// Namespaces store data organized by partitions and each partition stores data in Chunks.
 #[async_trait]
-pub trait QueryNamespace: QueryNamespaceMeta + Debug + Send + Sync {
+pub trait QueryNamespace: Debug + Send + Sync {
     /// Returns a set of chunks within the partition with data that may match the provided
-    /// predicate.
+    /// filter expression.
     ///
-    /// If possible, chunks which have no rows that can possibly match the predicate may be omitted.
+    /// If possible, chunks which have no rows that can possibly match the filter may be omitted.
     ///
     /// If projection is `None`, returned chunks will include all columns of its original data.
     /// Otherwise, returned chunks will include PK columns (tags and time) and columns specified in
@@ -167,10 +159,22 @@ pub trait QueryNamespace: QueryNamespaceMeta + Debug + Send + Sync {
     async fn chunks(
         &self,
         table_name: &str,
-        predicate: &Predicate,
+        filters: &[Expr],
         projection: Option<&Vec<usize>>,
         ctx: IOxSessionContext,
     ) -> Result<Vec<Arc<dyn QueryChunk>>, DataFusionError>;
+
+    /// Retention cutoff time.
+    ///
+    /// This gives the timestamp (NOT the duration) at which data should be cut off. This should result in an additional
+    /// filter of the following form:
+    ///
+    /// ```text
+    /// time >= retention_time_ns
+    /// ```
+    ///
+    /// Returns `None` if now retention policy was defined.
+    fn retention_time_ns(&self) -> Option<i64>;
 
     /// Record that particular type of query was run / planned
     fn record_query(
@@ -180,10 +184,8 @@ pub trait QueryNamespace: QueryNamespaceMeta + Debug + Send + Sync {
         query_text: QueryText,
     ) -> QueryCompletedToken;
 
-    /// Upcast to [`QueryNamespaceMeta`].
-    ///
-    /// This is required until <https://github.com/rust-lang/rust/issues/65991> is fixed.
-    fn as_meta(&self) -> &dyn QueryNamespaceMeta;
+    /// Returns a new execution context suitable for running queries
+    fn new_query_context(&self, span_ctx: Option<trace::ctx::SpanContext>) -> IOxSessionContext;
 }
 
 /// Raw data of a [`QueryChunk`].
@@ -191,7 +193,7 @@ pub trait QueryNamespace: QueryNamespaceMeta + Debug + Send + Sync {
 pub enum QueryChunkData {
     /// In-memory record batches.
     ///
-    /// **IMPORTANT: All batches MUST have the schema that the [chunk reports](QueryChunkMeta::schema).**
+    /// **IMPORTANT: All batches MUST have the schema that the [chunk reports](QueryChunk::schema).**
     RecordBatches(Vec<RecordBatch>),
 
     /// Parquet file.
@@ -225,87 +227,19 @@ impl QueryChunkData {
     }
 }
 
-/// Collection of data that shares the same partition key
-pub trait QueryChunk: QueryChunkMeta + Debug + Send + Sync + 'static {
-    /// returns the Id of this chunk. Ids are unique within a
-    /// particular partition.
-    fn id(&self) -> ChunkId;
-
-    /// Returns true if the chunk may contain a duplicate "primary
-    /// key" within itself
-    fn may_contain_pk_duplicates(&self) -> bool;
-
-    /// Returns the result of applying the `predicate` to the chunk
-    /// using an efficient, but inexact method, based on metadata.
-    ///
-    /// NOTE: This method is suitable for calling during planning, and
-    /// may return PredicateMatch::Unknown for certain types of
-    /// predicates.
-    fn apply_predicate_to_metadata(
-        &self,
-        ctx: &IOxSessionContext,
-        predicate: &Predicate,
-    ) -> Result<PredicateMatch, DataFusionError> {
-        let state = ctx.inner().state();
-        Ok(predicate.apply_to_table_summary(
-            state.execution_props(),
-            &self.summary(),
-            self.schema().as_arrow(),
-        ))
-    }
-
-    /// Returns a set of Strings with column names from the specified
-    /// table that have at least one row that matches `predicate`, if
-    /// the predicate can be evaluated entirely on the metadata of
-    /// this Chunk. Returns `None` otherwise
-    fn column_names(
-        &self,
-        ctx: IOxSessionContext,
-        predicate: &Predicate,
-        columns: Projection<'_>,
-    ) -> Result<Option<StringSet>, DataFusionError>;
-
-    /// Return a set of Strings containing the distinct values in the
-    /// specified columns. If the predicate can be evaluated entirely
-    /// on the metadata of this Chunk. Returns `None` otherwise
-    ///
-    /// The requested columns must all have String type.
-    fn column_values(
-        &self,
-        ctx: IOxSessionContext,
-        column_name: &str,
-        predicate: &Predicate,
-    ) -> Result<Option<StringSet>, DataFusionError>;
-
-    /// Provides access to raw [`QueryChunk`] data.
-    ///
-    /// The engine assume that minimal work shall be performed to gather the `QueryChunkData`.
-    fn data(&self) -> QueryChunkData;
-
-    /// Returns chunk type. Useful in tests and debug logs.
-    fn chunk_type(&self) -> &str;
-
-    /// Order of this chunk relative to other overlapping chunks.
-    fn order(&self) -> ChunkOrder;
-
-    /// Return backend as [`Any`] which can be used to downcast to a specific implementation.
-    fn as_any(&self) -> &dyn Any;
-}
-
-/// Implement ChunkMeta for something wrapped in an Arc (like Chunks often are)
-impl<P> QueryChunkMeta for Arc<P>
+impl<P> QueryChunk for Arc<P>
 where
-    P: QueryChunkMeta,
+    P: QueryChunk,
 {
-    fn summary(&self) -> Arc<TableSummary> {
-        self.as_ref().summary()
+    fn stats(&self) -> Arc<Statistics> {
+        self.as_ref().stats()
     }
 
     fn schema(&self) -> &Schema {
         self.as_ref().schema()
     }
 
-    fn partition_id(&self) -> PartitionId {
+    fn partition_id(&self) -> &TransitionPartitionId {
         self.as_ref().partition_id()
     }
 
@@ -313,24 +247,42 @@ where
         self.as_ref().sort_key()
     }
 
-    fn delete_predicates(&self) -> &[Arc<DeletePredicate>] {
-        let pred = self.as_ref().delete_predicates();
-        debug!(?pred, "Delete predicate in QueryChunkMeta");
-        pred
+    fn id(&self) -> ChunkId {
+        self.as_ref().id()
+    }
+
+    fn may_contain_pk_duplicates(&self) -> bool {
+        self.as_ref().may_contain_pk_duplicates()
+    }
+
+    fn data(&self) -> QueryChunkData {
+        self.as_ref().data()
+    }
+
+    fn chunk_type(&self) -> &str {
+        self.as_ref().chunk_type()
+    }
+
+    fn order(&self) -> ChunkOrder {
+        self.as_ref().order()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        // present the underlying implementation, not the wrapper
+        self.as_ref().as_any()
     }
 }
 
-/// Implement `ChunkMeta` for `Arc<dyn QueryChunk>`
-impl QueryChunkMeta for Arc<dyn QueryChunk> {
-    fn summary(&self) -> Arc<TableSummary> {
-        self.as_ref().summary()
+impl QueryChunk for Arc<dyn QueryChunk> {
+    fn stats(&self) -> Arc<Statistics> {
+        self.as_ref().stats()
     }
 
     fn schema(&self) -> &Schema {
         self.as_ref().schema()
     }
 
-    fn partition_id(&self) -> PartitionId {
+    fn partition_id(&self) -> &TransitionPartitionId {
         self.as_ref().partition_id()
     }
 
@@ -338,10 +290,29 @@ impl QueryChunkMeta for Arc<dyn QueryChunk> {
         self.as_ref().sort_key()
     }
 
-    fn delete_predicates(&self) -> &[Arc<DeletePredicate>] {
-        let pred = self.as_ref().delete_predicates();
-        debug!(?pred, "Delete predicate in QueryChunkMeta");
-        pred
+    fn id(&self) -> ChunkId {
+        self.as_ref().id()
+    }
+
+    fn may_contain_pk_duplicates(&self) -> bool {
+        self.as_ref().may_contain_pk_duplicates()
+    }
+
+    fn data(&self) -> QueryChunkData {
+        self.as_ref().data()
+    }
+
+    fn chunk_type(&self) -> &str {
+        self.as_ref().chunk_type()
+    }
+
+    fn order(&self) -> ChunkOrder {
+        self.as_ref().order()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        // present the underlying implementation, not the wrapper
+        self.as_ref().as_any()
     }
 }
 
@@ -353,69 +324,11 @@ pub fn chunks_have_distinct_counts<'a>(
     // do not need to compute potential duplicates. We will treat
     // as all of them have duplicates
     chunks.into_iter().all(|chunk| {
-        chunk
-            .summary()
-            .columns
-            .iter()
-            .all(|col| col.stats.distinct_count().is_some())
+        let Some(col_stats) = &chunk
+            .stats()
+            .column_statistics else {return false};
+        col_stats.iter().all(|col| col.distinct_count.is_some())
     })
-}
-
-pub fn compute_sort_key_for_chunks<'a>(
-    schema: &Schema,
-    chunks: impl Copy + IntoIterator<Item = &'a Arc<dyn QueryChunk>>,
-) -> SortKey {
-    if !chunks_have_distinct_counts(chunks) {
-        // chunks have not enough stats, return its pk that is
-        // sorted lexicographically but time column always last
-        SortKey::from_columns(schema.primary_key())
-    } else {
-        let summaries = chunks.into_iter().map(|x| x.summary());
-        compute_sort_key(summaries)
-    }
-}
-
-/// Compute a sort key that orders lower _estimated_ cardinality columns first
-///
-/// In the absence of more precise information, this should yield a
-/// good ordering for RLE compression.
-///
-/// The cardinality is estimated by the sum of unique counts over all summaries. This may overestimate cardinality since
-/// it does not account for shared/repeated values.
-fn compute_sort_key(summaries: impl Iterator<Item = Arc<TableSummary>>) -> SortKey {
-    let mut cardinalities: HashMap<String, u64> = Default::default();
-    for summary in summaries {
-        for column in &summary.columns {
-            if column.influxdb_type != InfluxDbType::Tag {
-                continue;
-            }
-
-            let mut cnt = 0;
-            if let Some(count) = column.stats.distinct_count() {
-                cnt = count.get();
-            }
-            *cardinalities.entry_ref(column.name.as_str()).or_default() += cnt;
-        }
-    }
-
-    trace!(cardinalities=?cardinalities, "cardinalities of of columns to compute sort key");
-
-    let mut cardinalities: Vec<_> = cardinalities.into_iter().collect();
-    // Sort by (cardinality, column_name) to have deterministic order if same cardinality
-    cardinalities
-        .sort_by(|(name_1, card_1), (name_2, card_2)| (card_1, name_1).cmp(&(card_2, name_2)));
-
-    let mut builder = SortKeyBuilder::with_capacity(cardinalities.len() + 1);
-    for (col, _) in cardinalities {
-        builder = builder.with_col(col)
-    }
-    builder = builder.with_col(TIME_COLUMN_NAME);
-
-    let key = builder.build();
-
-    trace!(computed_sort_key=?key, "Value of sort key from compute_sort_key");
-
-    key
 }
 
 // Note: I would like to compile this module only in the 'test' cfg,

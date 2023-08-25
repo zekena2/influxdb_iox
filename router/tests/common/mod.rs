@@ -1,6 +1,6 @@
 use std::{iter, string::String, sync::Arc, time::Duration};
 
-use data_types::{DefaultPartitionTemplate, TableId};
+use data_types::TableId;
 use generated_types::influxdata::iox::ingester::v1::WriteRequest;
 use hashbrown::HashMap;
 use hyper::{Body, Request, Response};
@@ -34,6 +34,8 @@ pub const TEST_RETENTION_PERIOD: Duration = Duration::from_secs(3600);
 pub struct TestContextBuilder {
     namespace_autocreation: MissingNamespaceAction,
     single_tenancy: bool,
+    rpc_write_error_window: Duration,
+    rpc_write_num_probes: u64,
 }
 
 impl Default for TestContextBuilder {
@@ -41,6 +43,8 @@ impl Default for TestContextBuilder {
         Self {
             namespace_autocreation: MissingNamespaceAction::Reject,
             single_tenancy: false,
+            rpc_write_error_window: Duration::from_secs(5),
+            rpc_write_num_probes: 10,
         }
     }
 }
@@ -79,6 +83,8 @@ impl TestContextBuilder {
             self.single_tenancy,
             catalog,
             metrics,
+            self.rpc_write_error_window,
+            self.rpc_write_num_probes,
         )
         .await
     }
@@ -94,6 +100,8 @@ pub struct TestContext {
 
     namespace_autocreation: MissingNamespaceAction,
     single_tenancy: bool,
+    rpc_write_error_window: Duration,
+    rpc_write_num_probes: u64,
 }
 
 // This mass of words is certainly a downside of chained handlers.
@@ -133,9 +141,16 @@ impl TestContext {
         single_tenancy: bool,
         catalog: Arc<dyn Catalog>,
         metrics: Arc<metric::Registry>,
+        rpc_write_error_window: Duration,
+        rpc_write_num_probes: u64,
     ) -> Self {
         let client = Arc::new(MockWriteClient::default());
-        let rpc_writer = RpcWrite::new([(Arc::clone(&client), "mock client")], None, &metrics);
+        let rpc_writer = RpcWrite::new(
+            [(Arc::clone(&client), "mock client")],
+            1.try_into().unwrap(),
+            &metrics,
+            rpc_write_num_probes,
+        );
 
         let ns_cache = Arc::new(ReadThroughCache::new(
             Arc::new(ShardedCache::new(
@@ -149,7 +164,7 @@ impl TestContext {
 
         let retention_validator = RetentionValidator::new();
 
-        let partitioner = Partitioner::new(DefaultPartitionTemplate::default());
+        let partitioner = Partitioner::default();
 
         let namespace_resolver = NamespaceSchemaResolver::new(Arc::clone(&ns_cache));
         let namespace_resolver = NamespaceAutocreation::new(
@@ -191,6 +206,8 @@ impl TestContext {
 
             namespace_autocreation,
             single_tenancy,
+            rpc_write_error_window,
+            rpc_write_num_probes,
         }
     }
 
@@ -204,6 +221,8 @@ impl TestContext {
             self.single_tenancy,
             catalog,
             metrics,
+            self.rpc_write_error_window,
+            self.rpc_write_num_probes,
         )
         .await
     }

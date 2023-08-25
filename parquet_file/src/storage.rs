@@ -11,13 +11,16 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use bytes::Bytes;
+use data_types::TransitionPartitionId;
 use datafusion::{
-    datasource::{listing::PartitionedFile, object_store::ObjectStoreUrl},
-    error::DataFusionError,
-    physical_plan::{
-        file_format::{FileScanConfig, ParquetExec},
-        ExecutionPlan, SendableRecordBatchStream, Statistics,
+    datasource::{
+        listing::PartitionedFile,
+        object_store::ObjectStoreUrl,
+        physical_plan::{FileScanConfig, ParquetExec},
     },
+    error::DataFusionError,
+    execution::memory_pool::MemoryPool,
+    physical_plan::{ExecutionPlan, SendableRecordBatchStream, Statistics},
     prelude::SessionContext,
 };
 use datafusion_util::config::{iox_session_config, register_iox_object_store};
@@ -91,7 +94,7 @@ impl std::fmt::Display for StorageId {
 /// The files shall be grouped by [`object_store_url`](Self::object_store_url). For each each object store, you shall
 /// create one [`ParquetExec`] and put each file into its own "file group".
 ///
-/// [`ParquetExec`]: datafusion::physical_plan::file_format::ParquetExec
+/// [`ParquetExec`]: datafusion::datasource::physical_plan::ParquetExec
 #[derive(Debug, Clone)]
 pub struct ParquetExecInput {
     /// Store where the file is located.
@@ -134,7 +137,7 @@ impl ParquetExecInput {
             limit: None,
             table_partition_cols: vec![],
             // Parquet files ARE actually sorted but we don't care here since we just construct a `collect` plan.
-            output_ordering: None,
+            output_ordering: vec![vec![]],
             infinite_source: false,
         };
         let exec = ParquetExec::new(base_config, None, None);
@@ -209,6 +212,8 @@ impl ParquetStorage {
     /// Push `batches`, a stream of [`RecordBatch`] instances, to object
     /// storage.
     ///
+    /// Any buffering needed is registered with the pool
+    ///
     /// # Retries
     ///
     /// This method retries forever in the presence of object store errors. All
@@ -218,7 +223,9 @@ impl ParquetStorage {
     pub async fn upload(
         &self,
         batches: SendableRecordBatchStream,
+        partition_id: &TransitionPartitionId,
         meta: &IoxMetadata,
+        pool: Arc<dyn MemoryPool>,
     ) -> Result<(IoxParquetMetaData, usize), UploadError> {
         let start = Instant::now();
 
@@ -230,19 +237,18 @@ impl ParquetStorage {
         //
         // This is not a huge concern, as the resulting parquet files are
         // currently smallish on average.
-        let (data, parquet_file_meta) = serialize::to_parquet_bytes(batches, meta).await?;
+        let (data, parquet_file_meta) = serialize::to_parquet_bytes(batches, meta, pool).await?;
 
         // Read the IOx-specific parquet metadata from the file metadata
         let parquet_meta =
             IoxParquetMetaData::try_from(parquet_file_meta).map_err(UploadError::Metadata)?;
         trace!(
-            ?meta.partition_id,
             ?parquet_meta,
             "IoxParquetMetaData coverted from Row Group Metadata (aka FileMetaData)"
         );
 
         // Derive the correct object store path from the metadata.
-        let path = ParquetFilePath::from(meta).object_store_path();
+        let path = ParquetFilePath::from((partition_id, meta)).object_store_path();
 
         let file_size = data.len();
         let data = Bytes::from(data);
@@ -250,7 +256,6 @@ impl ParquetStorage {
         debug!(
             file_size,
             object_store_id=?meta.object_store_id,
-            partition_id=?meta.partition_id,
             // includes the time to run the datafusion plan (that is the batches)
             total_time_to_create_parquet_bytes=?(Instant::now() - start),
             "Uploading parquet to object store"
@@ -282,7 +287,7 @@ impl ParquetStorage {
     ///
     /// See [`ParquetExecInput`] for more information.
     ///
-    /// [`ParquetExec`]: datafusion::physical_plan::file_format::ParquetExec
+    /// [`ParquetExec`]: datafusion::datasource::physical_plan::ParquetExec
     pub fn parquet_exec_input(&self, path: &ParquetFilePath, file_size: usize) -> ParquetExecInput {
         ParquetExecInput {
             object_store_url: ObjectStoreUrl::parse(format!("iox://{}/", self.id))
@@ -292,6 +297,7 @@ impl ParquetStorage {
                 // we don't care about the "last modified" field
                 last_modified: Default::default(),
                 size: file_size,
+                e_tag: None,
             },
         }
     }
@@ -320,12 +326,12 @@ pub enum ProjectionError {
 mod tests {
     use super::*;
     use arrow::{
-        array::{ArrayRef, Int64Array, StringArray},
+        array::{ArrayRef, BinaryArray, Int64Array, StringArray},
         record_batch::RecordBatch,
     };
     use data_types::{CompactionLevel, NamespaceId, PartitionId, TableId};
     use datafusion::common::DataFusionError;
-    use datafusion_util::MemoryStream;
+    use datafusion_util::{unbounded_memory_pool, MemoryStream};
     use iox_time::Time;
     use std::collections::HashMap;
 
@@ -335,11 +341,11 @@ mod tests {
 
         let store = ParquetStorage::new(object_store, StorageId::from("iox"));
 
-        let meta = meta();
+        let (partition_id, meta) = meta();
         let batch = RecordBatch::try_from_iter([("a", to_string_array(&["value"]))]).unwrap();
 
         // Serialize & upload the record batches.
-        let (file_meta, _file_size) = upload(&store, &meta, batch.clone()).await;
+        let (file_meta, _file_size) = upload(&store, &partition_id, &meta, batch.clone()).await;
 
         // Extract the various bits of metadata.
         let file_meta = file_meta.decode().expect("should decode parquet metadata");
@@ -436,13 +442,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_schema_check_fail_different_types() {
-        let batch = RecordBatch::try_from_iter([("a", to_string_array(&["value"]))]).unwrap();
+        let batch = RecordBatch::try_from_iter([("a", to_binary_array(&["value"]))]).unwrap();
         let other_batch = RecordBatch::try_from_iter([("a", to_int_array(&[1]))]).unwrap();
         let schema = batch.schema();
         assert_schema_check_fail(
             other_batch,
             schema,
-            "Execution error: Failed to map column projection for field a. Incompatible data types Int64 and Utf8",
+            "Error during planning: Cannot cast file schema field a of type Int64 to table schema field of type Binary",
         ).await;
     }
 
@@ -480,12 +486,12 @@ mod tests {
 
         let store = ParquetStorage::new(object_store, StorageId::from("iox"));
 
-        let meta = meta();
+        let (partition_id, meta) = meta();
         let batch = RecordBatch::try_from_iter([("a", to_string_array(&["value"]))]).unwrap();
         let schema = batch.schema();
 
         // Serialize & upload the record batches.
-        let (_iox_md, file_size) = upload(&store, &meta, batch).await;
+        let (_iox_md, file_size) = upload(&store, &partition_id, &meta, batch).await;
 
         // add metadata to reference schema
         let schema = Arc::new(
@@ -494,9 +500,16 @@ mod tests {
                 .clone()
                 .with_metadata(HashMap::from([(String::from("foo"), String::from("bar"))])),
         );
-        download(&store, &meta, Projection::All, schema, file_size)
-            .await
-            .unwrap();
+        download(
+            &store,
+            &partition_id,
+            &meta,
+            Projection::All,
+            schema,
+            file_size,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -505,7 +518,7 @@ mod tests {
 
         let store = ParquetStorage::new(object_store, StorageId::from("iox"));
 
-        let meta = meta();
+        let (partition_id, meta) = meta();
         let batch = RecordBatch::try_from_iter([("a", to_string_array(&["value"]))]).unwrap();
         let schema = batch.schema();
         // add metadata to stored batch
@@ -521,11 +534,18 @@ mod tests {
         .unwrap();
 
         // Serialize & upload the record batches.
-        let (_iox_md, file_size) = upload(&store, &meta, batch).await;
+        let (_iox_md, file_size) = upload(&store, &partition_id, &meta, batch).await;
 
-        download(&store, &meta, Projection::All, schema, file_size)
-            .await
-            .unwrap();
+        download(
+            &store,
+            &partition_id,
+            &meta,
+            Projection::All,
+            schema,
+            file_size,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -564,47 +584,56 @@ mod tests {
         Arc::new(array)
     }
 
+    fn to_binary_array(strs: &[&str]) -> ArrayRef {
+        let array: BinaryArray = strs.iter().map(|s| Some(*s)).collect();
+        Arc::new(array)
+    }
+
     fn to_int_array(vals: &[i64]) -> ArrayRef {
         let array: Int64Array = vals.iter().map(|v| Some(*v)).collect();
         Arc::new(array)
     }
 
-    fn meta() -> IoxMetadata {
-        IoxMetadata {
-            object_store_id: Default::default(),
-            creation_timestamp: Time::from_timestamp_nanos(42),
-            namespace_id: NamespaceId::new(1),
-            namespace_name: "bananas".into(),
-            table_id: TableId::new(3),
-            table_name: "platanos".into(),
-            partition_id: PartitionId::new(4),
-            partition_key: "potato".into(),
-            compaction_level: CompactionLevel::FileNonOverlapped,
-            sort_key: None,
-            max_l0_created_at: Time::from_timestamp_nanos(42),
-        }
+    fn meta() -> (TransitionPartitionId, IoxMetadata) {
+        (
+            TransitionPartitionId::Deprecated(PartitionId::new(4)),
+            IoxMetadata {
+                object_store_id: Default::default(),
+                creation_timestamp: Time::from_timestamp_nanos(42),
+                namespace_id: NamespaceId::new(1),
+                namespace_name: "bananas".into(),
+                table_id: TableId::new(3),
+                table_name: "platanos".into(),
+                partition_key: "potato".into(),
+                compaction_level: CompactionLevel::FileNonOverlapped,
+                sort_key: None,
+                max_l0_created_at: Time::from_timestamp_nanos(42),
+            },
+        )
     }
 
     async fn upload(
         store: &ParquetStorage,
+        partition_id: &TransitionPartitionId,
         meta: &IoxMetadata,
         batch: RecordBatch,
     ) -> (IoxParquetMetaData, usize) {
         let stream = Box::pin(MemoryStream::new(vec![batch]));
         store
-            .upload(stream, meta)
+            .upload(stream, partition_id, meta, unbounded_memory_pool())
             .await
             .expect("should serialize and store sucessfully")
     }
 
     async fn download<'a>(
         store: &ParquetStorage,
+        partition_id: &TransitionPartitionId,
         meta: &IoxMetadata,
         selection: Projection<'_>,
         expected_schema: SchemaRef,
         file_size: usize,
     ) -> Result<RecordBatch, DataFusionError> {
-        let path: ParquetFilePath = meta.into();
+        let path: ParquetFilePath = (partition_id, meta).into();
         store
             .parquet_exec_input(&path, file_size)
             .read_to_batches(expected_schema, selection, &store.test_df_context())
@@ -626,13 +655,20 @@ mod tests {
         let store = ParquetStorage::new(object_store, StorageId::from("iox"));
 
         // Serialize & upload the record batches.
-        let meta = meta();
-        let (_iox_md, file_size) = upload(&store, &meta, upload_batch).await;
+        let (partition_id, meta) = meta();
+        let (_iox_md, file_size) = upload(&store, &partition_id, &meta, upload_batch).await;
 
         // And compare to the original input
-        let actual_batch = download(&store, &meta, selection, expected_schema, file_size)
-            .await
-            .unwrap();
+        let actual_batch = download(
+            &store,
+            &partition_id,
+            &meta,
+            selection,
+            expected_schema,
+            file_size,
+        )
+        .await
+        .unwrap();
         assert_eq!(actual_batch, expected_batch);
     }
 
@@ -645,12 +681,19 @@ mod tests {
 
         let store = ParquetStorage::new(object_store, StorageId::from("iox"));
 
-        let meta = meta();
-        let (_iox_md, file_size) = upload(&store, &meta, persisted_batch).await;
+        let (partition_id, meta) = meta();
+        let (_iox_md, file_size) = upload(&store, &partition_id, &meta, persisted_batch).await;
 
-        let err = download(&store, &meta, Projection::All, expected_schema, file_size)
-            .await
-            .unwrap_err();
+        let err = download(
+            &store,
+            &partition_id,
+            &meta,
+            Projection::All,
+            expected_schema,
+            file_size,
+        )
+        .await
+        .unwrap_err();
 
         // And compare to the original input
         assert_eq!(err.to_string(), msg);

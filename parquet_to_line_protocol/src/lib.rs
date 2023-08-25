@@ -1,21 +1,35 @@
 //! Code that can convert between parquet files and line protocol
 
+#![deny(rustdoc::broken_intra_doc_links, rustdoc::bare_urls, rust_2018_idioms)]
+#![allow(clippy::clone_on_ref_ptr)]
+#![warn(
+    missing_copy_implementations,
+    missing_debug_implementations,
+    clippy::explicit_iter_loop,
+    // See https://github.com/influxdata/influxdb_iox/pull/1671
+    clippy::future_not_send,
+    clippy::clone_on_ref_ptr,
+    clippy::todo,
+    clippy::dbg_macro,
+    unused_crate_dependencies
+)]
+
+// Workaround for "unused crate" lint false positives.
+use workspace_hack as _;
+
 use datafusion::{
     arrow::datatypes::SchemaRef as ArrowSchemaRef,
     datasource::{
         file_format::{parquet::ParquetFormat, FileFormat},
         listing::PartitionedFile,
         object_store::ObjectStoreUrl,
+        physical_plan::{FileScanConfig, ParquetExec},
     },
     execution::{
         context::{SessionState, TaskContext},
         runtime_env::RuntimeEnv,
     },
-    physical_plan::{
-        execute_stream,
-        file_format::{FileScanConfig, ParquetExec},
-        SendableRecordBatchStream, Statistics,
-    },
+    physical_plan::{execute_stream, SendableRecordBatchStream, Statistics},
     prelude::SessionContext,
 };
 use datafusion_util::config::{iox_session_config, register_iox_object_store};
@@ -94,7 +108,7 @@ pub enum Error {
 /// protocol (aka lines are not split across the buffers)
 pub async fn convert_file<P>(path: P) -> Result<BoxStream<'static, Result<Vec<u8>>>>
 where
-    P: AsRef<Path>,
+    P: AsRef<Path> + Send,
 {
     let path = path.as_ref();
     let object_store_path =
@@ -172,6 +186,18 @@ pub struct ParquetFileReader {
     session_ctx: SessionContext,
 }
 
+impl std::fmt::Debug for ParquetFileReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParquetFileReader")
+            .field("object_store", &self.object_store)
+            .field("object_store_url", &self.object_store_url)
+            .field("object_meta", &self.object_meta)
+            .field("schema", &self.schema)
+            .field("session_ctx", &"<CONTEXT>")
+            .finish()
+    }
+}
+
 impl ParquetFileReader {
     /// Find and open the specified parquet file, and read its metadata / schema
     pub async fn try_new(
@@ -224,7 +250,7 @@ impl ParquetFileReader {
             projection: None,
             limit: None,
             table_partition_cols: vec![],
-            output_ordering: None,
+            output_ordering: vec![vec![]],
             infinite_source: false,
         };
 

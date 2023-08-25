@@ -5,17 +5,20 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use data_types::{
-    Column, ColumnSet, ColumnType, ColumnsByName, CompactionLevel, Namespace, NamespaceName,
-    NamespaceSchema, ParquetFile, ParquetFileParams, Partition, PartitionId, Table, TableId,
-    TableSchema, Timestamp,
+    partition_template::TablePartitionTemplateOverride, Column, ColumnSet, ColumnType,
+    ColumnsByName, CompactionLevel, Namespace, NamespaceName, NamespaceSchema, ParquetFile,
+    ParquetFileParams, Partition, PartitionId, SortedColumnSet, Table, TableId, TableSchema,
+    Timestamp, TransitionPartitionId,
 };
 use datafusion::physical_plan::metrics::Count;
-use datafusion_util::MemoryStream;
+use datafusion_util::{unbounded_memory_pool, MemoryStream};
+use generated_types::influxdata::iox::partition_template::v1::PartitionTemplate;
 use iox_catalog::{
     interface::{
-        get_schema_by_id, get_table_columns_by_id, Catalog, PartitionRepo, SoftDeletedRows,
+        get_schema_by_id, get_table_columns_by_id, Catalog, RepoCollection, SoftDeletedRows,
     },
     mem::MemCatalog,
+    partition_lookup,
     test_helpers::arbitrary_table,
 };
 use iox_query::{
@@ -89,6 +92,7 @@ impl TestCatalog {
                     parquet_store.id(),
                     Arc::clone(parquet_store.object_store()),
                 )]),
+                metric_registry: Arc::clone(&metric_registry),
                 mem_pool_size: 1024 * 1024 * 1024,
             },
             exec,
@@ -148,7 +152,7 @@ impl TestCatalog {
         let namespace_name = NamespaceName::new(name).unwrap();
         let namespace = repos
             .namespaces()
-            .create(&namespace_name, retention_period_ns)
+            .create(&namespace_name, None, retention_period_ns, None)
             .await
             .unwrap();
 
@@ -177,17 +181,6 @@ impl TestCatalog {
             .await
             .parquet_files()
             .list_by_table_not_to_delete(table_id)
-            .await
-            .unwrap()
-    }
-
-    /// List all files including the soft deleted ones
-    pub async fn list_by_table(self: &Arc<Self>, table_id: TableId) -> Vec<ParquetFile> {
-        self.catalog
-            .repositories()
-            .await
-            .parquet_files()
-            .list_by_table(table_id)
             .await
             .unwrap()
     }
@@ -222,6 +215,35 @@ impl TestNamespace {
         let mut repos = self.catalog.catalog.repositories().await;
 
         let table = arbitrary_table(&mut *repos, name, &self.namespace).await;
+
+        Arc::new(TestTable {
+            catalog: Arc::clone(&self.catalog),
+            namespace: Arc::clone(self),
+            table,
+        })
+    }
+
+    /// Create a table in this namespace w/ given partition template
+    pub async fn create_table_with_partition_template(
+        self: &Arc<Self>,
+        name: &str,
+        template: Option<PartitionTemplate>,
+    ) -> Arc<TestTable> {
+        let mut repos = self.catalog.catalog.repositories().await;
+
+        let table = repos
+            .tables()
+            .create(
+                name,
+                TablePartitionTemplateOverride::try_new(
+                    template,
+                    &self.namespace.partition_template,
+                )
+                .unwrap(),
+                self.namespace.id,
+            )
+            .await
+            .unwrap();
 
         Arc::new(TestTable {
             catalog: Arc::clone(&self.catalog),
@@ -296,6 +318,7 @@ impl TestTable {
         self: &Arc<Self>,
         key: &str,
         sort_key: &[&str],
+        sort_key_ids: &[i64],
     ) -> Arc<TestPartition> {
         let mut repos = self.catalog.catalog.repositories().await;
 
@@ -307,7 +330,12 @@ impl TestTable {
 
         let partition = repos
             .partitions()
-            .cas_sort_key(partition.id, None, sort_key)
+            .cas_sort_key(
+                &TransitionPartitionId::Deprecated(partition.id),
+                None,
+                sort_key,
+                &SortedColumnSet::from(sort_key_ids.iter().cloned()),
+            )
             .await
             .unwrap();
 
@@ -345,7 +373,7 @@ impl TestTable {
     pub async fn catalog_schema(&self) -> TableSchema {
         TableSchema {
             id: self.table.id,
-            partition_template: None,
+            partition_template: Default::default(),
             columns: self.catalog_columns().await,
         }
     }
@@ -399,6 +427,12 @@ pub struct TestColumn {
     pub column: Column,
 }
 
+impl TestColumn {
+    pub fn id(&self) -> i64 {
+        self.column.id.get()
+    }
+}
+
 /// A test catalog with specified namespace, table, partition
 #[allow(missing_docs)]
 #[derive(Debug)]
@@ -411,18 +445,19 @@ pub struct TestPartition {
 
 impl TestPartition {
     /// Update sort key.
-    pub async fn update_sort_key(self: &Arc<Self>, sort_key: SortKey) -> Arc<Self> {
-        let old_sort_key = self
-            .catalog
-            .catalog
-            .repositories()
-            .await
-            .partitions()
-            .get_by_id(self.partition.id)
-            .await
-            .unwrap()
-            .unwrap()
-            .sort_key;
+    pub async fn update_sort_key(
+        self: &Arc<Self>,
+        sort_key: SortKey,
+        sort_key_ids: &SortedColumnSet,
+    ) -> Arc<Self> {
+        let old_sort_key = partition_lookup(
+            self.catalog.catalog.repositories().await.as_mut(),
+            &self.partition.transition_partition_id(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .sort_key;
 
         let partition = self
             .catalog
@@ -431,9 +466,10 @@ impl TestPartition {
             .await
             .partitions()
             .cas_sort_key(
-                self.partition.id,
+                &self.partition.transition_partition_id(),
                 Some(old_sort_key),
                 &sort_key.to_columns().collect::<Vec<_>>(),
+                sort_key_ids,
             )
             .await
             .unwrap();
@@ -494,7 +530,6 @@ impl TestPartition {
             namespace_name: self.namespace.namespace.name.clone().into(),
             table_id: self.table.table.id,
             table_name: self.table.table.name.clone().into(),
-            partition_id: self.partition.id,
             partition_key: self.partition.partition_key.clone(),
             compaction_level: CompactionLevel::Initial,
             sort_key: Some(sort_key.clone()),
@@ -505,6 +540,7 @@ impl TestPartition {
                 Arc::clone(&self.catalog.object_store),
                 StorageId::from("iox"),
             ),
+            &self.partition.transition_partition_id(),
             &metadata,
             record_batch.clone(),
         )
@@ -528,7 +564,12 @@ impl TestPartition {
 
         let result = self.create_parquet_file_catalog_record(builder).await;
         let mut repos = self.catalog.catalog.repositories().await;
-        update_catalog_sort_key_if_needed(repos.partitions(), self.partition.id, sort_key).await;
+        update_catalog_sort_key_if_needed(
+            repos.as_mut(),
+            &self.partition.transition_partition_id(),
+            sort_key,
+        )
+        .await;
         result
     }
 
@@ -577,7 +618,7 @@ impl TestPartition {
         let parquet_file_params = ParquetFileParams {
             namespace_id: self.namespace.namespace.id,
             table_id: self.table.table.id,
-            partition_id: self.partition.id,
+            partition_id: self.partition.transition_partition_id(),
             object_store_id: object_store_id.unwrap_or_else(Uuid::new_v4),
             min_time: Timestamp::new(min_time),
             max_time: Timestamp::new(max_time),
@@ -599,7 +640,7 @@ impl TestPartition {
         if to_delete {
             repos
                 .parquet_files()
-                .flag_for_delete(parquet_file.id)
+                .create_upgrade_delete(&[parquet_file.id], &[], &[], CompactionLevel::Initial)
                 .await
                 .unwrap();
         }
@@ -737,16 +778,19 @@ impl TestParquetFileBuilder {
     }
 }
 
-async fn update_catalog_sort_key_if_needed(
-    partitions_catalog: &mut dyn PartitionRepo,
-    partition_id: PartitionId,
+async fn update_catalog_sort_key_if_needed<R>(
+    repos: &mut R,
+    id: &TransitionPartitionId,
     sort_key: SortKey,
-) {
+) where
+    R: RepoCollection + ?Sized,
+{
     // Fetch the latest partition info from the catalog
-    let partition = partitions_catalog
-        .get_by_id(partition_id)
+    let partition = partition_lookup(repos, id).await.unwrap().unwrap();
+
+    // fecth column ids from catalog
+    let columns = get_table_columns_by_id(partition.table_id, repos)
         .await
-        .unwrap()
         .unwrap();
 
     // Similarly to what the ingester does, if there's an existing sort key in the catalog, add new
@@ -762,9 +806,13 @@ async fn update_catalog_sort_key_if_needed(
                     catalog_sort_key.to_columns().collect::<Vec<_>>(),
                     &new_columns,
                 );
-                partitions_catalog
+
+                let column_ids = columns.ids_for_names(&new_columns);
+
+                repos
+                    .partitions()
                     .cas_sort_key(
-                        partition_id,
+                        id,
                         Some(
                             catalog_sort_key
                                 .to_columns()
@@ -772,6 +820,7 @@ async fn update_catalog_sort_key_if_needed(
                                 .collect::<Vec<_>>(),
                         ),
                         &new_columns,
+                        &column_ids,
                     )
                     .await
                     .unwrap();
@@ -780,8 +829,10 @@ async fn update_catalog_sort_key_if_needed(
         None => {
             let new_columns = sort_key.to_columns().collect::<Vec<_>>();
             debug!("Updating sort key from None to {:?}", &new_columns);
-            partitions_catalog
-                .cas_sort_key(partition_id, None, &new_columns)
+            let column_ids = columns.ids_for_names(&new_columns);
+            repos
+                .partitions()
+                .cas_sort_key(id, None, &new_columns, &column_ids)
                 .await
                 .unwrap();
         }
@@ -791,12 +842,13 @@ async fn update_catalog_sort_key_if_needed(
 /// Create parquet file and return file size.
 async fn create_parquet_file(
     store: ParquetStorage,
+    partition_id: &TransitionPartitionId,
     metadata: &IoxMetadata,
     record_batch: RecordBatch,
 ) -> usize {
     let stream = Box::pin(MemoryStream::new(vec![record_batch]));
     let (_meta, file_size) = store
-        .upload(stream, metadata)
+        .upload(stream, partition_id, metadata, unbounded_memory_pool())
         .await
         .expect("persisting parquet file should succeed");
     file_size
@@ -828,9 +880,9 @@ impl TestParquetFile {
 
         repos
             .parquet_files()
-            .flag_for_delete(self.parquet_file.id)
+            .create_upgrade_delete(&[self.parquet_file.id], &[], &[], CompactionLevel::Initial)
             .await
-            .unwrap()
+            .unwrap();
     }
 
     /// Get Parquet file schema.

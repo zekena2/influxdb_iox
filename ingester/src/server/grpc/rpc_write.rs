@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use data_types::{NamespaceId, PartitionKey, TableId};
-use dml::{DmlMeta, DmlOperation, DmlWrite};
 use generated_types::influxdata::iox::ingester::v1::{
     self as proto, write_service_server::WriteService,
 };
@@ -10,8 +9,14 @@ use mutable_batch_pb::decode::decode_database_batch;
 use observability_deps::tracing::*;
 use thiserror::Error;
 use tonic::{Code, Request, Response};
+use trace::{
+    ctx::SpanContext,
+    span::{SpanExt, SpanRecorder},
+};
 
 use crate::{
+    dml_payload::write::{PartitionedData, TableData, WriteOperation},
+    dml_payload::IngestOp,
     dml_sink::{DmlError, DmlSink},
     ingest_state::{IngestState, IngestStateError},
     timestamp_oracle::TimestampOracle,
@@ -48,6 +53,7 @@ impl From<RpcError> for tonic::Status {
         let code = match e {
             RpcError::Decode(_) | RpcError::NoPayload | RpcError::NoTables => Code::InvalidArgument,
             RpcError::SystemState(IngestStateError::PersistSaturated) => Code::ResourceExhausted,
+            RpcError::SystemState(IngestStateError::DiskFull) => Code::ResourceExhausted,
             RpcError::SystemState(IngestStateError::GracefulStop) => Code::FailedPrecondition,
         };
 
@@ -106,7 +112,7 @@ pub(crate) struct RpcWrite<T> {
 }
 
 impl<T> RpcWrite<T> {
-    /// Instantiate a new [`RpcWrite`] that pushes [`DmlOperation`] instances
+    /// Instantiate a new [`RpcWrite`] that pushes [`IngestOp`] instances
     /// into `sink`.
     pub(crate) fn new(
         sink: T,
@@ -131,6 +137,11 @@ where
         &self,
         request: Request<proto::WriteRequest>,
     ) -> Result<Response<proto::WriteResponse>, tonic::Status> {
+        // Extract the span context
+        let span_ctx: Option<SpanContext> = request.extensions().get().cloned();
+        let span = span_ctx.child_span("ingester write");
+        let mut span_recorder = SpanRecorder::new(span);
+
         // Drop writes if the persistence is saturated or the ingester is
         // shutting down.
         //
@@ -156,8 +167,6 @@ where
             .remote_addr()
             .map(|v| v.to_string())
             .unwrap_or_else(|| "<unknown>".to_string());
-
-        // Extract the write payload
         let payload = request.into_inner().payload.ok_or(RpcError::NoPayload)?;
 
         let batches = decode_database_batch(&payload).map_err(RpcError::Decode)?;
@@ -165,7 +174,7 @@ where
         let namespace_id = NamespaceId::new(payload.database_id);
         let partition_key = PartitionKey::from(payload.partition_key);
 
-        // Never attempt to create a DmlWrite with no tables - doing so causes a
+        // Never attempt to create a WriteOperation with no tables - doing so causes a
         // panic.
         if num_tables == 0 {
             return Err(RpcError::NoTables)?;
@@ -179,54 +188,64 @@ where
             "received rpc write"
         );
 
-        // Reconstruct the DML operation
-        let op = DmlWrite::new(
+        // Construct the corresponding ingester write operation for the RPC payload,
+        // independently sequencing the data contained by the write per-partition
+        let op = WriteOperation::new(
             namespace_id,
             batches
                 .into_iter()
-                .map(|(k, v)| (TableId::new(k), v))
+                .map(|(k, v)| {
+                    let table_id = TableId::new(k);
+                    let partition_sequence_number = self.timestamp.next();
+                    (
+                        table_id,
+                        TableData::new(
+                            table_id,
+                            PartitionedData::new(partition_sequence_number, v),
+                        ),
+                    )
+                })
                 .collect(),
             partition_key,
-            DmlMeta::sequenced(
-                self.timestamp.next(),
-                iox_time::Time::MAX, // TODO: remove this from DmlMeta
-                // The tracing context should be propagated over the RPC boundary.
-                //
-                // See https://github.com/influxdata/influxdb_iox/issues/6177
-                None,
-                42, // TODO: remove this from DmlMeta
-            ),
+            span_recorder.span().map(|span| span.ctx.clone()),
         );
 
-        // Apply the DML op to the in-memory buffer.
-        match self.sink.apply(DmlOperation::Write(op)).await {
-            Ok(()) => {}
+        // Apply the IngestOp to the DML sink.
+        match self.sink.apply(IngestOp::Write(op)).await {
+            Ok(()) => {
+                span_recorder.ok("applied write");
+                Ok(Response::new(proto::WriteResponse {}))
+            }
             Err(e) => {
-                error!(error=%e, "failed to apply DML op");
-                return Err(e.into())?;
+                error!(error=%e, "failed to apply ingest operation");
+                span_recorder.error(e.to_string());
+                Err(e.into())?
             }
         }
-
-        Ok(Response::new(proto::WriteResponse {}))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use assert_matches::assert_matches;
+    use data_types::SequenceNumber;
     use generated_types::influxdata::pbdata::v1::{
         column::{SemanticType, Values},
         Column, DatabaseBatch, TableBatch,
     };
+    use std::{collections::HashSet, sync::Arc};
+    use trace::RingBufferTraceCollector;
 
     use super::*;
-    use crate::dml_sink::mock_sink::MockDmlSink;
+    use crate::{
+        dml_payload::IngestOp,
+        test_util::{ARBITRARY_NAMESPACE_ID, ARBITRARY_TABLE_ID},
+    };
+    use crate::{dml_sink::mock_sink::MockDmlSink, test_util::ARBITRARY_PARTITION_KEY};
 
-    const NAMESPACE_ID: NamespaceId = NamespaceId::new(42);
-    const PARTITION_KEY: &str = "bananas";
     const PERSIST_QUEUE_DEPTH: usize = 42;
+
+    const ALTERNATIVE_TABLE_ID: TableId = TableId::new(76);
 
     macro_rules! test_rpc_write {
         (
@@ -252,7 +271,13 @@ mod tests {
                         .write(Request::new($request))
                         .await;
 
-                    assert_eq!(ret.is_err(), $want_err, "wanted handler error {} got {:?}", $want_err, ret);
+                    assert_eq!(
+                        ret.is_err(),
+                        $want_err,
+                        "wanted handler error {} got {:?}",
+                        $want_err,
+                        ret
+                    );
                     assert_matches!(mock.get_calls().as_slice(), $($want_calls)+);
                 }
             }
@@ -263,10 +288,10 @@ mod tests {
         apply_ok,
         request = proto::WriteRequest {
         payload: Some(DatabaseBatch {
-                database_id: NAMESPACE_ID.get(),
-                partition_key: PARTITION_KEY.to_string(),
+                database_id: ARBITRARY_NAMESPACE_ID.get(),
+                partition_key: ARBITRARY_PARTITION_KEY.to_string(),
                 table_batches: vec![TableBatch {
-                    table_id: 42,
+                    table_id: ARBITRARY_TABLE_ID.get(),
                     columns: vec![Column {
                         column_name: "time".to_string(),
                         semantic_type: SemanticType::Time.into(),
@@ -288,12 +313,84 @@ mod tests {
         },
         sink_ret = Ok(()),
         want_err = false,
-        want_calls = [DmlOperation::Write(w)] => {
-            // Assert the various DmlWrite properties match the expected values
-            assert_eq!(w.namespace_id(), NAMESPACE_ID);
-            assert_eq!(w.table_count(), 1);
-            assert_eq!(*w.partition_key(), PartitionKey::from(PARTITION_KEY));
-            assert_eq!(w.meta().sequence().unwrap().get(), 1);
+        want_calls = [IngestOp::Write(w)] => {
+            // Assert the various IngestOp properties match the expected values
+            assert_eq!(w.namespace(), ARBITRARY_NAMESPACE_ID);
+            assert_eq!(w.tables().count(), 1);
+            assert_eq!(w.partition_key(), &*ARBITRARY_PARTITION_KEY);
+            assert_eq!(
+                w.tables().next().unwrap().1.partitioned_data().sequence_number(),
+                SequenceNumber::new(1)
+            );
+        }
+    );
+
+    test_rpc_write!(
+        apply_ok_independently_sequenced_partitions,
+        request = proto::WriteRequest {
+            payload: Some(DatabaseBatch {
+                database_id: ARBITRARY_NAMESPACE_ID.get(),
+                partition_key: ARBITRARY_PARTITION_KEY.to_string(),
+                table_batches: vec![
+                    TableBatch {
+                        table_id: ARBITRARY_TABLE_ID.get(),
+                        columns: vec![Column {
+                            column_name: String::from("time"),
+                            semantic_type: SemanticType::Time.into(),
+                            values: Some(Values {
+                            i64_values: vec![4242],
+                            f64_values: vec![],
+                            u64_values: vec![],
+                            string_values: vec![],
+                            bool_values: vec![],
+                            bytes_values: vec![],
+                            packed_string_values: None,
+                            interned_string_values: None,
+                            }),
+                            null_mask: vec![0],
+                        }],
+                        row_count:1 ,
+                    },
+                    TableBatch {
+                        table_id: ALTERNATIVE_TABLE_ID.get(),
+                        columns: vec![Column {
+                            column_name: String::from("time"),
+                            semantic_type: SemanticType::Time.into(),
+                            values: Some(Values {
+                            i64_values: vec![7676],
+                            f64_values: vec![],
+                            u64_values: vec![],
+                            string_values: vec![],
+                            bool_values: vec![],
+                            bytes_values: vec![],
+                            packed_string_values: None,
+                            interned_string_values: None,
+                            }),
+                            null_mask: vec![0],
+                        }],
+                        row_count: 1,
+                    },
+                ],
+            }),
+        },
+        sink_ret = Ok(()),
+        want_err = false,
+        want_calls = [IngestOp::Write(w)] => {
+            // Assert the properties of the applied IngestOp match the expected
+            // values. Notably a sequence number should be assigned _per partition_.
+            assert_eq!(w.namespace(), ARBITRARY_NAMESPACE_ID);
+            assert_eq!(w.tables().count(), 2);
+            assert_eq!(*w.partition_key(), *ARBITRARY_PARTITION_KEY);
+            let sequence_numbers = w.tables().map(|t| t.1.partitioned_data().sequence_number()).collect::<HashSet<_>>();
+            assert_eq!(
+                sequence_numbers,
+                [
+                    SequenceNumber::new(1),
+                    SequenceNumber::new(2),
+                ]
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            );
         }
     );
 
@@ -309,8 +406,8 @@ mod tests {
         no_tables,
         request = proto::WriteRequest {
             payload: Some(DatabaseBatch {
-                database_id: NAMESPACE_ID.get(),
-                partition_key: PARTITION_KEY.to_string(),
+                database_id: ARBITRARY_NAMESPACE_ID.get(),
+                partition_key: ARBITRARY_PARTITION_KEY.to_string(),
                 table_batches: vec![],
             }),
         },
@@ -323,10 +420,10 @@ mod tests {
         batch_error,
         request = proto::WriteRequest {
             payload: Some(DatabaseBatch {
-                database_id: NAMESPACE_ID.get(),
-                partition_key: PARTITION_KEY.to_string(),
+                database_id: ARBITRARY_NAMESPACE_ID.get(),
+                partition_key: ARBITRARY_PARTITION_KEY.to_string(),
                 table_batches: vec![TableBatch {
-                    table_id: 42,
+                    table_id: ARBITRARY_TABLE_ID.get(),
                     columns: vec![Column {
                         column_name: "time".to_string(),
                         semantic_type: SemanticType::Time.into(),
@@ -364,10 +461,10 @@ mod tests {
 
         let req = proto::WriteRequest {
             payload: Some(DatabaseBatch {
-                database_id: NAMESPACE_ID.get(),
-                partition_key: PARTITION_KEY.to_string(),
+                database_id: ARBITRARY_NAMESPACE_ID.get(),
+                partition_key: ARBITRARY_PARTITION_KEY.to_string(),
                 table_batches: vec![TableBatch {
-                    table_id: 42,
+                    table_id: ARBITRARY_TABLE_ID.get(),
                     columns: vec![Column {
                         column_name: "time".to_string(),
                         semantic_type: SemanticType::Time.into(),
@@ -400,9 +497,9 @@ mod tests {
 
         assert_matches!(
             *mock.get_calls(),
-            [DmlOperation::Write(ref w1), DmlOperation::Write(ref w2)] => {
-                let w1 = w1.meta().sequence().unwrap().get();
-                let w2 = w2.meta().sequence().unwrap().get();
+            [IngestOp::Write(ref w1), IngestOp::Write(ref w2)] => {
+                let w1 = w1.tables().next().unwrap().1.partitioned_data().sequence_number().get();
+                let w2 = w2.tables().next().unwrap().1.partitioned_data().sequence_number().get();
                 assert!(w1 < w2);
             }
         );
@@ -421,10 +518,10 @@ mod tests {
 
         let req = proto::WriteRequest {
             payload: Some(DatabaseBatch {
-                database_id: NAMESPACE_ID.get(),
-                partition_key: PARTITION_KEY.to_string(),
+                database_id: ARBITRARY_NAMESPACE_ID.get(),
+                partition_key: ARBITRARY_PARTITION_KEY.to_string(),
                 table_batches: vec![TableBatch {
-                    table_id: 42,
+                    table_id: ARBITRARY_TABLE_ID.get(),
                     columns: vec![Column {
                         column_name: "time".to_string(),
                         semantic_type: SemanticType::Time.into(),
@@ -461,7 +558,72 @@ mod tests {
         assert_eq!(err.code(), Code::ResourceExhausted);
 
         // One write should have been passed through to the DML sinks.
-        assert_matches!(*mock.get_calls(), [DmlOperation::Write(_)]);
+        assert_matches!(*mock.get_calls(), [IngestOp::Write(_)]);
+    }
+
+    /// Validate that the disk being marked as full prevents the ingester from
+    /// accepting new writes (and that clearing the mark allows further writes).
+    #[tokio::test]
+    async fn test_rpc_write_disk_full() {
+        let mock = Arc::new(MockDmlSink::default().with_apply_return(vec![Ok(()), Ok(())]));
+        let timestamp = Arc::new(TimestampOracle::new(0));
+
+        let ingest_state = Arc::new(IngestState::default());
+
+        let handler = RpcWrite::new(Arc::clone(&mock), timestamp, Arc::clone(&ingest_state));
+
+        let req = proto::WriteRequest {
+            payload: Some(DatabaseBatch {
+                database_id: ARBITRARY_NAMESPACE_ID.get(),
+                partition_key: ARBITRARY_PARTITION_KEY.to_string(),
+                table_batches: vec![TableBatch {
+                    table_id: ARBITRARY_TABLE_ID.get(),
+                    columns: vec![Column {
+                        column_name: "time".to_string(),
+                        semantic_type: SemanticType::Time.into(),
+                        values: Some(Values {
+                            i64_values: vec![4242],
+                            f64_values: vec![],
+                            u64_values: vec![],
+                            string_values: vec![],
+                            bool_values: vec![],
+                            bytes_values: vec![],
+                            packed_string_values: None,
+                            interned_string_values: None,
+                        }),
+                        null_mask: vec![0],
+                    }],
+                    row_count: 1,
+                }],
+            }),
+        };
+
+        // Perform an OK write
+        handler
+            .write(Request::new(req.clone()))
+            .await
+            .expect("write should succeed");
+
+        // Set the disk full state, try to write again and assert the error
+        // code and write not passed through.
+        ingest_state.set(IngestStateError::DiskFull);
+        assert_eq!(
+            handler
+                .write(Request::new(req.clone()))
+                .await
+                .expect_err("write should fail")
+                .code(),
+            Code::ResourceExhausted
+        );
+        assert_matches!(*mock.get_calls(), [IngestOp::Write(_)]);
+
+        // Unset the error state and ensure another write goes through
+        ingest_state.unset(IngestStateError::DiskFull);
+        handler
+            .write(Request::new(req.clone()))
+            .await
+            .expect("write should succeed");
+        assert_matches!(*mock.get_calls(), [IngestOp::Write(_), IngestOp::Write(_)]);
     }
 
     /// Validate that the ingester being marked as stopping prevents the
@@ -477,10 +639,10 @@ mod tests {
 
         let req = proto::WriteRequest {
             payload: Some(DatabaseBatch {
-                database_id: NAMESPACE_ID.get(),
-                partition_key: PARTITION_KEY.to_string(),
+                database_id: ARBITRARY_NAMESPACE_ID.get(),
+                partition_key: ARBITRARY_PARTITION_KEY.to_string(),
                 table_batches: vec![TableBatch {
-                    table_id: 42,
+                    table_id: ARBITRARY_TABLE_ID.get(),
                     columns: vec![Column {
                         column_name: "time".to_string(),
                         semantic_type: SemanticType::Time.into(),
@@ -517,6 +679,68 @@ mod tests {
         assert_eq!(err.code(), Code::FailedPrecondition);
 
         // One write should have been passed through to the DML sinks.
-        assert_matches!(*mock.get_calls(), [DmlOperation::Write(_)]);
+        assert_matches!(*mock.get_calls(), [IngestOp::Write(_)]);
+    }
+
+    /// Assert that the ingester propagates the SpanContext from the client
+    /// request.
+    #[tokio::test]
+    async fn test_rpc_write_span_propagation() {
+        let mock = Arc::new(MockDmlSink::default().with_apply_return(vec![Ok(())]));
+        let timestamp = Arc::new(TimestampOracle::new(0));
+
+        let ingest_state = Arc::new(IngestState::default());
+
+        let handler = RpcWrite::new(Arc::clone(&mock), timestamp, Arc::clone(&ingest_state));
+
+        let mut req = Request::new(proto::WriteRequest {
+            payload: Some(DatabaseBatch {
+                database_id: ARBITRARY_NAMESPACE_ID.get(),
+                partition_key: ARBITRARY_PARTITION_KEY.to_string(),
+                table_batches: vec![TableBatch {
+                    table_id: ARBITRARY_TABLE_ID.get(),
+                    columns: vec![Column {
+                        column_name: "time".to_string(),
+                        semantic_type: SemanticType::Time.into(),
+                        values: Some(Values {
+                            i64_values: vec![4242],
+                            f64_values: vec![],
+                            u64_values: vec![],
+                            string_values: vec![],
+                            bool_values: vec![],
+                            bytes_values: vec![],
+                            packed_string_values: None,
+                            interned_string_values: None,
+                        }),
+                        null_mask: vec![0],
+                    }],
+                    row_count: 1,
+                }],
+            }),
+        });
+
+        // Initialise a trace context to bundle into the request.
+        let trace_collector = Arc::new(RingBufferTraceCollector::new(5));
+        let span_ctx = SpanContext::new(Arc::new(Arc::clone(&trace_collector)));
+        let external_span = span_ctx.child("external span");
+
+        // Insert the span context into the request extensions
+        req.extensions_mut().insert(external_span.clone().ctx);
+
+        handler.write(req).await.expect("write should succeed");
+
+        // One write should have been passed through to the DML sinks,
+        // containing the same trace ID.
+        assert_matches!(&mock.get_calls()[..], [IngestOp::Write(w)] => {
+            let got_span_ctx = w.clone().span_context().expect("op should contain span context").to_owned();
+            assert_eq!(got_span_ctx.trace_id, external_span.ctx.trace_id);
+        });
+
+        // Check the span name and the parent span ID are as expected
+        let spans = trace_collector.spans();
+        assert_matches!(spans.as_slice(), [handler_span] => {
+            assert_eq!(handler_span.name, "ingester write");
+            assert_eq!(handler_span.ctx.parent_span_id, Some(external_span.ctx.span_id));
+        })
     }
 }

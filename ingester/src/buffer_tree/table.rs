@@ -1,15 +1,23 @@
 //! Table level data buffer structures.
 
-pub(crate) mod name_resolver;
+pub(crate) mod metadata_resolver;
 
-use std::{fmt::Debug, sync::Arc};
+use std::{collections::HashMap, fmt::Debug, sync::Arc};
 
 use async_trait::async_trait;
-use data_types::{NamespaceId, PartitionKey, SequenceNumber, TableId};
-use datafusion_util::MemoryStream;
+use data_types::{
+    partition_template::{build_column_values, ColumnValue, TablePartitionTemplateOverride},
+    NamespaceId, PartitionKey, SequenceNumber, Table, TableId,
+};
+use datafusion::{prelude::Expr, scalar::ScalarValue};
+use iox_query::{
+    chunk_statistics::{create_chunk_statistics, ColumnRange},
+    pruning::prune_summaries,
+    QueryChunk,
+};
 use mutable_batch::MutableBatch;
 use parking_lot::Mutex;
-use schema::Projection;
+use predicate::Predicate;
 use trace::span::{Span, SpanRecorder};
 
 use super::{
@@ -21,9 +29,54 @@ use crate::{
     arcmap::ArcMap,
     deferred_load::DeferredLoad,
     query::{
-        partition_response::PartitionResponse, response::PartitionStream, QueryError, QueryExec,
+        partition_response::PartitionResponse, projection::OwnedProjection,
+        response::PartitionStream, QueryError, QueryExec,
     },
+    query_adaptor::QueryAdaptor,
 };
+
+/// Metadata from the catalog for a table
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TableMetadata {
+    name: TableName,
+    partition_template: TablePartitionTemplateOverride,
+}
+
+impl TableMetadata {
+    #[cfg(test)]
+    pub fn new_for_testing(
+        name: TableName,
+        partition_template: TablePartitionTemplateOverride,
+    ) -> Self {
+        Self {
+            name,
+            partition_template,
+        }
+    }
+
+    pub(crate) fn name(&self) -> &TableName {
+        &self.name
+    }
+
+    pub(crate) fn partition_template(&self) -> &TablePartitionTemplateOverride {
+        &self.partition_template
+    }
+}
+
+impl From<Table> for TableMetadata {
+    fn from(t: Table) -> Self {
+        Self {
+            name: t.name.into(),
+            partition_template: t.partition_template,
+        }
+    }
+}
+
+impl std::fmt::Display for TableMetadata {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.name, f)
+    }
+}
 
 /// The string name / identifier of a Table.
 ///
@@ -70,7 +123,7 @@ impl PartialEq<str> for TableName {
 #[derive(Debug)]
 pub(crate) struct TableData<O> {
     table_id: TableId,
-    table_name: Arc<DeferredLoad<TableName>>,
+    catalog_table: Arc<DeferredLoad<TableMetadata>>,
 
     /// The catalog ID of the namespace this table is being populated from.
     namespace_id: NamespaceId,
@@ -94,7 +147,7 @@ impl<O> TableData<O> {
     /// for the first time.
     pub(super) fn new(
         table_id: TableId,
-        table_name: Arc<DeferredLoad<TableName>>,
+        catalog_table: Arc<DeferredLoad<TableMetadata>>,
         namespace_id: NamespaceId,
         namespace_name: Arc<DeferredLoad<NamespaceName>>,
         partition_provider: Arc<dyn PartitionProvider>,
@@ -102,7 +155,7 @@ impl<O> TableData<O> {
     ) -> Self {
         Self {
             table_id,
-            table_name,
+            catalog_table,
             namespace_id,
             namespace_name,
             partition_data: Default::default(),
@@ -133,9 +186,9 @@ impl<O> TableData<O> {
         self.table_id
     }
 
-    /// Returns the name of this table.
-    pub(crate) fn table_name(&self) -> &Arc<DeferredLoad<TableName>> {
-        &self.table_name
+    /// Returns the catalog data for this table.
+    pub(crate) fn catalog_table(&self) -> &Arc<DeferredLoad<TableMetadata>> {
+        &self.catalog_table
     }
 
     /// Return the [`NamespaceId`] this table is a part of.
@@ -167,7 +220,7 @@ where
                         self.namespace_id,
                         Arc::clone(&self.namespace_name),
                         self.table_id,
-                        Arc::clone(&self.table_name),
+                        Arc::clone(&self.catalog_table),
                     )
                     .await;
                 // Add the partition to the map.
@@ -203,8 +256,9 @@ where
         &self,
         namespace_id: NamespaceId,
         table_id: TableId,
-        columns: Vec<String>,
+        projection: OwnedProjection,
         span: Option<Span>,
+        predicate: Option<Predicate>,
     ) -> Result<Self::Response, QueryError> {
         assert_eq!(self.table_id, table_id, "buffer tree index inconsistency");
         assert_eq!(
@@ -212,46 +266,172 @@ where
             "buffer tree index inconsistency"
         );
 
+        let table_partition_template = self.catalog_table.get().await.partition_template;
+        let filters = predicate
+            .map(|p| p.filter_expr().into_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+
         // Gather the partition data from all of the partitions in this table.
         let span = SpanRecorder::new(span);
-        let partitions = self.partitions().into_iter().map(move |p| {
+        let partitions = self.partitions().into_iter().filter_map(move |p| {
             let mut span = span.child("partition read");
 
-            let (id, completed_persistence_count, data) = {
+            let (id, completed_persistence_count, data, partition_key) = {
                 let mut p = p.lock();
                 (
-                    p.partition_id(),
+                    p.partition_id().clone(),
                     p.completed_persistence_count(),
-                    p.get_query_data(),
+                    p.get_query_data(&projection),
+                    p.partition_key().clone(),
                 )
             };
 
             let ret = match data {
                 Some(data) => {
-                    assert_eq!(id, data.partition_id());
+                    assert_eq!(&id, data.partition_id());
 
-                    // Project the data if necessary
-                    let columns = columns.iter().map(String::as_str).collect::<Vec<_>>();
-                    let selection = if columns.is_empty() {
-                        Projection::All
-                    } else {
-                        Projection::Some(columns.as_ref())
-                    };
+                    // Potentially prune out this partition if the partition
+                    // template & derived partition key can be used to match
+                    // against the filters.
+                    if !keep_after_pruning_partition_key(
+                        &table_partition_template,
+                        &partition_key,
+                        &filters,
+                        &data,
+                    ) {
+                        // This partition will never contain any data that would
+                        // form part of the query response.
+                        //
+                        // Because this is true of buffered data, it is also
+                        // true of the persisted data, and therefore sending the
+                        // persisted file count metadata is useless because the
+                        // querier would never utilise the persisted files as
+                        // part of this query.
+                        //
+                        // This avoids sending O(n) metadata frames for queries
+                        // that may only touch one or two actual frames. The N
+                        // partition count grows over the lifetime of the
+                        // ingester as more partitions are created, and while
+                        // fast to serialise individually, the sequentially-sent
+                        // N metadata frames add up.
+                        return None;
+                    }
 
-                    let data = Box::pin(MemoryStream::new(
-                        data.project_selection(selection).into_iter().collect(),
-                    ));
-                    PartitionResponse::new(Some(data), id, completed_persistence_count)
+                    PartitionResponse::new(
+                        data.into_record_batches(),
+                        id,
+                        completed_persistence_count,
+                    )
                 }
-                None => PartitionResponse::new(None, id, completed_persistence_count),
+                None => PartitionResponse::new(vec![], id, completed_persistence_count),
             };
 
             span.ok("read partition data");
-            ret
+            Some(ret)
         });
 
         Ok(PartitionStream::new(futures::stream::iter(partitions)))
     }
+}
+
+/// Return true if `data` contains one or more rows matching `predicate`,
+/// pruning based on the `partition_key` and `template`.
+///
+/// Returns false iff it can be proven that all of data does not match the
+/// predicate.
+fn keep_after_pruning_partition_key(
+    table_partition_template: &TablePartitionTemplateOverride,
+    partition_key: &PartitionKey,
+    filters: &[Expr],
+    data: &QueryAdaptor,
+) -> bool {
+    // Construct a set of per-column min/max statistics based on the partition
+    // key values.
+    let column_ranges = Arc::new(
+        build_column_values(table_partition_template, partition_key.inner())
+            .filter_map(|(col, val)| {
+                let range = match val {
+                    ColumnValue::Identity(s) => {
+                        let s = Arc::new(ScalarValue::from(s.as_ref()));
+                        ColumnRange {
+                            min_value: Arc::clone(&s),
+                            max_value: s,
+                        }
+                    }
+                    ColumnValue::Prefix(p) if p.is_empty() => return None,
+                    ColumnValue::Prefix(p) => {
+                        // If the partition only has a prefix of the tag value
+                        // (it was truncated) then form a conservative range:
+                        //
+                        // # Minimum
+                        // Use the prefix itself.
+                        //
+                        // Note that the minimum is inclusive.
+                        //
+                        // All values in the partition are either:
+                        //
+                        // - identical to the prefix, in which case they are
+                        //   included by the inclusive minimum
+                        //
+                        // - have the form `"<prefix><s>"`, and it holds that
+                        //   `"<prefix><s>" > "<prefix>"` for all strings
+                        //   `"<s>"`.
+                        //
+                        // # Maximum
+                        // Use `"<prefix_excluding_last_char><char::max>"`.
+                        //
+                        // Note that the maximum is inclusive.
+                        //
+                        // All strings in this partition must be smaller than
+                        // this constructed maximum, because string comparison
+                        // is front-to-back and the
+                        // `"<prefix_excluding_last_char><char::max>" >
+                        // "<prefix>"`.
+
+                        let min_value = Arc::new(ScalarValue::from(p.as_ref()));
+
+                        let mut chars = p.as_ref().chars().collect::<Vec<_>>();
+                        *chars.last_mut().expect("checked that prefix is not empty") =
+                            std::char::MAX;
+                        let max_value = Arc::new(ScalarValue::from(
+                            chars.into_iter().collect::<String>().as_str(),
+                        ));
+
+                        ColumnRange {
+                            min_value,
+                            max_value,
+                        }
+                    }
+                };
+
+                Some((Arc::from(col), range))
+            })
+            .collect::<HashMap<_, _>>(),
+    );
+
+    let chunk_statistics = Arc::new(create_chunk_statistics(
+        data.num_rows(),
+        data.schema(),
+        data.ts_min_max(),
+        &column_ranges,
+    ));
+
+    prune_summaries(
+        data.schema(),
+        &[(chunk_statistics, data.schema().as_arrow())],
+        filters,
+    )
+    // Errors are logged by `iox_query` and sometimes fine, e.g. for not
+    // implemented DataFusion features or upstream bugs. The querier uses the
+    // same strategy. Pruning is a mere optimization and should not lead to
+    // crashes or unreadable data.
+    .ok()
+    .map(|vals| {
+        vals.into_iter()
+            .next()
+            .expect("one chunk in, one chunk out")
+    })
+    .unwrap_or(true)
 }
 
 #[cfg(test)]
@@ -267,7 +447,7 @@ mod tests {
             post_write::mock::MockPostWriteObserver,
         },
         test_util::{
-            defer_namespace_name_1_sec, defer_table_name_1_sec, PartitionDataBuilder,
+            defer_namespace_name_1_sec, defer_table_metadata_1_sec, PartitionDataBuilder,
             ARBITRARY_NAMESPACE_ID, ARBITRARY_PARTITION_KEY, ARBITRARY_TABLE_ID,
             ARBITRARY_TABLE_NAME,
         },
@@ -282,7 +462,7 @@ mod tests {
 
         let table = TableData::new(
             ARBITRARY_TABLE_ID,
-            defer_table_name_1_sec(),
+            defer_table_metadata_1_sec(),
             ARBITRARY_NAMESPACE_ID,
             defer_namespace_name_1_sec(),
             partition_provider,

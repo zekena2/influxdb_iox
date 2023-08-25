@@ -2,7 +2,10 @@ use std::{fmt::Display, sync::Arc};
 
 use async_trait::async_trait;
 use data_types::{CompactionLevel, ParquetFileParams};
-use datafusion::{error::DataFusionError, physical_plan::SendableRecordBatchStream};
+use datafusion::{
+    error::DataFusionError, execution::memory_pool::MemoryPool,
+    physical_plan::SendableRecordBatchStream,
+};
 use iox_time::{Time, TimeProvider};
 use parquet_file::{
     metadata::IoxMetadata,
@@ -17,13 +20,20 @@ use super::ParquetFileSink;
 
 #[derive(Debug)]
 pub struct ObjectStoreParquetFileSink {
+    // pool on which to register parquet buffering
+    pool: Arc<dyn MemoryPool>,
     store: ParquetStorage,
     time_provider: Arc<dyn TimeProvider>,
 }
 
 impl ObjectStoreParquetFileSink {
-    pub fn new(store: ParquetStorage, time_provider: Arc<dyn TimeProvider>) -> Self {
+    pub fn new(
+        pool: Arc<dyn MemoryPool>,
+        store: ParquetStorage,
+        time_provider: Arc<dyn TimeProvider>,
+    ) -> Self {
         Self {
+            pool,
             store,
             time_provider,
         }
@@ -52,7 +62,6 @@ impl ParquetFileSink for ObjectStoreParquetFileSink {
             namespace_name: partition.namespace_name.clone().into(),
             table_id: partition.table.id,
             table_name: partition.table.name.clone().into(),
-            partition_id: partition.partition_id,
             partition_key: partition.partition_key.clone(),
             compaction_level: level,
             sort_key: partition.sort_key.clone(),
@@ -62,7 +71,12 @@ impl ParquetFileSink for ObjectStoreParquetFileSink {
         // Stream the record batches from the compaction exec, serialize
         // them, and directly upload the resulting Parquet files to
         // object storage.
-        let (parquet_meta, file_size) = match self.store.upload(stream, &meta).await {
+        let pool = Arc::clone(&self.pool);
+        let (parquet_meta, file_size) = match self
+            .store
+            .upload(stream, &partition.partition_id(), &meta, pool)
+            .await
+        {
             Ok(v) => v,
             Err(UploadError::Serialise(CodecError::NoRows | CodecError::NoRecordBatches)) => {
                 // This MAY be a bug.
@@ -78,7 +92,7 @@ impl ParquetFileSink for ObjectStoreParquetFileSink {
         };
 
         let parquet_file =
-            meta.to_parquet_file(partition.partition_id, file_size, &parquet_meta, |name| {
+            meta.to_parquet_file(partition.partition_id(), file_size, &parquet_meta, |name| {
                 partition
                     .table_schema
                     .columns

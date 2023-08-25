@@ -6,8 +6,11 @@ use super::main;
 use clap_blocks::{
     catalog_dsn::CatalogDsnConfig,
     compactor::CompactorConfig,
+    compactor_scheduler::CompactorSchedulerConfig,
+    gossip::GossipConfig,
     ingester::IngesterConfig,
     ingester_address::IngesterAddress,
+    memory_size::MemorySize,
     object_store::{make_object_store, ObjectStoreConfig},
     querier::QuerierConfig,
     router::RouterConfig,
@@ -32,7 +35,6 @@ use object_store::DynObjectStore;
 use observability_deps::tracing::*;
 use parquet_file::storage::{ParquetStorage, StorageId};
 use std::{
-    collections::HashMap,
     num::NonZeroUsize,
     path::{Path, PathBuf},
     str::FromStr,
@@ -314,23 +316,30 @@ pub struct Config {
     )]
     pub compactor_grpc_bind_address: SocketAddr,
 
+    #[clap(flatten)]
+    compactor_scheduler_config: CompactorSchedulerConfig,
+
     /// Size of the querier RAM cache used to store catalog metadata information in bytes.
+    ///
+    /// Can be given as absolute value or in percentage of the total available memory (e.g. `10%`).
     #[clap(
         long = "querier-ram-pool-metadata-bytes",
         env = "INFLUXDB_IOX_QUERIER_RAM_POOL_METADATA_BYTES",
         default_value = "134217728",  // 128MB
         action
     )]
-    pub querier_ram_pool_metadata_bytes: usize,
+    pub querier_ram_pool_metadata_bytes: MemorySize,
 
     /// Size of the querier RAM cache used to store data in bytes.
+    ///
+    /// Can be given as absolute value or in percentage of the total available memory (e.g. `10%`).
     #[clap(
         long = "querier-ram-pool-data-bytes",
         env = "INFLUXDB_IOX_QUERIER_RAM_POOL_DATA_BYTES",
         default_value = "1073741824",  // 1GB
         action
     )]
-    pub querier_ram_pool_data_bytes: usize,
+    pub querier_ram_pool_data_bytes: MemorySize,
 
     /// Limit the number of concurrent queries.
     #[clap(
@@ -342,13 +351,15 @@ pub struct Config {
     pub querier_max_concurrent_queries: usize,
 
     /// Size of memory pool used during query exec, in bytes.
+    ///
+    /// Can be given as absolute value or in percentage of the total available memory (e.g. `10%`).
     #[clap(
         long = "exec-mem-pool-bytes",
         env = "INFLUXDB_IOX_EXEC_MEM_POOL_BYTES",
         default_value = "8589934592",  // 8GB
         action
     )]
-    pub exec_mem_pool_bytes: usize,
+    pub exec_mem_pool_bytes: MemorySize,
 }
 
 impl Config {
@@ -373,6 +384,7 @@ impl Config {
             querier_grpc_bind_address,
             ingester_grpc_bind_address,
             compactor_grpc_bind_address,
+            compactor_scheduler_config,
             querier_ram_pool_metadata_bytes,
             querier_ram_pool_data_bytes,
             querier_max_concurrent_queries,
@@ -431,6 +443,15 @@ impl Config {
             catalog_dsn.dsn = Some(dsn);
         };
 
+        // TODO: make num_threads a parameter (other modes have it
+        // configured by a command line)
+        let num_threads =
+            NonZeroUsize::new(num_cpus::get()).unwrap_or_else(|| NonZeroUsize::new(1).unwrap());
+
+        // Target allowing the compactor to use as many as 1/2 the
+        // cores by default, but at least one.
+        let compactor_concurrency = NonZeroUsize::new((num_threads.get() / 2).max(1)).unwrap();
+
         let ingester_addresses =
             vec![IngesterAddress::from_str(&ingester_grpc_bind_address.to_string()).unwrap()];
 
@@ -463,6 +484,7 @@ impl Config {
             persist_queue_depth,
             persist_hot_partition_cost,
             rpc_write_max_incoming_bytes: 1024 * 1024 * 1024, // 1GiB
+            gossip_config: GossipConfig::disabled(),
         };
 
         let router_config = RouterConfig {
@@ -473,37 +495,33 @@ impl Config {
             new_namespace_retention_hours: None, // infinite retention
             namespace_autocreation_enabled: true,
             rpc_write_timeout_seconds: Duration::new(3, 0),
-            rpc_write_replicas: None,
+            rpc_write_replicas: 1.try_into().unwrap(),
             rpc_write_max_outgoing_bytes: ingester_config.rpc_write_max_incoming_bytes,
+            rpc_write_health_num_probes: 10,
+            gossip_config: GossipConfig::disabled(),
         };
 
         // create a CompactorConfig for the all in one server based on
         // settings from other configs. Can't use `#clap(flatten)` as the
         // parameters are redundant with ingester's
         let compactor_config = CompactorConfig {
-            compaction_type: Default::default(),
-            compaction_partition_minute_threshold: 10,
-            compaction_cold_partition_minute_threshold: 60,
-            compaction_partition_concurrency: NonZeroUsize::new(1).unwrap(),
-            compaction_df_concurrency: NonZeroUsize::new(1).unwrap(),
-            compaction_partition_scratchpad_concurrency: NonZeroUsize::new(1).unwrap(),
-            query_exec_thread_count: Some(NonZeroUsize::new(1).unwrap()),
+            compactor_scheduler_config,
+            compaction_partition_concurrency: compactor_concurrency,
+            compaction_df_concurrency: compactor_concurrency,
+            compaction_partition_scratchpad_concurrency: compactor_concurrency,
+            query_exec_thread_count: Some(num_threads),
             exec_mem_pool_bytes,
-            max_desired_file_size_bytes: 30_000,
+            max_desired_file_size_bytes: 100 * 1024 * 1024, // 100 MB
             percentage_max_file_size: 30,
             split_percentage: 80,
-            partition_timeout_secs: 0,
-            partition_filter: None,
+            partition_timeout_secs: 30 * 60, // 30 minutes
             shadow_mode: false,
-            ignore_partition_skip_marker: false,
-            shard_count: None,
-            shard_id: None,
-            hostname: None,
+            enable_scratchpad: true,
             min_num_l1_files_to_compact: 1,
             process_once: false,
-            process_all_partitions: false,
             max_num_columns_per_table: 200,
             max_num_files_per_plan: 200,
+            max_partition_fetch_queries_per_second: Some(500),
         };
 
         let querier_config = QuerierConfig {
@@ -519,6 +537,8 @@ impl Config {
         };
 
         SpecializedConfig {
+            num_threads,
+
             router_run_config,
             querier_run_config,
 
@@ -539,7 +559,10 @@ impl Config {
 /// panic's if the directory does not exist and can not be created
 fn ensure_directory_exists(p: &Path) {
     if !p.exists() {
-        println!("Creating directory {p:?}");
+        info!(
+            p=%p.display(),
+            "Creating directory",
+        );
         std::fs::create_dir_all(p).expect("Could not create default directory");
     }
 }
@@ -547,6 +570,8 @@ fn ensure_directory_exists(p: &Path) {
 /// Different run configs for the different services (needed as they
 /// listen on different ports)
 struct SpecializedConfig {
+    num_threads: NonZeroUsize,
+
     router_run_config: RunConfig,
     querier_run_config: RunConfig,
     ingester_run_config: RunConfig,
@@ -561,6 +586,7 @@ struct SpecializedConfig {
 
 pub async fn command(config: Config) -> Result<()> {
     let SpecializedConfig {
+        num_threads,
         router_run_config,
         querier_run_config,
         ingester_run_config,
@@ -592,21 +618,25 @@ pub async fn command(config: Config) -> Result<()> {
     // create common state from the router and use it below
     let common_state = CommonServerState::from_config(router_run_config.clone())?;
 
-    // TODO: make num_threads a parameter (other modes have it
-    // configured by a command line)
-    let num_threads = NonZeroUsize::new(num_cpus::get())
-        .unwrap_or_else(|| NonZeroUsize::new(1).expect("1 is valid"));
     info!(%num_threads, "Creating shared query executor");
-
     let parquet_store_real = ParquetStorage::new(Arc::clone(&object_store), StorageId::from("iox"));
+    let parquet_store_scratchpad = ParquetStorage::new(
+        Arc::new(MetricsStore::new(
+            Arc::new(object_store::memory::InMemory::new()),
+            &metrics,
+            "scratchpad",
+        )),
+        StorageId::from("iox_scratchpad"),
+    );
     let exec = Arc::new(Executor::new_with_config(ExecutorConfig {
         num_threads,
         target_query_partitions: num_threads,
-        object_stores: HashMap::from([(
-            parquet_store_real.id(),
-            Arc::clone(parquet_store_real.object_store()),
-        )]),
-        mem_pool_size: querier_config.exec_mem_pool_bytes,
+        object_stores: [&parquet_store_real, &parquet_store_scratchpad]
+            .into_iter()
+            .map(|store| (store.id(), Arc::clone(store.object_store())))
+            .collect(),
+        metric_registry: Arc::clone(&metrics),
+        mem_pool_size: querier_config.exec_mem_pool_bytes.bytes(),
     }));
 
     info!("starting router");
@@ -616,6 +646,11 @@ pub async fn command(config: Config) -> Result<()> {
         Arc::clone(&catalog),
         Arc::clone(&object_store),
         &router_config,
+        &GossipConfig::disabled(),
+        router_run_config
+            .tracing_config()
+            .traces_jaeger_trace_context_header_name
+            .clone(),
     )
     .await?;
 
@@ -632,14 +667,6 @@ pub async fn command(config: Config) -> Result<()> {
     .expect("failed to start ingester");
 
     info!("starting compactor");
-    let parquet_store_scratchpad = ParquetStorage::new(
-        Arc::new(MetricsStore::new(
-            Arc::new(object_store::memory::InMemory::new()),
-            &metrics,
-            "scratchpad",
-        )),
-        StorageId::from("iox_scratchpad"),
-    );
 
     let compactor = create_compactor_server_type(
         &common_state,
@@ -662,6 +689,10 @@ pub async fn command(config: Config) -> Result<()> {
         exec,
         time_provider,
         querier_config,
+        trace_context_header_name: querier_run_config
+            .tracing_config()
+            .traces_jaeger_trace_context_header_name
+            .clone(),
     })
     .await?;
 

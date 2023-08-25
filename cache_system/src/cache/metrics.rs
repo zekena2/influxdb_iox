@@ -4,6 +4,7 @@ use std::{fmt::Debug, sync::Arc};
 use async_trait::async_trait;
 use iox_time::{Time, TimeProvider};
 use metric::{Attributes, DurationHistogram, U64Counter};
+use observability_deps::tracing::warn;
 use trace::span::{Span, SpanRecorder};
 
 use super::{Cache, CacheGetStatus, CachePeekStatus};
@@ -180,15 +181,22 @@ impl<'a> Drop for SetGetMetricOnDrop<'a> {
     fn drop(&mut self) {
         let t_end = self.metrics.time_provider.now();
 
-        match self.status {
-            Some(CacheGetStatus::Hit) => &self.metrics.metric_get_hit,
-            Some(CacheGetStatus::Miss) => &self.metrics.metric_get_miss,
-            Some(CacheGetStatus::MissAlreadyLoading) => {
-                &self.metrics.metric_get_miss_already_loading
+        match t_end.checked_duration_since(self.t_start) {
+            Some(duration) => {
+                match self.status {
+                    Some(CacheGetStatus::Hit) => &self.metrics.metric_get_hit,
+                    Some(CacheGetStatus::Miss) => &self.metrics.metric_get_miss,
+                    Some(CacheGetStatus::MissAlreadyLoading) => {
+                        &self.metrics.metric_get_miss_already_loading
+                    }
+                    None => &self.metrics.metric_get_cancelled,
+                }
+                .record(duration);
             }
-            None => &self.metrics.metric_get_cancelled,
+            None => {
+                warn!("Clock went backwards, not recording cache GET duration");
+            }
         }
-        .record(t_end - self.t_start);
 
         if let Some(status) = self.status {
             self.span_recorder.ok(status.name());
@@ -224,15 +232,22 @@ impl<'a> Drop for SetPeekMetricOnDrop<'a> {
     fn drop(&mut self) {
         let t_end = self.metrics.time_provider.now();
 
-        match self.status {
-            Some(Some(CachePeekStatus::Hit)) => &self.metrics.metric_peek_hit,
-            Some(Some(CachePeekStatus::MissAlreadyLoading)) => {
-                &self.metrics.metric_peek_miss_already_loading
+        match t_end.checked_duration_since(self.t_start) {
+            Some(duration) => {
+                match self.status {
+                    Some(Some(CachePeekStatus::Hit)) => &self.metrics.metric_peek_hit,
+                    Some(Some(CachePeekStatus::MissAlreadyLoading)) => {
+                        &self.metrics.metric_peek_miss_already_loading
+                    }
+                    Some(None) => &self.metrics.metric_peek_miss,
+                    None => &self.metrics.metric_peek_cancelled,
+                }
+                .record(duration);
             }
-            Some(None) => &self.metrics.metric_peek_miss,
-            None => &self.metrics.metric_peek_cancelled,
+            None => {
+                warn!("Clock went backwards, not recording cache PEEK duration");
+            }
         }
-        .record(t_end - self.t_start);
 
         if let Some(status) = self.status {
             self.span_recorder
@@ -251,9 +266,13 @@ mod tests {
     use tokio::sync::Barrier;
     use trace::{span::SpanStatus, RingBufferTraceCollector};
 
-    use crate::cache::{
-        driver::CacheDriver,
-        test_util::{run_test_generic, AbortAndWaitExt, EnsurePendingExt, TestAdapter, TestLoader},
+    use crate::{
+        cache::{
+            driver::CacheDriver,
+            test_util::{run_test_generic, TestAdapter},
+        },
+        loader::test_util::TestLoader,
+        test_util::{AbortAndWaitExt, EnsurePendingExt},
     };
 
     use super::*;
@@ -298,7 +317,7 @@ mod tests {
             assert_eq!(hist.total, Duration::from_secs(0));
         }
 
-        test_cache.loader.block();
+        test_cache.loader.block_global();
 
         let barrier_pending_1 = Arc::new(Barrier::new(2));
         let barrier_pending_1_captured = Arc::clone(&barrier_pending_1);
@@ -348,12 +367,13 @@ mod tests {
         barrier_pending_2.wait().await;
         let d2 = Duration::from_secs(3);
         test_cache.time_provider.inc(d2);
-        test_cache.loader.unblock();
+        test_cache.loader.mock_next(1, "v".into());
+        test_cache.loader.unblock_global();
 
         join_handle_1.await.unwrap();
         join_handle_2.await.unwrap();
 
-        test_cache.loader.block();
+        test_cache.loader.block_global();
         test_cache.time_provider.inc(Duration::from_secs(10));
         let n_hit = 100;
         for _ in 0..n_hit {
@@ -443,7 +463,7 @@ mod tests {
             assert_eq!(hist.total, Duration::from_secs(0));
         }
 
-        test_cache.loader.block();
+        test_cache.loader.block_global();
 
         test_cache
             .cache
@@ -491,12 +511,13 @@ mod tests {
         barrier_pending_2.wait().await;
         let d2 = Duration::from_secs(3);
         test_cache.time_provider.inc(d2);
-        test_cache.loader.unblock();
+        test_cache.loader.mock_next(1, "v".into());
+        test_cache.loader.unblock_global();
 
         join_handle_1.await.unwrap();
         join_handle_2.await.unwrap();
 
-        test_cache.loader.block();
+        test_cache.loader.block_global();
         test_cache.time_provider.inc(Duration::from_secs(10));
         let n_hit = 100;
         for _ in 0..n_hit {

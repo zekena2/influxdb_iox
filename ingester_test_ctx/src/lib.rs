@@ -4,19 +4,25 @@
     clippy::clone_on_ref_ptr,
     clippy::dbg_macro,
     clippy::explicit_iter_loop,
+    // See https://github.com/influxdata/influxdb_iox/pull/1671
     clippy::future_not_send,
     clippy::todo,
     clippy::use_self,
     missing_copy_implementations,
     missing_debug_implementations,
-    missing_docs
+    missing_docs,
+    unused_crate_dependencies
 )]
+
+// Workaround for "unused crate" lint false positives.
+use workspace_hack as _;
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use arrow::record_batch::RecordBatch;
 use arrow_flight::{decode::FlightRecordBatchStream, flight_service_server::FlightService, Ticket};
 use data_types::{
+    partition_template::{NamespacePartitionTemplateOverride, TablePartitionTemplateOverride},
     Namespace, NamespaceId, NamespaceSchema, ParquetFile, PartitionKey, SequenceNumber, TableId,
 };
 use dml::{DmlMeta, DmlWrite};
@@ -24,7 +30,7 @@ use futures::{stream::FuturesUnordered, FutureExt, StreamExt, TryStreamExt};
 use generated_types::influxdata::iox::ingester::v1::{
     write_service_server::WriteService, WriteRequest,
 };
-use ingester::{IngesterGuard, IngesterRpcInterface};
+use ingester::{GossipConfig, IngesterGuard, IngesterRpcInterface};
 use ingester_query_grpc::influxdata::iox::ingester::v1::IngesterQueryRequest;
 use iox_catalog::{
     interface::{Catalog, SoftDeletedRows},
@@ -43,6 +49,7 @@ use test_helpers::timeout::FutureTimeout;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tonic::Request;
+use trace::ctx::SpanContext;
 
 /// The default max persist queue depth - configurable with
 /// [`TestContextBuilder::with_max_persist_queue_depth()`].
@@ -50,7 +57,11 @@ pub const DEFAULT_MAX_PERSIST_QUEUE_DEPTH: usize = 5;
 /// The default partition hot persist cost - configurable with
 /// [`TestContextBuilder::with_persist_hot_partition_cost()`].
 pub const DEFAULT_PERSIST_HOT_PARTITION_COST: usize = 20_000_000;
-
+/// The default write-ahead log rotation period - configurable with
+/// [`TestContextBuilder::with_wal_rotation_period()`].
+/// This value is high to effectively stop the test ingester from
+/// performing WAL rotations and the associated time-based persistence.
+pub const DEFAULT_WAL_ROTATION_PERIOD: Duration = Duration::from_secs(1_000_000);
 /// Construct a new [`TestContextBuilder`] to make a [`TestContext`] for an [`ingester`] instance.
 pub fn test_context() -> TestContextBuilder {
     TestContextBuilder::default()
@@ -64,6 +75,7 @@ pub struct TestContextBuilder {
 
     max_persist_queue_depth: usize,
     persist_hot_partition_cost: usize,
+    wal_rotation_period: Duration,
 }
 
 impl Default for TestContextBuilder {
@@ -73,6 +85,7 @@ impl Default for TestContextBuilder {
             catalog: None,
             max_persist_queue_depth: DEFAULT_MAX_PERSIST_QUEUE_DEPTH,
             persist_hot_partition_cost: DEFAULT_PERSIST_HOT_PARTITION_COST,
+            wal_rotation_period: DEFAULT_WAL_ROTATION_PERIOD,
         }
     }
 }
@@ -107,6 +120,14 @@ impl TestContextBuilder {
         self
     }
 
+    /// Configure the ingester to rotate the write-ahead log at the regular
+    /// interval specified by [`Duration`]. Defaults to
+    /// [`DEFAULT_WAL_ROTATION_PERIOD`].
+    pub fn with_wal_rotation_period(mut self, period: Duration) -> Self {
+        self.wal_rotation_period = period;
+        self
+    }
+
     /// Initialise the [`ingester`] instance and return a [`TestContext`] for it.
     pub async fn build(self) -> TestContext<impl IngesterRpcInterface> {
         let Self {
@@ -114,6 +135,7 @@ impl TestContextBuilder {
             catalog,
             max_persist_queue_depth,
             persist_hot_partition_cost,
+            wal_rotation_period,
         } = self;
 
         test_helpers::maybe_start_logging();
@@ -128,9 +150,6 @@ impl TestContextBuilder {
             Arc::new(object_store::memory::InMemory::default());
         let storage =
             ParquetStorage::new(object_store, parquet_file::storage::StorageId::from("iox"));
-
-        // Settings so that the ingester will effectively never persist by itself, only on demand
-        let wal_rotation_period = Duration::from_secs(1_000_000);
 
         let persist_background_fetch_time = Duration::from_secs(10);
         let persist_executor = Arc::new(iox_query::exec::Executor::new_testing());
@@ -149,6 +168,7 @@ impl TestContextBuilder {
             max_persist_queue_depth,
             persist_hot_partition_cost,
             storage.clone(),
+            GossipConfig::default(),
             shutdown_rx.map(|v| v.expect("shutdown sender dropped without calling shutdown")),
         )
         .await
@@ -203,6 +223,7 @@ where
         &mut self,
         name: &str,
         retention_period_ns: Option<i64>,
+        partition_template: Option<NamespacePartitionTemplateOverride>,
     ) -> Namespace {
         let mut repos = self.catalog.repositories().await;
         let ns = arbitrary_namespace(&mut *repos, name).await;
@@ -217,7 +238,7 @@ where
                         max_columns_per_table: iox_catalog::DEFAULT_MAX_COLUMNS_PER_TABLE as usize,
                         max_tables: iox_catalog::DEFAULT_MAX_TABLES as usize,
                         retention_period_ns,
-                        partition_template: None,
+                        partition_template: partition_template.unwrap_or_default(),
                     },
                 )
                 .is_none(),
@@ -236,7 +257,8 @@ where
         namespace: &str,
         lp: &str,
         partition_key: PartitionKey,
-        sequence_number: i64,
+        sequence_number: u64,
+        span_ctx: Option<SpanContext>,
     ) {
         // Resolve the namespace ID needed to construct the DML op
         let namespace_id = self.namespace_id(namespace).await;
@@ -245,6 +267,8 @@ where
             .namespaces
             .get_mut(&namespace_id)
             .expect("namespace does not exist");
+        let partition_template =
+            TablePartitionTemplateOverride::try_new(None, &schema.partition_template).unwrap();
 
         let batches = lines_to_batches(lp, 0).unwrap();
 
@@ -264,17 +288,29 @@ where
             .into_iter()
             .map(|(table_name, batch)| {
                 let catalog = Arc::clone(&self.catalog);
+                let partition_template = partition_template.clone();
                 async move {
-                    let id = catalog
+                    match catalog
                         .repositories()
                         .await
                         .tables()
-                        .create_or_get(table_name.as_str(), namespace_id)
+                        .get_by_namespace_and_name(namespace_id, table_name.as_str())
                         .await
-                        .expect("table should create OK")
-                        .id;
-
-                    (id, batch)
+                        .unwrap()
+                    {
+                        Some(table) => (table.id, batch),
+                        None => {
+                            let id = catalog
+                                .repositories()
+                                .await
+                                .tables()
+                                .create(table_name.as_str(), partition_template, namespace_id)
+                                .await
+                                .expect("table should create OK")
+                                .id;
+                            (id, batch)
+                        }
+                    }
                 }
             })
             .collect::<FuturesUnordered<_>>()
@@ -293,12 +329,18 @@ where
             ),
         );
 
+        let mut req = tonic::Request::new(WriteRequest {
+            payload: Some(encode_write(namespace_id.get(), &op)),
+        });
+
+        // Mock out the trace extraction middleware by inserting the given
+        // span context straight into the requests extensions
+        span_ctx.map(|span_ctx| req.extensions_mut().insert(span_ctx));
+
         self.ingester
             .rpc()
             .write_service()
-            .write(tonic::Request::new(WriteRequest {
-                payload: Some(encode_write(namespace_id.get(), &op)),
-            }))
+            .write(req)
             .await
             .unwrap();
 

@@ -9,43 +9,30 @@ use crate::{
 use async_trait::async_trait;
 use data_types::NamespaceId;
 use datafusion::{
-    catalog::{catalog::CatalogProvider, schema::SchemaProvider},
+    catalog::{schema::SchemaProvider, CatalogProvider},
     datasource::TableProvider,
     error::DataFusionError,
+    prelude::Expr,
 };
 use datafusion_util::config::DEFAULT_SCHEMA;
 use iox_query::{
-    exec::{ExecutionContextProvider, ExecutorType, IOxSessionContext},
+    exec::{ExecutorType, IOxSessionContext},
     QueryChunk, QueryCompletedToken, QueryNamespace, QueryText,
 };
 use observability_deps::tracing::{debug, trace};
-use predicate::{rpc_predicate::QueryNamespaceMeta, Predicate};
-use schema::Schema;
 use std::{any::Any, collections::HashMap, sync::Arc};
 use trace::ctx::SpanContext;
-
-impl QueryNamespaceMeta for QuerierNamespace {
-    fn table_names(&self) -> Vec<String> {
-        let mut names: Vec<_> = self.tables.keys().map(|s| s.to_string()).collect();
-        names.sort();
-        names
-    }
-
-    fn table_schema(&self, table_name: &str) -> Option<Schema> {
-        self.tables.get(table_name).map(|t| t.schema().clone())
-    }
-}
 
 #[async_trait]
 impl QueryNamespace for QuerierNamespace {
     async fn chunks(
         &self,
         table_name: &str,
-        predicate: &Predicate,
+        filters: &[Expr],
         projection: Option<&Vec<usize>>,
         ctx: IOxSessionContext,
     ) -> Result<Vec<Arc<dyn QueryChunk>>, DataFusionError> {
-        debug!(%table_name, %predicate, "Finding chunks for table");
+        debug!(%table_name, ?filters, "Finding chunks for table");
         // get table metadata
         let table = match self.tables.get(table_name).map(Arc::clone) {
             Some(table) => table,
@@ -56,28 +43,21 @@ impl QueryNamespace for QuerierNamespace {
             }
         };
 
-        let mut chunks = table
+        let chunks = table
             .chunks(
-                predicate,
+                filters,
                 ctx.child_span("QuerierNamespace chunks"),
                 projection,
             )
             .await?;
 
-        // if there is a field restriction on the predicate, only
-        // chunks with that field should be returned. If the chunk has
-        // none of the fields specified, then it doesn't match
-        // TODO: test this branch
-        if let Some(field_columns) = &predicate.field_columns {
-            chunks.retain(|chunk| {
-                let schema = chunk.schema();
-                // keep chunk if it has any of the columns requested
-                field_columns
-                    .iter()
-                    .any(|col| schema.find_index_of(col).is_some())
-            })
-        }
         Ok(chunks)
+    }
+
+    fn retention_time_ns(&self) -> Option<i64> {
+        self.retention_period.map(|d| {
+            self.catalog_cache.time_provider().now().timestamp_nanos() - d.as_nanos() as i64
+        })
     }
 
     fn record_query(
@@ -94,8 +74,18 @@ impl QueryNamespace for QuerierNamespace {
         QueryCompletedToken::new(move |success| query_log.set_completed(entry, success))
     }
 
-    fn as_meta(&self) -> &dyn QueryNamespaceMeta {
-        self
+    fn new_query_context(&self, span_ctx: Option<SpanContext>) -> IOxSessionContext {
+        let mut cfg = self
+            .exec
+            .new_execution_config(ExecutorType::Query)
+            .with_default_catalog(Arc::new(QuerierCatalogProvider::from_namespace(self)) as _)
+            .with_span_context(span_ctx);
+
+        for (k, v) in self.datafusion_config.as_ref() {
+            cfg = cfg.with_config_option(k, v);
+        }
+
+        cfg.build()
     }
 }
 
@@ -108,6 +98,9 @@ pub struct QuerierCatalogProvider {
 
     /// Query log.
     query_log: Arc<QueryLog>,
+
+    /// Include debug info tables.
+    include_debug_info_tables: bool,
 }
 
 impl QuerierCatalogProvider {
@@ -116,6 +109,7 @@ impl QuerierCatalogProvider {
             namespace_id: namespace.id,
             tables: Arc::clone(&namespace.tables),
             query_log: Arc::clone(&namespace.query_log),
+            include_debug_info_tables: namespace.include_debug_info_tables,
         }
     }
 }
@@ -137,23 +131,10 @@ impl CatalogProvider for QuerierCatalogProvider {
             SYSTEM_SCHEMA => Some(Arc::new(SystemSchemaProvider::new(
                 Arc::clone(&self.query_log),
                 self.namespace_id,
+                self.include_debug_info_tables,
             ))),
             _ => None,
         }
-    }
-}
-
-impl CatalogProvider for QuerierNamespace {
-    fn as_any(&self) -> &dyn Any {
-        self as &dyn Any
-    }
-
-    fn schema_names(&self) -> Vec<String> {
-        QuerierCatalogProvider::from_namespace(self).schema_names()
-    }
-
-    fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
-        QuerierCatalogProvider::from_namespace(self).schema(name)
     }
 }
 
@@ -181,22 +162,6 @@ impl SchemaProvider for UserSchemaProvider {
 
     fn table_exist(&self, name: &str) -> bool {
         self.tables.contains_key(name)
-    }
-}
-
-impl ExecutionContextProvider for QuerierNamespace {
-    fn new_query_context(&self, span_ctx: Option<SpanContext>) -> IOxSessionContext {
-        let mut cfg = self
-            .exec
-            .new_execution_config(ExecutorType::Query)
-            .with_default_catalog(Arc::new(QuerierCatalogProvider::from_namespace(self)) as _)
-            .with_span_context(span_ctx);
-
-        for (k, v) in self.datafusion_config.as_ref() {
-            cfg = cfg.with_config_option(k, v);
-        }
-
-        cfg.build()
     }
 }
 

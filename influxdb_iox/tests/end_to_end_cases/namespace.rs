@@ -64,7 +64,10 @@ async fn soft_deletion() {
                         state.cluster().router().router_grpc_connection(),
                     );
                     let namespace_name = state.cluster().namespace();
-                    client.create_namespace(namespace_name, None).await.unwrap();
+                    client
+                        .create_namespace(namespace_name, None, None, None)
+                        .await
+                        .unwrap();
                     let namespaces = client.get_namespaces().await.unwrap();
                     let created_namespace = namespaces
                         .iter()
@@ -192,12 +195,15 @@ async fn soft_deletion() {
                     let namespace_name = state.cluster().namespace();
 
                     let error = client
-                        .create_namespace(namespace_name, None)
+                        .create_namespace(namespace_name, None, None, None)
                         .await
                         .unwrap_err();
                     assert_eq!(
                         error.to_string(),
-                        format!("Internal error: name {namespace_name} already exists"),
+                        format!(
+                            "Some entity that we attempted to create already exists: \
+                            A namespace with the name `{namespace_name}` already exists"
+                        ),
                     );
                 }
                 .boxed()

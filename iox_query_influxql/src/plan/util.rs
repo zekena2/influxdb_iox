@@ -1,5 +1,6 @@
-use crate::plan::{error, util_copy};
+use crate::error;
 use arrow::datatypes::{DataType, TimeUnit};
+use datafusion::common::tree_node::{Transformed, TreeNode, VisitRecursion};
 use datafusion::common::{DFSchemaRef, Result};
 use datafusion::logical_expr::utils::expr_as_column_expr;
 use datafusion::logical_expr::{lit, Expr, ExprSchemable, LogicalPlan, Operator};
@@ -9,7 +10,10 @@ use influxdb_influxql_parser::literal::Number;
 use influxdb_influxql_parser::string::Regex;
 use query_functions::clean_non_meta_escapes;
 use query_functions::coalesce_struct::coalesce_struct;
+use schema::InfluxColumnType;
 use std::sync::Arc;
+
+use super::ir::{DataSourceSchema, Field};
 
 pub(in crate::plan) fn binary_operator_to_df_operator(op: BinaryOperator) -> Operator {
     match op {
@@ -24,17 +28,62 @@ pub(in crate::plan) fn binary_operator_to_df_operator(op: BinaryOperator) -> Ope
     }
 }
 
-/// Container for both the DataFusion and equivalent IOx schema.
-pub(in crate::plan) struct Schemas {
+/// Container for the DataFusion schema as well as
+/// info on which columns are tags.
+pub(in crate::plan) struct IQLSchema<'a> {
     pub(in crate::plan) df_schema: DFSchemaRef,
+    tag_info: TagInfo<'a>,
 }
 
-impl Schemas {
-    pub(in crate::plan) fn new(df_schema: &DFSchemaRef) -> Result<Self> {
+impl<'a> IQLSchema<'a> {
+    /// Create a new IQLSchema from a [`DataSourceSchema`] from the
+    /// FROM clause of a query or subquery.
+    pub(in crate::plan) fn new_from_ds_schema(
+        df_schema: &DFSchemaRef,
+        ds_schema: DataSourceSchema<'a>,
+    ) -> Result<Self> {
         Ok(Self {
             df_schema: Arc::clone(df_schema),
+            tag_info: TagInfo::DataSourceSchema(ds_schema),
         })
     }
+
+    /// Create a new IQLSchema from a list of [`Field`]s on the SELECT list
+    /// of a subquery.
+    pub(in crate::plan) fn new_from_fields(
+        df_schema: &DFSchemaRef,
+        fields: &'a [Field],
+    ) -> Result<Self> {
+        Ok(Self {
+            df_schema: Arc::clone(df_schema),
+            tag_info: TagInfo::FieldList(fields),
+        })
+    }
+
+    /// Returns `true` if the schema contains a tag column with the specified name.
+    pub fn is_tag_field(&self, name: &str) -> bool {
+        match self.tag_info {
+            TagInfo::DataSourceSchema(ref ds_schema) => ds_schema.is_tag_field(name),
+            TagInfo::FieldList(fields) => fields
+                .iter()
+                .any(|f| f.name == name && f.data_type == Some(InfluxColumnType::Tag)),
+        }
+    }
+
+    /// Returns `true` if the schema contains a tag column with the specified name.
+    /// If the underlying data source is a subquery, it will apply any aliases in the
+    /// projection that represents the SELECT list.
+    pub fn is_projected_tag_field(&self, name: &str) -> bool {
+        match self.tag_info {
+            TagInfo::DataSourceSchema(ref ds_schema) => ds_schema.is_projected_tag_field(name),
+            _ => self.is_tag_field(name),
+        }
+    }
+}
+
+pub(in crate::plan) enum TagInfo<'a> {
+    DataSourceSchema(DataSourceSchema<'a>),
+    FieldList(&'a [Field]),
 }
 
 /// Sanitize an InfluxQL regular expression and create a compiled [`regex::Regex`].
@@ -68,6 +117,7 @@ fn number_to_scalar(n: &Number, data_type: &DataType) -> Result<ScalarValue> {
             ),
             fields.clone(),
         ),
+        (_, DataType::Null) => ScalarValue::Null,
         (n, data_type) => {
             // The only output data types expected are Int64, Float64 or UInt64
             return error::internal(format!("no conversion from {n} to {data_type}"));
@@ -99,25 +149,89 @@ pub(crate) fn rebase_expr(
     plan: &LogicalPlan,
 ) -> Result<Expr> {
     if let Some(value) = fill_if_null {
-        util_copy::clone_with_replacement(expr, &|nested_expr| {
-            Ok(if base_exprs.contains(nested_expr) {
-                let col_expr = expr_as_column_expr(nested_expr, plan)?;
+        expr.clone().transform_up(&|nested_expr| {
+            Ok(if base_exprs.contains(&nested_expr) {
+                let col_expr = expr_as_column_expr(&nested_expr, plan)?;
                 let data_type = col_expr.get_type(plan.schema())?;
-                Some(coalesce_struct(vec![
+                Transformed::Yes(coalesce_struct(vec![
                     col_expr,
                     lit(number_to_scalar(value, &data_type)?),
                 ]))
             } else {
-                None
+                Transformed::No(nested_expr)
             })
         })
     } else {
-        util_copy::clone_with_replacement(expr, &|nested_expr| {
-            Ok(if base_exprs.contains(nested_expr) {
-                Some(expr_as_column_expr(nested_expr, plan)?)
+        expr.clone().transform_up(&|nested_expr| {
+            Ok(if base_exprs.contains(&nested_expr) {
+                Transformed::Yes(expr_as_column_expr(&nested_expr, plan)?)
             } else {
-                None
+                Transformed::No(nested_expr)
             })
         })
     }
+}
+
+pub(crate) fn contains_expr(expr: &Expr, needle: &Expr) -> bool {
+    let mut found = false;
+    expr.apply(&mut |expr| {
+        if expr == needle {
+            found = true;
+            Ok(VisitRecursion::Stop)
+        } else {
+            Ok(VisitRecursion::Continue)
+        }
+    })
+    .expect("cannot fail");
+    found
+}
+
+/// Search the provided `Expr`'s, and all of their nested `Expr`, for any that
+/// pass the provided test. The returned `Expr`'s are deduplicated and returned
+/// in order of appearance (depth first).
+///
+/// # NOTE
+///
+/// Copied from DataFusion
+pub(crate) fn find_exprs_in_exprs<F>(exprs: &[Expr], test_fn: &F) -> Vec<Expr>
+where
+    F: Fn(&Expr) -> bool,
+{
+    exprs
+        .iter()
+        .flat_map(|expr| find_exprs_in_expr(expr, test_fn))
+        .fold(vec![], |mut acc, expr| {
+            if !acc.contains(&expr) {
+                acc.push(expr)
+            }
+            acc
+        })
+}
+
+/// Search an `Expr`, and all of its nested `Expr`'s, for any that pass the
+/// provided test. The returned `Expr`'s are deduplicated and returned in order
+/// of appearance (depth first).
+///
+/// # NOTE
+///
+/// Copied from DataFusion
+fn find_exprs_in_expr<F>(expr: &Expr, test_fn: &F) -> Vec<Expr>
+where
+    F: Fn(&Expr) -> bool,
+{
+    let mut exprs = vec![];
+    expr.apply(&mut |expr| {
+        if test_fn(expr) {
+            if !(exprs.contains(expr)) {
+                exprs.push(expr.clone())
+            }
+            // stop recursing down this expr once we find a match
+            return Ok(VisitRecursion::Skip);
+        }
+
+        Ok(VisitRecursion::Continue)
+    })
+    // pre_visit always returns OK, so this will always too
+    .expect("no way to return error during recursion");
+    exprs
 }

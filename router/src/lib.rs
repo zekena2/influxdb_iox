@@ -125,11 +125,19 @@
     clippy::dbg_macro,
     clippy::explicit_iter_loop,
     clippy::clone_on_ref_ptr,
-    clippy::future_not_send
+    // See https://github.com/influxdata/influxdb_iox/pull/1671
+    clippy::future_not_send,
+    unused_crate_dependencies
 )]
 #![allow(clippy::missing_docs_in_private_items)]
 
+// Workaround for "unused crate" lint false positives.
+#[cfg(test)]
+use criterion as _;
+use workspace_hack as _;
+
 pub mod dml_handlers;
+pub mod gossip;
 pub mod namespace_cache;
 pub mod namespace_resolver;
 pub mod server;

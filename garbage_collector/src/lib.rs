@@ -11,11 +11,17 @@
     clippy::todo,
     clippy::dbg_macro,
     clippy::clone_on_ref_ptr,
+    // See https://github.com/influxdata/influxdb_iox/pull/1671
     clippy::future_not_send,
     clippy::todo,
-    clippy::dbg_macro
+    clippy::dbg_macro,
+    unused_crate_dependencies
 )]
 #![allow(clippy::missing_docs_in_private_items)]
+
+// Workaround for "unused crate" lint false positives.
+use clap as _;
+use workspace_hack as _;
 
 use crate::{
     objectstore::{checker as os_checker, deleter as os_deleter, lister as os_lister},
@@ -114,17 +120,31 @@ impl GarbageCollector {
                 },
             }
         });
-        let os_checker = tokio::spawn(os_checker::perform(
-            shutdown.clone(),
-            Arc::clone(&catalog),
-            chrono::Duration::from_std(sub_config.objectstore_cutoff).map_err(|e| {
-                Error::CutoffError {
-                    message: e.to_string(),
-                }
-            })?,
-            rx1,
-            tx2,
-        ));
+
+        let cat = Arc::clone(&catalog);
+        let sdt = shutdown.clone();
+        let cutoff = chrono::Duration::from_std(sub_config.objectstore_cutoff).map_err(|e| {
+            Error::CutoffError {
+                message: e.to_string(),
+            }
+        })?;
+
+        let os_checker = tokio::spawn(async move {
+            select! {
+                ret = os_checker::perform(
+                    cat,
+                    cutoff,
+                    rx1,
+                    tx2,
+                ) => {
+                    ret
+                },
+                _ = sdt.cancelled() => {
+                    Ok(())
+                },
+            }
+        });
+
         let os_deleter = tokio::spawn(os_deleter::perform(
             shutdown.clone(),
             object_store,

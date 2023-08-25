@@ -27,7 +27,7 @@ use datafusion::{
     physical_plan::{
         expressions::Column,
         metrics::{BaselineMetrics, ExecutionPlanMetricsSet},
-        DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PhysicalExpr,
+        DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PhysicalExpr,
         SendableRecordBatchStream, Statistics,
     },
     prelude::Expr,
@@ -223,12 +223,18 @@ impl UserDefinedLogicalNodeCore for GapFill {
             })
             .collect::<Vec<String>>()
             .join(", ");
+
+        let group_expr = self
+            .group_expr
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<String>>()
+            .join(", ");
+
         write!(
             f,
-            "{}: groupBy=[{:?}], aggr=[[{}]], time_column={}, stride={}, range={:?}",
+            "{}: groupBy=[{group_expr}], aggr=[[{aggr_expr}]], time_column={}, stride={}, range={:?}",
             self.name(),
-            self.group_expr,
-            aggr_expr,
             self.params.time_column,
             self.params.stride,
             self.params.time_range,
@@ -528,9 +534,15 @@ impl ExecutionPlan for GapFillExec {
         )?))
     }
 
+    fn statistics(&self) -> Statistics {
+        Statistics::default()
+    }
+}
+
+impl DisplayAs for GapFillExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match t {
-            DisplayFormatType::Default => {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 let group_expr: Vec<_> = self.group_expr.iter().map(|e| e.to_string()).collect();
                 let aggr_expr: Vec<_> = self
                     .params
@@ -559,10 +571,6 @@ impl ExecutionPlan for GapFillExec {
                 )
             }
         }
-    }
-
-    fn statistics(&self) -> Statistics {
-        Statistics::default()
     }
 }
 
@@ -740,7 +748,7 @@ mod test {
             format_logical_plan(&plan),
             @r###"
         ---
-        - " GapFill: groupBy=[[loc, time]], aggr=[[temp]], time_column=time, stride=IntervalDayTime(\"60000\"), range=Included(TimestampNanosecond(1000, None))..Excluded(TimestampNanosecond(2000, None))"
+        - " GapFill: groupBy=[loc, time], aggr=[[temp]], time_column=time, stride=IntervalDayTime(\"60000\"), range=Included(Literal(TimestampNanosecond(1000, None)))..Excluded(Literal(TimestampNanosecond(2000, None)))"
         - "   TableScan: temps"
         "###
         );
@@ -775,7 +783,7 @@ mod test {
         - "   GapFillExec: group_expr=[date_bin_gapfill(IntervalMonthDayNano(\"60000000000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@0], aggr_expr=[AVG(temps.temp)@1], stride=60000000000, time_range=Included(\"315532800000000000\")..Excluded(\"347155200000000000\")"
         - "     SortExec: expr=[date_bin_gapfill(IntervalMonthDayNano(\"60000000000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@0 ASC]"
         - "       AggregateExec: mode=Final, gby=[date_bin_gapfill(IntervalMonthDayNano(\"60000000000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@0 as date_bin_gapfill(IntervalMonthDayNano(\"60000000000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))], aggr=[AVG(temps.temp)]"
-        - "         AggregateExec: mode=Partial, gby=[datebin(60000000000, time@0, 0) as date_bin_gapfill(IntervalMonthDayNano(\"60000000000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))], aggr=[AVG(temps.temp)]"
+        - "         AggregateExec: mode=Partial, gby=[date_bin(60000000000, time@0, 0) as date_bin_gapfill(IntervalMonthDayNano(\"60000000000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))], aggr=[AVG(temps.temp)]"
         - "           EmptyExec: produce_one_row=false"
         "###
         );
@@ -805,7 +813,7 @@ mod test {
         - "   GapFillExec: group_expr=[loc@0, date_bin_gapfill(IntervalMonthDayNano(\"60000000000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@1, concat(Utf8(\"zz\"),temps.loc)@2], aggr_expr=[AVG(temps.temp)@3], stride=60000000000, time_range=Included(\"315532800000000000\")..Excluded(\"347155200000000000\")"
         - "     SortExec: expr=[loc@0 ASC,concat(Utf8(\"zz\"),temps.loc)@2 ASC,date_bin_gapfill(IntervalMonthDayNano(\"60000000000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@1 ASC]"
         - "       AggregateExec: mode=Final, gby=[loc@0 as loc, date_bin_gapfill(IntervalMonthDayNano(\"60000000000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\"))@1 as date_bin_gapfill(IntervalMonthDayNano(\"60000000000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\")), concat(Utf8(\"zz\"),temps.loc)@2 as concat(Utf8(\"zz\"),temps.loc)], aggr=[AVG(temps.temp)]"
-        - "         AggregateExec: mode=Partial, gby=[loc@1 as loc, datebin(60000000000, time@0, 0) as date_bin_gapfill(IntervalMonthDayNano(\"60000000000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\")), concat(zz, loc@1) as concat(Utf8(\"zz\"),temps.loc)], aggr=[AVG(temps.temp)]"
+        - "         AggregateExec: mode=Partial, gby=[loc@1 as loc, date_bin(60000000000, time@0, 0) as date_bin_gapfill(IntervalMonthDayNano(\"60000000000\"),temps.time,Utf8(\"1970-01-01T00:00:00Z\")), concat(zz, loc@1) as concat(Utf8(\"zz\"),temps.loc)], aggr=[AVG(temps.temp)]"
         - "           EmptyExec: produce_one_row=false"
         "###
         );

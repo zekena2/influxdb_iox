@@ -51,7 +51,7 @@ fn shard_id_without_num_shards_is_invalid() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "must provide or not provide shard ID and count",
+            "the following required arguments were not provided:\n  --compaction-shard-count <SHARD_COUNT>",
         ));
 }
 
@@ -70,7 +70,7 @@ fn num_shards_without_shard_id_is_invalid() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "must provide or not provide shard ID and count",
+            "shard_count must be paired with either shard_id or hostname",
         ));
 }
 
@@ -120,7 +120,7 @@ async fn sharded_compactor_0_always_compacts_partition_1() {
                 "my_awesome_table,tag1=A,tag2=B val=42i 123456",
             )),
             // wait for partitions to be persisted
-            Step::WaitForPersisted2 {
+            Step::WaitForPersisted {
                 expected_increase: 1,
             },
             // Run the compactor
@@ -157,10 +157,12 @@ async fn sharded_compactor_0_always_compacts_partition_1() {
                         .assert()
                         .success()
                         .stdout(
-                            // Important parts are the expected partition ID
-                            predicate::str::contains(r#""partitionId": "1","#)
-                                // and compaction level
-                                .and(predicate::str::contains(r#""compactionLevel": 1"#)),
+                            // Important parts are the expected partition identifier
+                            predicate::str::contains(
+                                r#""hashId": "uGKn6bMp7mpBjN4ZEZjq6xUSdT8ZuHqB3vKubD0O0jc=""#,
+                            )
+                            // and compaction level
+                            .and(predicate::str::contains(r#""compactionLevel": 1"#)),
                         );
                 }
                 .boxed()
@@ -203,7 +205,7 @@ async fn sharded_compactor_1_never_compacts_partition_1() {
                 "my_awesome_table,tag1=A,tag2=B val=42i 123456",
             )),
             // wait for partitions to be persisted
-            Step::WaitForPersisted2 {
+            Step::WaitForPersisted {
                 expected_increase: 1,
             },
             // Run the compactor
@@ -240,10 +242,12 @@ async fn sharded_compactor_1_never_compacts_partition_1() {
                         .assert()
                         .success()
                         .stdout(
-                            // Important parts are the expected partition ID
-                            predicate::str::contains(r#""partitionId": "1","#)
-                                // and compaction level is 0 so it's not returned
-                                .and(predicate::str::contains("compactionLevel").not()),
+                            // Important parts are the expected partition identifier
+                            predicate::str::contains(
+                                r#""hashId": "uGKn6bMp7mpBjN4ZEZjq6xUSdT8ZuHqB3vKubD0O0jc=""#,
+                            )
+                            // and compaction level is 0 so it's not returned
+                            .and(predicate::str::contains("compactionLevel").not()),
                         );
                 }
                 .boxed()

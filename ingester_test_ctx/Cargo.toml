@@ -23,14 +23,14 @@ iox_time = { path = "../iox_time" }
 metric = { version = "0.1.0", path = "../metric" }
 mutable_batch_lp = { path = "../mutable_batch_lp" }
 mutable_batch_pb = { version = "0.1.0", path = "../mutable_batch_pb" }
-object_store = "0.5.6"
+object_store = { workspace = true }
 observability_deps = { version = "0.1.0", path = "../observability_deps" }
 parquet_file = { version = "0.1.0", path = "../parquet_file" }
 prost = { version = "0.11.9", default-features = false, features = ["std"] }
-tempfile = { version = "3.5.0" }
+tempfile = { version = "3.8.0" }
 test_helpers = { path = "../test_helpers", features = ["future_timeout"] }
-tokio = { version = "1.28", features = ["macros", "parking_lot", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.32", features = ["macros", "parking_lot", "rt-multi-thread", "sync", "time"] }
 tokio-util = "0.7.8"
 tonic = { workspace = true }
-wal = { version = "0.1.0", path = "../wal" }
+trace = { version = "0.1.0", path = "../trace" }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }

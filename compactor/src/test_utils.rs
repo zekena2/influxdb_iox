@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use data_types::{
-    Column, ColumnId, ColumnType, ColumnsByName, NamespaceId, PartitionId, PartitionKey, Table,
-    TableId, TableSchema,
+    Column, ColumnId, ColumnType, ColumnsByName, NamespaceId, PartitionHashId, PartitionId,
+    PartitionKey, Table, TableId, TableSchema,
 };
 
 use crate::PartitionInfo;
@@ -16,20 +16,26 @@ impl PartitionInfoBuilder {
         let partition_id = PartitionId::new(1);
         let namespace_id = NamespaceId::new(2);
         let table_id = TableId::new(3);
+        let partition_key = PartitionKey::from("key");
+        let partition_hash_id = Some(PartitionHashId::new(table_id, &partition_key));
+        let table = Arc::new(Table {
+            id: table_id,
+            namespace_id,
+            name: String::from("table"),
+            partition_template: Default::default(),
+        });
+        let table_schema = Arc::new(TableSchema::new_empty_from(&table));
 
         Self {
             inner: PartitionInfo {
                 partition_id,
+                partition_hash_id,
                 namespace_id,
                 namespace_name: String::from("ns"),
-                table: Arc::new(Table {
-                    id: TableId::new(3),
-                    namespace_id,
-                    name: String::from("table"),
-                }),
-                table_schema: Arc::new(TableSchema::new(table_id)),
+                table,
+                table_schema,
                 sort_key: None,
-                partition_key: PartitionKey::from("key"),
+                partition_key,
             },
         }
     }
@@ -51,7 +57,7 @@ impl PartitionInfoBuilder {
 
         let table_schema = Arc::new(TableSchema {
             id: self.inner.table.id,
-            partition_template: None,
+            partition_template: Default::default(),
             columns: ColumnsByName::new(columns),
         });
         self.inner.table_schema = table_schema;

@@ -1,6 +1,6 @@
 use data_types::{
     ColumnSet, CompactionLevel, NamespaceId, ParquetFile, ParquetFileId, Partition, PartitionId,
-    PartitionKey, SkippedCompaction, Table, TableId, Timestamp,
+    PartitionKey, SkippedCompaction, Table, TableId, Timestamp, TransitionPartitionId,
 };
 use uuid::Uuid;
 
@@ -14,12 +14,16 @@ impl ParquetFileBuilder {
     /// Create a builder that will create a parquet file with
     /// `parquet_id` of `id`
     pub fn new(id: i64) -> Self {
+        let table_id = TableId::new(0);
         Self {
             file: ParquetFile {
                 id: ParquetFileId::new(id),
                 namespace_id: NamespaceId::new(0),
-                table_id: TableId::new(0),
-                partition_id: PartitionId::new(0),
+                table_id,
+                partition_id: TransitionPartitionId::new(
+                    table_id,
+                    &PartitionKey::from("arbitrary"),
+                ),
                 object_store_id: Uuid::from_u128(id.try_into().expect("invalid id")),
                 min_time: Timestamp::new(0),
                 max_time: Timestamp::new(0),
@@ -34,11 +38,11 @@ impl ParquetFileBuilder {
         }
     }
 
-    /// Set the partition id
-    pub fn with_partition(self, id: i64) -> Self {
+    /// Set the partition identifier
+    pub fn with_partition(self, partition_id: TransitionPartitionId) -> Self {
         Self {
             file: ParquetFile {
-                partition_id: PartitionId::new(id),
+                partition_id,
                 ..self.file
             },
         }
@@ -121,6 +125,7 @@ impl TableBuilder {
                 id: TableId::new(id),
                 namespace_id: NamespaceId::new(0),
                 name: "table".to_string(),
+                partition_template: Default::default(),
             },
         }
     }
@@ -151,13 +156,14 @@ impl PartitionBuilder {
     /// Create a builder to create a partition with `partition_id` `id`
     pub fn new(id: i64) -> Self {
         Self {
-            partition: Partition {
-                id: PartitionId::new(id),
-                table_id: TableId::new(0),
-                partition_key: PartitionKey::from("key"),
-                sort_key: vec![],
-                new_file_at: None,
-            },
+            partition: Partition::new_in_memory_only(
+                PartitionId::new(id),
+                TableId::new(0),
+                PartitionKey::from("key"),
+                vec![],
+                None,
+                None,
+            ),
         }
     }
 

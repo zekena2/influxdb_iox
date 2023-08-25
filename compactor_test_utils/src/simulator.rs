@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
@@ -51,6 +51,8 @@ pub struct ParquetFileSimulator {
     run_id_generator: AtomicUsize,
     /// Used to track total bytes written (to help judge efficiency changes)
     bytes_written: Arc<AtomicUsize>,
+    /// map of bytes written per plan type
+    bytes_written_per_plan: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl std::fmt::Display for ParquetFileSimulator {
@@ -62,11 +64,16 @@ impl std::fmt::Display for ParquetFileSimulator {
 impl ParquetFileSimulator {
     /// Create a new simulator for creating parquet files, which
     /// appends its output to `run_log`
-    pub fn new(run_log: Arc<Mutex<Vec<String>>>, bytes_written: Arc<AtomicUsize>) -> Self {
+    pub fn new(
+        run_log: Arc<Mutex<Vec<String>>>,
+        bytes_written: Arc<AtomicUsize>,
+        bytes_written_per_plan: Arc<Mutex<HashMap<String, usize>>>,
+    ) -> Self {
         Self {
             run_log,
             run_id_generator: AtomicUsize::new(0),
             bytes_written,
+            bytes_written_per_plan,
         }
     }
 
@@ -143,6 +150,13 @@ impl ParquetFilesSink for ParquetFileSimulator {
         self.bytes_written
             .fetch_add(bytes_written as usize, Ordering::Relaxed);
 
+        self.bytes_written_per_plan
+            .lock()
+            .unwrap()
+            .entry(plan_ir.to_string())
+            .and_modify(|e| *e += bytes_written as usize)
+            .or_insert(bytes_written as usize);
+
         Ok(output_params)
     }
 
@@ -202,7 +216,7 @@ impl SimulatedFile {
         ParquetFileParams {
             namespace_id: partition_info.namespace_id,
             table_id: partition_info.table.id,
-            partition_id: partition_info.partition_id,
+            partition_id: partition_info.partition_id(),
             object_store_id: Uuid::new_v4(),
             min_time,
             max_time,
@@ -278,7 +292,7 @@ fn even_time_split(
 ) -> Vec<SimulatedFile> {
     let overall_min_time = files.iter().map(|f| f.min_time).min().unwrap();
     let overall_max_time = files.iter().map(|f| f.max_time).max().unwrap();
-    let overall_time_range = overall_max_time - overall_min_time;
+    let overall_time_range = overall_max_time - overall_min_time + 1;
 
     let total_input_rows: i64 = files.iter().map(|f| f.row_count).sum();
     let total_input_size: i64 = files.iter().map(|f| f.file_size_bytes).sum();
@@ -291,6 +305,9 @@ fn even_time_split(
             "split times {last_split} {split} must be in ascending order",
         );
         assert!(
+            // split time is the last ns in the resulting 'left' file.  If split time
+            // matches the last ns of the input file, the input file does not need
+            // split at this time.
             Timestamp::new(*split) < overall_max_time,
             "split time {} must be less than time range max {}",
             split,
@@ -327,7 +344,8 @@ fn even_time_split(
     let mut simulated_files: Vec<_> = time_ranges
         .into_iter()
         .map(|(min_time, max_time)| {
-            let p = ((max_time - min_time).get() as f64) / ((overall_time_range).get() as f64);
+            let p =
+                ((max_time - min_time).get() as f64 + 1.0) / ((overall_time_range).get() as f64);
 
             let file_size_bytes = (total_input_size as f64 * p) as i64;
             let row_count = (total_input_rows as f64 * p) as i64;

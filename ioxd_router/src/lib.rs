@@ -1,3 +1,21 @@
+#![deny(rustdoc::broken_intra_doc_links, rust_2018_idioms)]
+#![warn(
+    clippy::clone_on_ref_ptr,
+    clippy::dbg_macro,
+    clippy::explicit_iter_loop,
+    // See https://github.com/influxdata/influxdb_iox/pull/1671
+    clippy::future_not_send,
+    clippy::todo,
+    clippy::use_self,
+    missing_debug_implementations,
+    unused_crate_dependencies
+)]
+#![allow(clippy::default_constructed_unit_structs)]
+
+use gossip::TopicInterests;
+// Workaround for "unused crate" lint false positives.
+use workspace_hack as _;
+
 use std::{
     fmt::{Debug, Display},
     sync::Arc,
@@ -5,8 +23,8 @@ use std::{
 
 use async_trait::async_trait;
 use authz::{Authorizer, AuthorizerInstrumentation, IoxAuthorizer};
-use clap_blocks::router::RouterConfig;
-use data_types::{DefaultPartitionTemplate, NamespaceName};
+use clap_blocks::{gossip::GossipConfig, router::RouterConfig};
+use data_types::NamespaceName;
 use hashbrown::HashMap;
 use hyper::{Body, Request, Response};
 use iox_catalog::interface::Catalog;
@@ -15,8 +33,9 @@ use ioxd_common::{
     http::error::{HttpApiError, HttpApiErrorSource},
     reexport::{
         generated_types::influxdata::iox::{
-            catalog::v1::catalog_service_server, namespace::v1::namespace_service_server,
-            object_store::v1::object_store_service_server, schema::v1::schema_service_server,
+            catalog::v1::catalog_service_server, gossip::Topic,
+            namespace::v1::namespace_service_server, object_store::v1::object_store_service_server,
+            schema::v1::schema_service_server, table::v1::table_service_server,
         },
         tonic::transport::Endpoint,
     },
@@ -33,9 +52,13 @@ use router::{
         lazy_connector::LazyConnector, DmlHandler, DmlHandlerChainExt, FanOutAdaptor,
         InstrumentationDecorator, Partitioner, RetentionValidator, RpcWrite, SchemaValidator,
     },
+    gossip::{
+        dispatcher::GossipMessageDispatcher, namespace_cache::NamespaceSchemaGossip,
+        schema_change_observer::SchemaChangeObserver,
+    },
     namespace_cache::{
-        metrics::InstrumentedCache, MemoryNamespaceCache, NamespaceCache, ReadThroughCache,
-        ShardedCache,
+        metrics::InstrumentedCache, MaybeLayer, MemoryNamespaceCache, NamespaceCache,
+        ReadThroughCache, ShardedCache,
     },
     namespace_resolver::{
         MissingNamespaceAction, NamespaceAutocreation, NamespaceResolver, NamespaceSchemaResolver,
@@ -69,6 +92,10 @@ pub enum Error {
         source: Box<dyn std::error::Error>,
         addr: String,
     },
+
+    /// An error binding the UDP socket for gossip communication.
+    #[error("failed to bind udp gossip socket: {0}")]
+    GossipBind(std::io::Error),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -155,6 +182,10 @@ where
                 self.server.grpc().namespace_service()
             )
         );
+        add_service!(
+            builder,
+            table_service_server::TableServiceServer::new(self.server.grpc().table_service())
+        );
         serve_builder!(builder);
 
         Ok(())
@@ -197,6 +228,8 @@ pub async fn create_router_server_type(
     catalog: Arc<dyn Catalog>,
     object_store: Arc<DynObjectStore>,
     router_config: &RouterConfig,
+    gossip_config: &GossipConfig,
+    trace_context_header_name: String,
 ) -> Result<Arc<dyn ServerType>> {
     let ingester_connections = router_config.ingester_addresses.iter().map(|addr| {
         let addr = addr.to_string();
@@ -207,6 +240,7 @@ pub async fn create_router_server_type(
                 endpoint,
                 router_config.rpc_write_timeout_seconds,
                 router_config.rpc_write_max_outgoing_bytes,
+                trace_context_header_name.clone(),
             ),
             addr,
         )
@@ -217,6 +251,7 @@ pub async fn create_router_server_type(
         ingester_connections,
         router_config.rpc_write_replicas,
         &metrics,
+        router_config.rpc_write_health_num_probes,
     );
     let rpc_writer = InstrumentationDecorator::new("rpc_writer", &metrics, rpc_writer);
 
@@ -225,19 +260,91 @@ pub async fn create_router_server_type(
     // Initialise an instrumented namespace cache to be shared with the schema
     // validator, and namespace auto-creator that reports cache hit/miss/update
     // metrics.
-    let ns_cache = Arc::new(ReadThroughCache::new(
-        Arc::new(InstrumentedCache::new(
-            Arc::new(ShardedCache::new(
-                std::iter::repeat_with(|| Arc::new(MemoryNamespaceCache::default())).take(10),
-            )),
-            &metrics,
+    let ns_cache = Arc::new(InstrumentedCache::new(
+        Arc::new(ShardedCache::new(
+            std::iter::repeat_with(|| Arc::new(MemoryNamespaceCache::default())).take(10),
         )),
-        Arc::clone(&catalog),
+        &metrics,
     ));
 
+    // Pre-warm the cache before adding the gossip layer to avoid broadcasting
+    // the full cache content at startup.
     pre_warm_schema_cache(&ns_cache, &*catalog)
         .await
         .expect("namespace cache pre-warming failed");
+
+    // Optionally initialise the schema gossip subsystem.
+    //
+    // The schema gossip primitives sit in the stack of NamespaceCache layers:
+    //
+    //                   ┌───────────────────────────┐
+    //                   │     ReadThroughCache      │
+    //                   └───────────────────────────┘
+    //                                 │
+    //                                 ▼
+    //                   ┌───────────────────────────┐
+    //                   │   SchemaChangeObserver    │◀ ─ ─ ─ ─
+    //                   └───────────────────────────┘         │
+    //                                 │                     peers
+    //                                 ▼                       ▲
+    //                   ┌───────────────────────────┐         │
+    //                   │   Incoming Gossip Apply   │─ ─ ─ ─ ─
+    //                   └───────────────────────────┘
+    //                                 │
+    //                                 ▼
+    //                   ┌───────────────────────────┐
+    //                   │      Underlying Impl      │
+    //                   └───────────────────────────┘
+    //
+    //
+    //   - SchemaChangeObserver: sends outgoing gossip schema diffs
+    //   - NamespaceSchemaGossip: applies incoming gossip diffs locally
+    //
+    // The SchemaChangeObserver is responsible for gossiping any diffs that pass
+    // through it - it MUST sit above the NamespaceSchemaGossip layer
+    // responsible for applying gossip diffs from peers (otherwise the local
+    // node will receive a gossip diff and apply it, which passes through the
+    // diff layer, and causes the local node to gossip it again).
+    //
+    // These gossip layers sit below the catalog lookups, so that they do not
+    // drive catalog queries themselves (defeating the point of the gossiping!).
+    // If a local node has to perform a catalog lookup, it gossips the result to
+    // other peers, helping converge them.
+    let ns_cache = match gossip_config.gossip_bind_address {
+        Some(bind_addr) => {
+            // Initialise the NamespaceSchemaGossip responsible for applying the
+            // incoming gossip schema diffs.
+            let gossip_reader = Arc::new(NamespaceSchemaGossip::new(Arc::clone(&ns_cache)));
+            // Adapt it to the gossip subsystem via the "Dispatcher" trait
+            let dispatcher = GossipMessageDispatcher::new(Arc::clone(&gossip_reader), 100);
+
+            // Initialise the gossip subsystem, delegating message processing to
+            // the above dispatcher.
+            let handle = gossip::Builder::<_, Topic>::new(
+                gossip_config.seed_list.clone(),
+                dispatcher,
+                Arc::clone(&metrics),
+            )
+            // Configure the router to listen to SchemaChange messages.
+            .with_topic_filter(TopicInterests::default().with_topic(Topic::SchemaChanges))
+            .bind(*bind_addr)
+            .await
+            .map_err(Error::GossipBind)?;
+
+            // Initialise the local diff observer responsible for gossiping any
+            // local changes made to the cache content.
+            //
+            // This sits above / wraps the NamespaceSchemaGossip layer.
+            let ns_cache = SchemaChangeObserver::new(ns_cache, Arc::new(handle));
+
+            MaybeLayer::With(ns_cache)
+        }
+        None => MaybeLayer::Without(ns_cache),
+    };
+
+    // Wrap the NamespaceCache in a read-through layer that queries the catalog
+    // for cache misses, and populates the local cache with the result.
+    let ns_cache = Arc::new(ReadThroughCache::new(ns_cache, Arc::clone(&catalog)));
 
     // # Schema validator
     //
@@ -257,8 +364,8 @@ pub async fn create_router_server_type(
     // # Write partitioner
     //
     // Add a write partitioner into the handler stack that splits by the date
-    // portion of the write's timestamp (the default [`PartitionTemplate`]).
-    let partitioner = Partitioner::new(DefaultPartitionTemplate::default());
+    // portion of the write's timestamp (the default table partition template)
+    let partitioner = Partitioner::default();
     let partitioner = InstrumentationDecorator::new("partitioner", &metrics, partitioner);
 
     // # Namespace resolver
@@ -397,7 +504,6 @@ mod tests {
 
         let mut repos = catalog.repositories().await;
         let namespace = arbitrary_namespace(&mut *repos, "test_ns").await;
-
         let table = arbitrary_table(&mut *repos, "name", &namespace).await;
         let _column = repos
             .columns()

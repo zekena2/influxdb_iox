@@ -1,10 +1,10 @@
 use async_trait::async_trait;
 use data_types::{
-    DefaultPartitionTemplate, NamespaceName, NamespaceSchema, PartitionKey, PartitionTemplate,
-    TableId, TablePartitionTemplateOverride,
+    partition_template::TablePartitionTemplateOverride, NamespaceName, NamespaceSchema,
+    PartitionKey, TableId,
 };
 use hashbrown::HashMap;
-use mutable_batch::{MutableBatch, PartitionWrite, WritePayload};
+use mutable_batch::{MutableBatch, PartitionKeyError, PartitionWrite, WritePayload};
 use observability_deps::tracing::*;
 use std::sync::Arc;
 use thiserror::Error;
@@ -18,6 +18,10 @@ pub enum PartitionError {
     /// Failed to write to the partitioned table batch.
     #[error("error batching into partitioned write: {0}")]
     BatchWrite(#[from] mutable_batch::Error),
+
+    /// An error deriving the partition key from the partition key template.
+    #[error("error generating partition key: {0}")]
+    Partitioner(#[from] PartitionKeyError),
 }
 
 /// A decorator of `T`, tagging it with the partition key derived from it.
@@ -45,49 +49,29 @@ impl<T> Partitioned<T> {
 }
 
 /// A [`DmlHandler`] implementation that splits per-table [`MutableBatch`] into
-/// partitioned per-table [`MutableBatch`] instances according to a configured
-/// [`DefaultPartitionTemplate`]. Deletes pass through unmodified.
+/// partitioned per-table [`MutableBatch`] instances according to the tables' partition templates.
+/// Deletes pass through unmodified.
 ///
 /// A vector of partitions are returned to the caller, or the first error that
 /// occurs during partitioning.
-#[derive(Debug)]
-pub struct Partitioner {
-    partition_template: Arc<DefaultPartitionTemplate>,
-}
-
-impl Partitioner {
-    /// Initialise a new [`Partitioner`], splitting writes according to the
-    /// specified [`DefaultPartitionTemplate`].
-    pub fn new(partition_template: DefaultPartitionTemplate) -> Self {
-        Self {
-            partition_template: Arc::new(partition_template),
-        }
-    }
-}
+#[derive(Debug, Default)]
+pub struct Partitioner {}
 
 #[async_trait]
 impl DmlHandler for Partitioner {
     type WriteError = PartitionError;
 
-    type WriteInput = HashMap<
-        TableId,
-        (
-            String,
-            Option<Arc<TablePartitionTemplateOverride>>,
-            MutableBatch,
-        ),
-    >;
+    type WriteInput = HashMap<TableId, (String, TablePartitionTemplateOverride, MutableBatch)>;
     type WriteOutput = Vec<Partitioned<HashMap<TableId, (String, MutableBatch)>>>;
 
     /// Partition the per-table [`MutableBatch`].
     async fn write(
         &self,
         _namespace: &NamespaceName<'static>,
-        namespace_schema: Arc<NamespaceSchema>,
+        _namespace_schema: Arc<NamespaceSchema>,
         batch: Self::WriteInput,
         _span_ctx: Option<SpanContext>,
     ) -> Result<Self::WriteOutput, Self::WriteError> {
-        let namespace_partition_template = &namespace_schema.partition_template;
         // A collection of partition-keyed, per-table MutableBatch instances.
         let mut partitions: HashMap<PartitionKey, HashMap<_, (String, MutableBatch)>> =
             HashMap::default();
@@ -95,15 +79,8 @@ impl DmlHandler for Partitioner {
         for (table_id, (table_name, table_partition_template, batch)) in batch {
             // Partition the table batch according to the configured partition
             // template and write it into the partition-keyed map.
-
-            let partition_template = PartitionTemplate::determine_precedence(
-                table_partition_template.as_ref(),
-                namespace_partition_template.as_ref(),
-                &self.partition_template,
-            );
-
             for (partition_key, partition_payload) in
-                PartitionWrite::partition(&batch, partition_template)
+                PartitionWrite::partition(&batch, &table_partition_template)?
             {
                 let partition = partitions.entry(partition_key).or_default();
                 let table_batch = partition
@@ -127,44 +104,39 @@ impl DmlHandler for Partitioner {
 #[cfg(test)]
 mod tests {
     use assert_matches::assert_matches;
-    use data_types::{NamespaceId, NamespacePartitionTemplateOverride, TemplatePart};
+    use chrono::{format::StrftimeItems, TimeZone, Utc};
+    use data_types::{
+        partition_template::{test_table_partition_override, TemplatePart},
+        NamespaceId,
+    };
+    use mutable_batch::writer::Writer;
+    use proptest::prelude::*;
 
     use super::*;
 
     // Parse `lp` into a table-keyed MutableBatch map.
     pub(crate) fn lp_to_writes(
         lp: &str,
-    ) -> HashMap<
-        TableId,
-        (
-            String,
-            Option<Arc<TablePartitionTemplateOverride>>,
-            MutableBatch,
-        ),
-    > {
+    ) -> HashMap<TableId, (String, TablePartitionTemplateOverride, MutableBatch)> {
         let (writes, _) = mutable_batch_lp::lines_to_batches_stats(lp, 42)
             .expect("failed to build test writes from LP");
 
         writes
             .into_iter()
             .enumerate()
-            .map(|(i, (name, data))| (TableId::new(i as _), (name, None, data)))
+            .map(|(i, (name, data))| (TableId::new(i as _), (name, Default::default(), data)))
             .collect()
     }
 
-    // Start a new `NamespaceSchema` with only the given ID and partition template override; the
-    // rest of the fields are arbitrary.
-    fn namespace_schema(
-        id: i64,
-        partition_template: Option<Arc<NamespacePartitionTemplateOverride>>,
-    ) -> Arc<NamespaceSchema> {
+    // Start a new `NamespaceSchema` with only the given ID; the rest of the fields are arbitrary.
+    fn namespace_schema(id: i64) -> Arc<NamespaceSchema> {
         Arc::new(NamespaceSchema {
             id: NamespaceId::new(id),
             tables: Default::default(),
             max_columns_per_table: 500,
             max_tables: 200,
             retention_period_ns: None,
-            partition_template,
+            partition_template: Default::default(),
         })
     }
 
@@ -182,16 +154,14 @@ mod tests {
             paste::paste! {
                 #[tokio::test]
                 async fn [<test_write_ $name>]() {
-                    let partition_template = DefaultPartitionTemplate::default();
-
-                    let partitioner = Partitioner::new(partition_template);
+                    let partitioner = Partitioner::default();
                     let ns = NamespaceName::new("bananas").expect("valid db name");
 
                     let writes = lp_to_writes($lp);
 
                     let handler_ret = partitioner.write(
                         &ns,
-                        namespace_schema(42, None),
+                        namespace_schema(42),
                         writes,
                         None
                     ).await;
@@ -338,94 +308,17 @@ mod tests {
     );
 
     #[tokio::test]
-    async fn test_write_namespace_partition_template() {
-        let partitioner = Partitioner::new(DefaultPartitionTemplate::default());
+    async fn test_write_table_partition_template() {
+        let partitioner = Partitioner::default();
         let ns = NamespaceName::new("bananas").expect("valid db name");
 
-        let namespace_partition_template = Some(Arc::new(NamespacePartitionTemplateOverride::new(
-            PartitionTemplate {
-                parts: vec![
-                    TemplatePart::TimeFormat("%Y".to_string()),
-                    TemplatePart::Column("tag1".to_string()),
-                    TemplatePart::Column("nonanas".to_string()),
-                ],
-            },
-        )));
-        let namespace_schema = namespace_schema(42, namespace_partition_template);
+        let namespace_schema = namespace_schema(42);
 
-        let writes = lp_to_writes(
-            "
-            bananas,tag1=A,tag2=C val=42i 1\n\
-            platanos,tag1=B,tag2=C value=42i 1465839830100400200\n\
-            platanos,tag1=A,tag2=D value=42i 1\n\
-            bananas,tag1=B,tag2=D value=42i 1465839830100400200\n\
-            bananas,tag1=A,tag2=D value=42i 1465839830100400200\n\
-        ",
-        );
-
-        let handler_ret = partitioner.write(&ns, namespace_schema, writes, None).await;
-
-        // Check the partition -> table mapping.
-        let got = handler_ret
-            .unwrap_or_default()
-            .into_iter()
-            .map(|partition| {
-                // Extract the table names in this partition
-                let mut tables = partition
-                    .payload
-                    .values()
-                    .map(|v| v.0.clone())
-                    .collect::<Vec<String>>();
-
-                tables.sort();
-
-                (partition.key, tables)
-            })
-            .collect::<HashMap<_, _>>();
-
-        let expected = HashMap::from([
-            (
-                PartitionKey::from("2016-tag1_B-nonanas"),
-                vec!["bananas".into(), "platanos".into()],
-            ),
-            (
-                PartitionKey::from("1970-tag1_A-nonanas"),
-                vec!["bananas".into(), "platanos".into()],
-            ),
-            (
-                PartitionKey::from("2016-tag1_A-nonanas"),
-                vec!["bananas".into()],
-            ),
+        let bananas_table_template = test_table_partition_override(vec![
+            TemplatePart::TagValue("oranges"),
+            TemplatePart::TimeFormat("%Y-%m"),
+            TemplatePart::TagValue("tag2"),
         ]);
-
-        pretty_assertions::assert_eq!(expected, got);
-    }
-
-    #[tokio::test]
-    async fn test_write_namespace_and_table_partition_template() {
-        let partitioner = Partitioner::new(DefaultPartitionTemplate::default());
-        let ns = NamespaceName::new("bananas").expect("valid db name");
-
-        // Specify this but the table partition will take precedence for bananas.
-        let namespace_partition_template = Some(Arc::new(NamespacePartitionTemplateOverride::new(
-            PartitionTemplate {
-                parts: vec![
-                    TemplatePart::TimeFormat("%Y".to_string()),
-                    TemplatePart::Column("tag1".to_string()),
-                    TemplatePart::Column("nonanas".to_string()),
-                ],
-            },
-        )));
-        let namespace_schema = namespace_schema(42, namespace_partition_template);
-        let bananas_table_template = Some(Arc::new(TablePartitionTemplateOverride::new(
-            PartitionTemplate {
-                parts: vec![
-                    TemplatePart::Column("oranges".to_string()),
-                    TemplatePart::TimeFormat("%Y-%m".to_string()),
-                    TemplatePart::Column("tag2".to_string()),
-                ],
-            },
-        )));
 
         let lp = "
             bananas,tag1=A,tag2=C val=42i 1\n\
@@ -444,7 +337,7 @@ mod tests {
             .map(|(i, (name, data))| {
                 let table_partition_template = match name.as_str() {
                     "bananas" => bananas_table_template.clone(),
-                    _ => None,
+                    _ => Default::default(),
                 };
                 (TableId::new(i as _), (name, table_partition_template, data))
             })
@@ -471,101 +364,119 @@ mod tests {
             .collect::<HashMap<_, _>>();
 
         let expected = HashMap::from([
-            (
-                PartitionKey::from("oranges-1970-01-tag2_C"),
-                vec!["bananas".into()],
-            ),
-            (
-                PartitionKey::from("oranges-2016-06-tag2_D"),
-                vec!["bananas".into()],
-            ),
-            (
-                PartitionKey::from("1970-tag1_A-nonanas"),
-                vec!["platanos".into()],
-            ),
-            (
-                PartitionKey::from("2016-tag1_B-nonanas"),
-                vec!["platanos".into()],
-            ),
-        ]);
-
-        pretty_assertions::assert_eq!(expected, got);
-    }
-
-    #[tokio::test]
-    async fn test_write_only_table_partition_template() {
-        let partitioner = Partitioner::new(DefaultPartitionTemplate::default());
-        let ns = NamespaceName::new("bananas").expect("valid db name");
-
-        // No namespace partition means the platanos table will fall back to the default
-        let namespace_schema = namespace_schema(42, None);
-
-        let bananas_table_template = Some(Arc::new(TablePartitionTemplateOverride::new(
-            PartitionTemplate {
-                parts: vec![
-                    TemplatePart::Column("oranges".to_string()),
-                    TemplatePart::TimeFormat("%Y-%m".to_string()),
-                    TemplatePart::Column("tag2".to_string()),
-                ],
-            },
-        )));
-
-        let lp = "
-            bananas,tag1=A,tag2=C val=42i 1\n\
-            platanos,tag1=B,tag2=C value=42i 1465839830100400200\n\
-            platanos,tag1=A,tag2=D value=42i 1\n\
-            bananas,tag1=B,tag2=D value=42i 1465839830100400200\n\
-            bananas,tag1=A,tag2=D value=42i 1465839830100400200\n\
-        ";
-
-        let (writes, _) = mutable_batch_lp::lines_to_batches_stats(lp, 42)
-            .expect("failed to build test writes from LP");
-
-        let writes = writes
-            .into_iter()
-            .enumerate()
-            .map(|(i, (name, data))| {
-                let table_partition_template = match name.as_str() {
-                    "bananas" => bananas_table_template.clone(),
-                    _ => None,
-                };
-                (TableId::new(i as _), (name, table_partition_template, data))
-            })
-            .collect();
-
-        let handler_ret = partitioner.write(&ns, namespace_schema, writes, None).await;
-
-        // Check the partition -> table mapping.
-        let got = handler_ret
-            .unwrap_or_default()
-            .into_iter()
-            .map(|partition| {
-                // Extract the table names in this partition
-                let mut tables = partition
-                    .payload
-                    .values()
-                    .map(|v| v.0.clone())
-                    .collect::<Vec<String>>();
-
-                tables.sort();
-
-                (partition.key, tables)
-            })
-            .collect::<HashMap<_, _>>();
-
-        let expected = HashMap::from([
-            (
-                PartitionKey::from("oranges-1970-01-tag2_C"),
-                vec!["bananas".into()],
-            ),
-            (
-                PartitionKey::from("oranges-2016-06-tag2_D"),
-                vec!["bananas".into()],
-            ),
+            (PartitionKey::from("!|1970-01|C"), vec!["bananas".into()]),
+            (PartitionKey::from("!|2016-06|D"), vec!["bananas".into()]),
+            // This table does not have a partition template override
             (PartitionKey::from("1970-01-01"), vec!["platanos".into()]),
             (PartitionKey::from("2016-06-13"), vec!["platanos".into()]),
         ]);
 
         pretty_assertions::assert_eq!(expected, got);
+    }
+
+    prop_compose! {
+        /// Yield a Vec containing an identical timestamp run of random length,
+        /// up to `max_run_len`,
+        fn arbitrary_timestamp_run(max_run_len: usize)(v in 0_i64..i64::MAX, run_len in 1..max_run_len) -> Vec<i64> {
+            let mut x = Vec::with_capacity(run_len);
+            x.resize(max_run_len, v);
+            x
+        }
+    }
+
+    /// Yield a Vec of timestamp values that more accurately model real
+    /// timestamps than pure random selection.
+    ///
+    /// Runs of identical timestamps are generated with
+    /// [`arbitrary_timestamp_run()`], which are then shuffled to produce a list
+    /// of timestamps with limited repeats, sometimes consecutively.
+    fn arbitrary_timestamps() -> impl Strategy<Value = Vec<i64>> {
+        proptest::collection::vec(arbitrary_timestamp_run(6), 10..100)
+            .prop_map(|v| v.into_iter().flatten().collect::<Vec<_>>())
+            .prop_shuffle()
+    }
+
+    proptest! {
+        /// A test asserting that writes passing through the router's
+        /// partitioning handler are correctly partitioned when using the
+        /// default YYYY-MM-DD formatter.
+        ///
+        /// All rows within each partition must have timestamps that when
+        /// formatted match the partition key.
+        #[test]
+        fn prop_default_template_row_contents(times in arbitrary_timestamps()) {
+            let partitioner = Partitioner::default();
+            let ns = NamespaceName::new("bananas").expect("valid db name");
+            let namespace_schema = namespace_schema(42);
+
+            let row_count = times.len();
+
+            // Generate a batch of writes containing the random set of
+            // timestamps.
+            let mut batch = MutableBatch::new();
+            let mut writer = Writer::new(&mut batch, row_count);
+            writer
+                .write_time("time", times.into_iter())
+                .unwrap();
+            writer.commit();
+
+            // Map the batch into the partitioner input type
+            let input = [(TableId::new(1), ("bananas".to_string(),TablePartitionTemplateOverride::default(), batch))];
+            let handler_ret = futures::executor::block_on(partitioner.write(
+                &ns,
+                namespace_schema,
+                input.into_iter().collect(),
+                None
+            ));
+
+            let mut observed_rows = 0;
+
+            // For each partition in the output
+            for p in handler_ret.into_iter().flatten() {
+                // Extract the partition key, and the data batch.
+                //
+                // The all rows in this batch must produce the same stftime time
+                // formatter output as the partition key.
+                let (key, data) = p.into_parts();
+
+                let partitioned_data = data.into_iter().map(|(_t_id, (_t_name, v))| v);
+                for batch in partitioned_data {
+                    // Validate the min/max of the batch - all other rows fall
+                    // within these values.
+                    let ts = batch.timestamp_summary().unwrap().stats;
+                    let min = format_yyyy_mm_dd(ts.min.unwrap());
+                    let max = format_yyyy_mm_dd(ts.max.unwrap());
+
+                    // For YYYY-MM-DD formatting, the min and max representation
+                    // MUST always be equal, as a batch may span only a single
+                    // day.
+                    assert_eq!(min, max);
+                    // Finally, the partition key must match the batch
+                    // timestamps when rendered in the same YYYY-MM-DD format.
+                    assert_eq!(min, key.to_string());
+
+                    observed_rows += batch.rows();
+                }
+            }
+
+            assert_eq!(observed_rows, row_count);
+        }
+    }
+
+    /// Format `ts` as a timestamp in the form `YYYY-MM-DD`.
+    fn format_yyyy_mm_dd(ts: i64) -> String {
+        use std::fmt::Write;
+
+        let fmt = StrftimeItems::new("%Y-%m-%d");
+
+        // Generate the control string.
+        let mut control = String::new();
+        let _ = write!(
+            control,
+            "{}",
+            Utc.timestamp_nanos(ts).format_with_items(fmt)
+        );
+
+        control
     }
 }

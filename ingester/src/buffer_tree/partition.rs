@@ -1,24 +1,28 @@
 //! Partition level data buffer structures.
 
-use std::{collections::VecDeque, sync::Arc};
+use std::sync::Arc;
 
 use data_types::{
-    sequence_number_set::SequenceNumberSet, NamespaceId, PartitionId, PartitionKey, SequenceNumber,
-    TableId,
+    sequence_number_set::SequenceNumberSet, NamespaceId, PartitionKey, SequenceNumber,
+    SortedColumnSet, TableId, TimestampMinMax, TransitionPartitionId,
 };
 use mutable_batch::MutableBatch;
 use observability_deps::tracing::*;
-use schema::sort::SortKey;
+use schema::{merge::SchemaMerger, sort::SortKey, Schema};
 
 use self::{
-    buffer::{traits::Queryable, BufferState, DataBuffer, Persisting},
+    buffer::{traits::Queryable, DataBuffer},
     persisting::{BatchIdent, PersistingData},
+    persisting_list::PersistingList,
 };
-use super::{namespace::NamespaceName, table::TableName};
-use crate::{deferred_load::DeferredLoad, query_adaptor::QueryAdaptor};
+use super::{namespace::NamespaceName, table::TableMetadata};
+use crate::{
+    deferred_load::DeferredLoad, query::projection::OwnedProjection, query_adaptor::QueryAdaptor,
+};
 
 mod buffer;
 pub(crate) mod persisting;
+mod persisting_list;
 pub(crate) mod resolver;
 
 /// The load state of the [`SortKey`] for a given partition.
@@ -27,7 +31,7 @@ pub(crate) enum SortKeyState {
     /// The [`SortKey`] has not yet been fetched from the catalog, and will be
     /// lazy loaded (or loaded in the background) by a call to
     /// [`DeferredLoad::get()`].
-    Deferred(Arc<DeferredLoad<Option<SortKey>>>),
+    Deferred(Arc<DeferredLoad<(Option<SortKey>, Option<SortedColumnSet>)>>),
     /// The sort key is known and specified.
     Provided(Option<SortKey>),
 }
@@ -35,7 +39,7 @@ pub(crate) enum SortKeyState {
 impl SortKeyState {
     pub(crate) async fn get(&self) -> Option<SortKey> {
         match self {
-            Self::Deferred(v) => v.get().await,
+            Self::Deferred(v) => v.get().await.0,
             Self::Provided(v) => v.clone(),
         }
     }
@@ -44,8 +48,9 @@ impl SortKeyState {
 /// Data of an IOx Partition of a given Table of a Namespace
 #[derive(Debug)]
 pub struct PartitionData {
-    /// The catalog ID of the partition this buffer is for.
-    partition_id: PartitionId,
+    /// The partition this buffer is for.
+    partition_id: TransitionPartitionId,
+
     /// The string partition key for this partition.
     partition_key: PartitionKey,
 
@@ -68,9 +73,9 @@ pub struct PartitionData {
 
     /// The catalog ID for the table this partition is part of.
     table_id: TableId,
-    /// The name of the table this partition is part of, potentially unresolved
+    /// The catalog metadata for the table this partition is part of, potentially unresolved
     /// / deferred.
-    table_name: Arc<DeferredLoad<TableName>>,
+    table: Arc<DeferredLoad<TableMetadata>>,
 
     /// A [`DataBuffer`] for incoming writes.
     buffer: DataBuffer,
@@ -82,7 +87,7 @@ pub struct PartitionData {
     ///
     /// The [`BatchIdent`] is a generational counter that is used to tag each
     /// persisting with a unique, opaque identifier.
-    persisting: VecDeque<(BatchIdent, BufferState<Persisting>)>,
+    persisting: PersistingList,
 
     /// The number of persist operations started over the lifetime of this
     /// [`PartitionData`].
@@ -97,24 +102,24 @@ impl PartitionData {
     /// Initialize a new partition data buffer
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        id: PartitionId,
+        partition_id: TransitionPartitionId,
         partition_key: PartitionKey,
         namespace_id: NamespaceId,
         namespace_name: Arc<DeferredLoad<NamespaceName>>,
         table_id: TableId,
-        table_name: Arc<DeferredLoad<TableName>>,
+        table: Arc<DeferredLoad<TableMetadata>>,
         sort_key: SortKeyState,
     ) -> Self {
         Self {
-            partition_id: id,
+            partition_id,
             partition_key,
             sort_key,
             namespace_id,
             namespace_name,
             table_id,
-            table_name,
+            table,
             buffer: DataBuffer::default(),
-            persisting: VecDeque::with_capacity(1),
+            persisting: PersistingList::default(),
             started_persistence_count: BatchIdent::default(),
             completed_persistence_count: 0,
         }
@@ -132,7 +137,7 @@ impl PartitionData {
         trace!(
             namespace_id = %self.namespace_id,
             table_id = %self.table_id,
-            table_name = %self.table_name,
+            table = %self.table,
             partition_id = %self.partition_id,
             partition_key = %self.partition_key,
             "buffered write"
@@ -147,11 +152,76 @@ impl PartitionData {
         self.buffer.persist_cost_estimate()
     }
 
+    /// Returns the number of rows currently buffered in this [`PartitionData`].
+    ///
+    /// The returned value will always match the row count of the data returned
+    /// by a subsequent call to [`PartitionData::get_query_data()`], without any
+    /// column projection applied.
+    ///
+    /// This value is inclusive of "hot" buffered data, and all currently
+    /// persisting data.
+    ///
+    /// This is an `O(n)` operation where `n` is the number of currently
+    /// persisting batches, plus 1 for the "hot" buffer. Reading the row count
+    /// of each batch is `O(1)`. This method is expected to be fast.
+    pub(crate) fn rows(&self) -> usize {
+        self.persisting.rows() + self.buffer.rows()
+    }
+
+    /// Return the timestamp min/max values for the data contained within this
+    /// [`PartitionData`].
+    ///
+    /// The returned value will always match the timestamp summary values of the
+    /// data returned by a subsequent call to
+    /// [`PartitionData::get_query_data()`] iff the projection provided to the
+    /// call includes the timestamp column (returns pre-projection value).
+    ///
+    /// This value is inclusive of "hot" buffered data, and all currently
+    /// persisting data.
+    ///
+    /// This is an `O(n)` operation where `n` is the number of currently
+    /// persisting batches, plus 1 for the "hot" buffer, Reading the timestamp
+    /// statistics for each batch is `O(1)`. This method is expected to be fast.
+    pub(crate) fn timestamp_stats(&self) -> Option<TimestampMinMax> {
+        self.persisting
+            .timestamp_stats()
+            .into_iter()
+            .chain(self.buffer.timestamp_stats())
+            .reduce(|acc, v| TimestampMinMax {
+                min: acc.min.min(v.min),
+                max: acc.max.max(v.max),
+            })
+    }
+
+    /// Return the schema of the data currently buffered within this
+    /// [`PartitionData`].
+    ///
+    /// This schema is not additive - it is the union of the individual schema
+    /// batches currently buffered and as such columns are removed as the
+    /// individual batches containing those columns are persisted and dropped.
+    pub(crate) fn schema(&self) -> Option<Schema> {
+        if self.persisting.is_empty() && self.buffer.rows() == 0 {
+            return None;
+        }
+
+        Some(
+            self.persisting
+                .schema()
+                .into_iter()
+                .cloned()
+                .chain(self.buffer.schema())
+                .fold(SchemaMerger::new(), |acc, v| {
+                    acc.merge(&v).expect("schemas are incompatible")
+                })
+                .build(),
+        )
+    }
+
     /// Return all data for this partition, ordered by the calls to
     /// [`PartitionData::buffer_write()`].
-    pub(crate) fn get_query_data(&mut self) -> Option<QueryAdaptor> {
+    pub(crate) fn get_query_data(&mut self, projection: &OwnedProjection) -> Option<QueryAdaptor> {
         // Extract the buffered data, if any.
-        let buffered_data = self.buffer.get_query_data();
+        let buffered_data = self.buffer.get_query_data(projection);
 
         // Prepend any currently persisting batches.
         //
@@ -160,15 +230,14 @@ impl PartitionData {
         // existing rows materialise to the correct output.
         let data = self
             .persisting
-            .iter()
-            .flat_map(|(_, b)| b.get_query_data())
+            .get_query_data(projection)
             .chain(buffered_data)
             .collect::<Vec<_>>();
 
         trace!(
             namespace_id = %self.namespace_id,
             table_id = %self.table_id,
-            table_name = %self.table_name,
+            table = %self.table,
             partition_id = %self.partition_id,
             partition_key = %self.partition_key,
             n_batches = data.len(),
@@ -176,6 +245,7 @@ impl PartitionData {
         );
 
         if data.is_empty() {
+            debug_assert_eq!(self.rows(), 0);
             return None;
         }
 
@@ -185,7 +255,32 @@ impl PartitionData {
         // is upheld by the FSM, which ensures only non-empty snapshots /
         // RecordBatch are generated. Because `data` contains at least one
         // RecordBatch, this invariant holds.
-        Some(QueryAdaptor::new(self.partition_id, data))
+        let q = QueryAdaptor::new(self.partition_id.clone(), data);
+
+        // Invariant: the number of rows returned in a query MUST always match
+        // the row count reported by the rows() method.
+        //
+        // The row count is never affected by projection.
+        debug_assert_eq!(q.num_rows(), self.rows() as u64);
+
+        // Invariant: the timestamp min/max MUST match the values reported by
+        // timestamp_stats(), iff the projection contains the "time" column.
+        #[cfg(debug_assertions)]
+        {
+            if projection
+                .columns()
+                .map(|v| v.iter().any(|v| v == schema::TIME_COLUMN_NAME))
+                .unwrap_or(true)
+            {
+                assert_eq!(q.ts_min_max(), self.timestamp_stats());
+            } else {
+                // Otherwise the timestamp summary in the query response MUST be
+                // empty.
+                assert_eq!(q.ts_min_max(), None);
+            }
+        }
+
+        Some(q)
     }
 
     /// Snapshot and mark all buffered data as persisting.
@@ -208,13 +303,13 @@ impl PartitionData {
         // Increment the "started persist" counter.
         //
         // This is used to cheaply identify batches given to the
-        // mark_persisted() call.
+        // mark_persisted() call and ensure monotonicity.
         let batch_ident = self.started_persistence_count.next();
 
         debug!(
             namespace_id = %self.namespace_id,
             table_id = %self.table_id,
-            table_name = %self.table_name,
+            table = %self.table,
             partition_id = %self.partition_id,
             partition_key = %self.partition_key,
             %batch_ident,
@@ -223,14 +318,16 @@ impl PartitionData {
 
         // Wrap the persisting data in the type wrapper
         let data = PersistingData::new(
-            QueryAdaptor::new(self.partition_id, fsm.get_query_data()),
+            QueryAdaptor::new(
+                self.partition_id.clone(),
+                fsm.get_query_data(&OwnedProjection::default()),
+            ),
             batch_ident,
         );
 
-        // Push the new buffer to the back of the persisting queue, so that
-        // iterating from back to front during queries iterates over writes from
-        // oldest to newest.
-        self.persisting.push_back((batch_ident, fsm));
+        // Push the buffer into the persisting list (which maintains batch
+        // order).
+        self.persisting.push(batch_ident, fsm);
 
         Some(data)
     }
@@ -245,26 +342,15 @@ impl PartitionData {
     /// This method panics if [`Self`] is not marked as undergoing a persist
     /// operation, or `batch` is not currently being persisted.
     pub(crate) fn mark_persisted(&mut self, batch: PersistingData) -> SequenceNumberSet {
-        // Find the batch in the persisting queue.
-        let idx = self
-            .persisting
-            .iter()
-            .position(|(old, _)| *old == batch.batch_ident())
-            .expect("no currently persisting batch");
-
-        // Remove the batch from the queue, preserving the order of the queue
-        // for batch iteration during queries.
-        let (old_ident, fsm) = self.persisting.remove(idx).unwrap();
-        assert_eq!(old_ident, batch.batch_ident());
+        let fsm = self.persisting.remove(batch.batch_ident());
 
         self.completed_persistence_count += 1;
 
         debug!(
-            batch_ident = %old_ident,
             persistence_count = %self.completed_persistence_count,
             namespace_id = %self.namespace_id,
             table_id = %self.table_id,
-            table_name = %self.table_name,
+            table = %self.table,
             partition_id = %self.partition_id,
             partition_key = %self.partition_key,
             batch_ident = %batch.batch_ident(),
@@ -275,8 +361,8 @@ impl PartitionData {
         fsm.into_sequence_number_set()
     }
 
-    pub(crate) fn partition_id(&self) -> PartitionId {
-        self.partition_id
+    pub(crate) fn partition_id(&self) -> &TransitionPartitionId {
+        &self.partition_id
     }
 
     /// Return the count of persisted Parquet files for this [`PartitionData`] instance.
@@ -284,10 +370,10 @@ impl PartitionData {
         self.completed_persistence_count
     }
 
-    /// Return the name of the table this [`PartitionData`] is buffering writes
+    /// Return the metadata of the table this [`PartitionData`] is buffering writes
     /// for.
-    pub(crate) fn table_name(&self) -> &Arc<DeferredLoad<TableName>> {
-        &self.table_name
+    pub(crate) fn table(&self) -> &Arc<DeferredLoad<TableMetadata>> {
+        &self.table
     }
 
     /// Return the table ID for this partition.
@@ -331,12 +417,13 @@ impl PartitionData {
 
 #[cfg(test)]
 mod tests {
-    use std::{ops::Deref, time::Duration};
+    use std::time::Duration;
 
     use arrow::compute::SortOptions;
     use arrow_util::assert_batches_eq;
     use assert_matches::assert_matches;
     use backoff::BackoffConfig;
+    use data_types::SortedColumnSet;
     use datafusion::{
         physical_expr::PhysicalSortExpr,
         physical_plan::{expressions::col, memory::MemoryExec, ExecutionPlan},
@@ -348,7 +435,7 @@ mod tests {
     use super::*;
     use crate::{
         buffer_tree::partition::resolver::SortKeyResolver,
-        test_util::{populate_catalog, PartitionDataBuilder, ARBITRARY_PARTITION_ID},
+        test_util::{populate_catalog, PartitionDataBuilder, ARBITRARY_TRANSITION_PARTITION_ID},
     };
 
     // Write some data and read it back from the buffer.
@@ -360,7 +447,7 @@ mod tests {
         let mut p = PartitionDataBuilder::new().build();
 
         // And no data should be returned when queried.
-        assert!(p.get_query_data().is_none());
+        assert!(p.get_query_data(&OwnedProjection::default()).is_none());
 
         // Perform a single write.
         let mb = lp_to_mutable_batch(r#"bananas,city=London people=2,pigeons="millions" 10"#).1;
@@ -369,8 +456,10 @@ mod tests {
 
         // The data should be readable.
         {
-            let data = p.get_query_data().expect("should return data");
-            assert_eq!(data.partition_id(), ARBITRARY_PARTITION_ID);
+            let data = p
+                .get_query_data(&OwnedProjection::default())
+                .expect("should return data");
+            assert_eq!(data.partition_id(), &*ARBITRARY_TRANSITION_PARTITION_ID);
 
             let expected = [
                 "+--------+--------+----------+--------------------------------+",
@@ -379,15 +468,7 @@ mod tests {
                 "| London | 2.0    | millions | 1970-01-01T00:00:00.000000010Z |",
                 "+--------+--------+----------+--------------------------------+",
             ];
-            assert_batches_eq!(
-                expected,
-                &*data
-                    .record_batches()
-                    .iter()
-                    .map(Deref::deref)
-                    .cloned()
-                    .collect::<Vec<_>>()
-            );
+            assert_batches_eq!(expected, data.record_batches());
         }
 
         // Perform a another write, adding data to the existing queryable data
@@ -398,8 +479,10 @@ mod tests {
 
         // And finally both writes should be readable.
         {
-            let data = p.get_query_data().expect("should contain data");
-            assert_eq!(data.partition_id(), ARBITRARY_PARTITION_ID);
+            let data = p
+                .get_query_data(&OwnedProjection::default())
+                .expect("should contain data");
+            assert_eq!(data.partition_id(), &*ARBITRARY_TRANSITION_PARTITION_ID);
 
             let expected = [
                 "+--------+--------+----------+--------------------------------+",
@@ -409,15 +492,7 @@ mod tests {
                 "| Madrid | 4.0    | none     | 1970-01-01T00:00:00.000000020Z |",
                 "+--------+--------+----------+--------------------------------+",
             ];
-            assert_batches_eq!(
-                expected,
-                &*data
-                    .record_batches()
-                    .iter()
-                    .map(Deref::deref)
-                    .cloned()
-                    .collect::<Vec<_>>()
-            );
+            assert_batches_eq!(expected, data.record_batches());
         }
     }
 
@@ -427,7 +502,7 @@ mod tests {
     async fn test_persist() {
         let mut p = PartitionDataBuilder::new().build();
 
-        assert!(p.get_query_data().is_none());
+        assert!(p.get_query_data(&OwnedProjection::default()).is_none());
 
         // Perform a single write.
         let mb = lp_to_mutable_batch(r#"bananas,city=London people=2,pigeons="millions" 10"#).1;
@@ -441,7 +516,10 @@ mod tests {
         // Begin persisting the partition.
         let persisting_data = p.mark_persisting().expect("must contain existing data");
         // And validate the data being persisted.
-        assert_eq!(persisting_data.partition_id(), ARBITRARY_PARTITION_ID);
+        assert_eq!(
+            persisting_data.partition_id(),
+            &*ARBITRARY_TRANSITION_PARTITION_ID
+        );
         assert_eq!(persisting_data.record_batches().len(), 1);
         let expected = [
             "+--------+--------+----------+--------------------------------+",
@@ -450,15 +528,7 @@ mod tests {
             "| London | 2.0    | millions | 1970-01-01T00:00:00.000000010Z |",
             "+--------+--------+----------+--------------------------------+",
         ];
-        assert_batches_eq!(
-            expected,
-            &*persisting_data
-                .record_batches()
-                .iter()
-                .map(Deref::deref)
-                .cloned()
-                .collect::<Vec<_>>()
-        );
+        assert_batches_eq!(expected, persisting_data.record_batches());
 
         // Ensure the started batch ident is increased after a persist call, but not the completed
         // batch ident.
@@ -474,8 +544,10 @@ mod tests {
 
         // Which must be readable, alongside the ongoing persist data.
         {
-            let data = p.get_query_data().expect("must have data");
-            assert_eq!(data.partition_id(), ARBITRARY_PARTITION_ID);
+            let data = p
+                .get_query_data(&OwnedProjection::default())
+                .expect("must have data");
+            assert_eq!(data.partition_id(), &*ARBITRARY_TRANSITION_PARTITION_ID);
             assert_eq!(data.record_batches().len(), 2);
             let expected = [
                 "+--------+--------+----------+--------------------------------+",
@@ -485,15 +557,7 @@ mod tests {
                 "| Madrid | 4.0    | none     | 1970-01-01T00:00:00.000000020Z |",
                 "+--------+--------+----------+--------------------------------+",
             ];
-            assert_batches_eq!(
-                expected,
-                &*data
-                    .record_batches()
-                    .iter()
-                    .map(Deref::deref)
-                    .cloned()
-                    .collect::<Vec<_>>()
-            );
+            assert_batches_eq!(expected, data.record_batches());
         }
 
         // The persist now "completes".
@@ -508,8 +572,10 @@ mod tests {
 
         // Querying the buffer should now return only the second write.
         {
-            let data = p.get_query_data().expect("must have data");
-            assert_eq!(data.partition_id(), ARBITRARY_PARTITION_ID);
+            let data = p
+                .get_query_data(&OwnedProjection::default())
+                .expect("must have data");
+            assert_eq!(data.partition_id(), &*ARBITRARY_TRANSITION_PARTITION_ID);
             assert_eq!(data.record_batches().len(), 1);
             let expected = [
                 "+--------+--------+---------+--------------------------------+",
@@ -518,15 +584,7 @@ mod tests {
                 "| Madrid | 4.0    | none    | 1970-01-01T00:00:00.000000020Z |",
                 "+--------+--------+---------+--------------------------------+",
             ];
-            assert_batches_eq!(
-                expected,
-                &*data
-                    .record_batches()
-                    .iter()
-                    .map(Deref::deref)
-                    .cloned()
-                    .collect::<Vec<_>>()
-            );
+            assert_batches_eq!(expected, data.record_batches());
         }
     }
 
@@ -539,12 +597,7 @@ mod tests {
         // A helper function to dedupe the record batches in [`QueryAdaptor`]
         // and assert the resulting batch contents.
         async fn assert_deduped(expect: &[&str], batch: QueryAdaptor) {
-            let batch = batch
-                .record_batches()
-                .iter()
-                .map(Deref::deref)
-                .cloned()
-                .collect::<Vec<_>>();
+            let batch = batch.record_batches().to_vec();
 
             let sort_keys = vec![PhysicalSortExpr {
                 expr: col("time", &batch[0].schema()).unwrap(),
@@ -578,7 +631,13 @@ mod tests {
         p.buffer_write(mb, SequenceNumber::new(1))
             .expect("write should succeed");
 
-        assert_eq!(p.get_query_data().unwrap().record_batches().len(), 1);
+        assert_eq!(
+            p.get_query_data(&OwnedProjection::default())
+                .unwrap()
+                .record_batches()
+                .len(),
+            1
+        );
         assert_deduped(
             &[
                 "+--------------------------------+-----+",
@@ -587,7 +646,7 @@ mod tests {
                 "| 1970-01-01T00:00:00.000000042Z | 1.0 |",
                 "+--------------------------------+-----+",
             ],
-            p.get_query_data().unwrap(),
+            p.get_query_data(&OwnedProjection::default()).unwrap(),
         )
         .await;
 
@@ -596,7 +655,13 @@ mod tests {
         p.buffer_write(mb, SequenceNumber::new(2))
             .expect("write should succeed");
 
-        assert_eq!(p.get_query_data().unwrap().record_batches().len(), 1);
+        assert_eq!(
+            p.get_query_data(&OwnedProjection::default())
+                .unwrap()
+                .record_batches()
+                .len(),
+            1
+        );
         assert_deduped(
             &[
                 "+--------------------------------+-----+",
@@ -605,7 +670,7 @@ mod tests {
                 "| 1970-01-01T00:00:00.000000042Z | 2.0 |",
                 "+--------------------------------+-----+",
             ],
-            p.get_query_data().unwrap(),
+            p.get_query_data(&OwnedProjection::default()).unwrap(),
         )
         .await;
 
@@ -638,7 +703,13 @@ mod tests {
         p.buffer_write(mb, SequenceNumber::new(3))
             .expect("write should succeed");
 
-        assert_eq!(p.get_query_data().unwrap().record_batches().len(), 2);
+        assert_eq!(
+            p.get_query_data(&OwnedProjection::default())
+                .unwrap()
+                .record_batches()
+                .len(),
+            2
+        );
         assert_deduped(
             &[
                 "+--------------------------------+-----+",
@@ -647,7 +718,7 @@ mod tests {
                 "| 1970-01-01T00:00:00.000000042Z | 3.0 |",
                 "+--------------------------------+-----+",
             ],
-            p.get_query_data().unwrap(),
+            p.get_query_data(&OwnedProjection::default()).unwrap(),
         )
         .await;
 
@@ -679,7 +750,13 @@ mod tests {
         p.buffer_write(mb, SequenceNumber::new(3))
             .expect("write should succeed");
 
-        assert_eq!(p.get_query_data().unwrap().record_batches().len(), 3);
+        assert_eq!(
+            p.get_query_data(&OwnedProjection::default())
+                .unwrap()
+                .record_batches()
+                .len(),
+            3
+        );
         assert_deduped(
             &[
                 "+--------------------------------+-----+",
@@ -688,7 +765,7 @@ mod tests {
                 "| 1970-01-01T00:00:00.000000042Z | 4.0 |",
                 "+--------------------------------+-----+",
             ],
-            p.get_query_data().unwrap(),
+            p.get_query_data(&OwnedProjection::default()).unwrap(),
         )
         .await;
 
@@ -699,7 +776,13 @@ mod tests {
         assert!(set.contains(SequenceNumber::new(2)));
 
         // And assert the correct value remains.
-        assert_eq!(p.get_query_data().unwrap().record_batches().len(), 2);
+        assert_eq!(
+            p.get_query_data(&OwnedProjection::default())
+                .unwrap()
+                .record_batches()
+                .len(),
+            2
+        );
         assert_deduped(
             &[
                 "+--------------------------------+-----+",
@@ -708,7 +791,7 @@ mod tests {
                 "| 1970-01-01T00:00:00.000000042Z | 4.0 |",
                 "+--------------------------------+-----+",
             ],
-            p.get_query_data().unwrap(),
+            p.get_query_data(&OwnedProjection::default()).unwrap(),
         )
         .await;
 
@@ -718,7 +801,13 @@ mod tests {
         assert!(set.contains(SequenceNumber::new(3)));
 
         // And assert the correct value remains.
-        assert_eq!(p.get_query_data().unwrap().record_batches().len(), 1);
+        assert_eq!(
+            p.get_query_data(&OwnedProjection::default())
+                .unwrap()
+                .record_batches()
+                .len(),
+            1
+        );
         assert_deduped(
             &[
                 "+--------------------------------+-----+",
@@ -727,7 +816,7 @@ mod tests {
                 "| 1970-01-01T00:00:00.000000042Z | 4.0 |",
                 "+--------------------------------+-----+",
             ],
-            p.get_query_data().unwrap(),
+            p.get_query_data(&OwnedProjection::default()).unwrap(),
         )
         .await;
 
@@ -759,7 +848,7 @@ mod tests {
         p.buffer_write(mb, SequenceNumber::new(3))
             .expect("write should succeed");
 
-        let data = p.get_query_data().unwrap();
+        let data = p.get_query_data(&OwnedProjection::default()).unwrap();
         assert_batches_eq!(
             [
                 "+--------------------------------+-----+",
@@ -769,12 +858,7 @@ mod tests {
                 "| 1970-01-01T00:00:00.000000042Z | 2.0 |",
                 "+--------------------------------+-----+",
             ],
-            &*data
-                .record_batches()
-                .iter()
-                .map(Deref::deref)
-                .cloned()
-                .collect::<Vec<_>>()
+            &*data.record_batches().to_vec()
         );
 
         // Persist again, moving the last write to the persisting state and
@@ -787,7 +871,7 @@ mod tests {
         p.buffer_write(mb, SequenceNumber::new(4))
             .expect("write should succeed");
 
-        let data = p.get_query_data().unwrap();
+        let data = p.get_query_data(&OwnedProjection::default()).unwrap();
         assert_batches_eq!(
             [
                 "+--------------------------------+-----+",
@@ -798,12 +882,7 @@ mod tests {
                 "| 1970-01-01T00:00:00.000000042Z | 3.0 |",
                 "+--------------------------------+-----+",
             ],
-            &*data
-                .record_batches()
-                .iter()
-                .map(Deref::deref)
-                .cloned()
-                .collect::<Vec<_>>()
+            &*data.record_batches().to_vec()
         );
 
         // Persist again, moving the last write to the persisting state and
@@ -816,7 +895,7 @@ mod tests {
         p.buffer_write(mb, SequenceNumber::new(5))
             .expect("write should succeed");
 
-        let data = p.get_query_data().unwrap();
+        let data = p.get_query_data(&OwnedProjection::default()).unwrap();
         assert_batches_eq!(
             [
                 "+--------------------------------+-----+",
@@ -828,12 +907,7 @@ mod tests {
                 "| 1970-01-01T00:00:00.000000042Z | 4.0 |",
                 "+--------------------------------+-----+",
             ],
-            &*data
-                .record_batches()
-                .iter()
-                .map(Deref::deref)
-                .cloned()
-                .collect::<Vec<_>>()
+            &*data.record_batches().to_vec()
         );
 
         // Finish persisting the second batch out-of-order! The middle entry,
@@ -842,7 +916,7 @@ mod tests {
         assert_eq!(set.len(), 1);
         assert!(set.contains(SequenceNumber::new(3)));
 
-        let data = p.get_query_data().unwrap();
+        let data = p.get_query_data(&OwnedProjection::default()).unwrap();
         assert_batches_eq!(
             [
                 "+--------------------------------+-----+",
@@ -853,12 +927,7 @@ mod tests {
                 "| 1970-01-01T00:00:00.000000042Z | 4.0 |",
                 "+--------------------------------+-----+",
             ],
-            &*data
-                .record_batches()
-                .iter()
-                .map(Deref::deref)
-                .cloned()
-                .collect::<Vec<_>>()
+            &*data.record_batches().to_vec()
         );
 
         // Finish persisting the last batch.
@@ -866,7 +935,7 @@ mod tests {
         assert_eq!(set.len(), 1);
         assert!(set.contains(SequenceNumber::new(4)));
 
-        let data = p.get_query_data().unwrap();
+        let data = p.get_query_data(&OwnedProjection::default()).unwrap();
         assert_batches_eq!(
             [
                 "+--------------------------------+-----+",
@@ -876,12 +945,7 @@ mod tests {
                 "| 1970-01-01T00:00:00.000000042Z | 4.0 |",
                 "+--------------------------------+-----+",
             ],
-            &*data
-                .record_batches()
-                .iter()
-                .map(Deref::deref)
-                .cloned()
-                .collect::<Vec<_>>()
+            &*data.record_batches().to_vec()
         );
 
         // Finish persisting the first batch.
@@ -890,7 +954,7 @@ mod tests {
         assert!(set.contains(SequenceNumber::new(1)));
 
         // Assert only the buffered data remains
-        let data = p.get_query_data().unwrap();
+        let data = p.get_query_data(&OwnedProjection::default()).unwrap();
         assert_batches_eq!(
             [
                 "+--------------------------------+-----+",
@@ -899,12 +963,7 @@ mod tests {
                 "| 1970-01-01T00:00:00.000000042Z | 4.0 |",
                 "+--------------------------------+-----+",
             ],
-            &*data
-                .record_batches()
-                .iter()
-                .map(Deref::deref)
-                .cloned()
-                .collect::<Vec<_>>()
+            &*data.record_batches().to_vec()
         );
     }
 
@@ -933,31 +992,50 @@ mod tests {
         let catalog: Arc<dyn Catalog> =
             Arc::new(iox_catalog::mem::MemCatalog::new(Arc::clone(&metrics)));
 
+        let partition_key = PartitionKey::from("test");
+
         // Populate the catalog with the namespace / table
         let (_ns_id, table_id) = populate_catalog(&*catalog, "bananas", "platanos").await;
 
-        let partition_id = catalog
+        let partition = catalog
             .repositories()
             .await
             .partitions()
-            .create_or_get("test".into(), table_id)
+            .create_or_get(partition_key.clone(), table_id)
             .await
-            .expect("should create")
-            .id;
+            .expect("should create");
+        // Test: sort_key_ids from create_or_get which is empty
+        assert!(partition.sort_key_ids().unwrap().is_empty());
 
-        catalog
+        let updated_partition = catalog
             .repositories()
             .await
             .partitions()
-            .cas_sort_key(partition_id, None, &["terrific"])
+            .cas_sort_key(
+                &partition.transition_partition_id(),
+                None,
+                &["terrific"],
+                &SortedColumnSet::from([1]),
+            )
             .await
             .unwrap();
+        // Test: sort_key_ids after updating
+        assert_eq!(
+            updated_partition.sort_key_ids(),
+            Some(&SortedColumnSet::from([1]))
+        );
 
         // Read the just-created sort key (None)
         let fetcher = Arc::new(DeferredLoad::new(
             Duration::from_nanos(1),
-            SortKeyResolver::new(partition_id, Arc::clone(&catalog), backoff_config.clone())
-                .fetch(),
+            SortKeyResolver::new(
+                partition_key.clone(),
+                table_id,
+                Arc::clone(&catalog),
+                backoff_config.clone(),
+            )
+            .fetch(),
+            &metrics,
         ));
 
         let starting_state = SortKeyState::Deferred(fetcher);
@@ -990,7 +1068,7 @@ mod tests {
         );
 
         // Nothing should explode, data should be readable.
-        let data = p.get_query_data().unwrap();
+        let data = p.get_query_data(&OwnedProjection::default()).unwrap();
         assert_batches_eq!(
             [
                 "+--------+--------+----------+--------------------------------+",
@@ -1000,12 +1078,7 @@ mod tests {
                 "| Madrid | 2.0    | none     | 1970-01-01T00:00:00.000000011Z |",
                 "+--------+--------+----------+--------------------------------+",
             ],
-            &*data
-                .record_batches()
-                .iter()
-                .map(Deref::deref)
-                .cloned()
-                .collect::<Vec<_>>()
+            &*data.record_batches().to_vec()
         );
     }
 
@@ -1034,6 +1107,6 @@ mod tests {
     async fn test_empty_partition_no_queryadaptor_panic() {
         let mut p = PartitionDataBuilder::new().build();
 
-        assert!(p.get_query_data().is_none());
+        assert!(p.get_query_data(&OwnedProjection::default()).is_none());
     }
 }

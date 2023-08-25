@@ -191,38 +191,27 @@
     clippy::clone_on_ref_ptr,
     clippy::dbg_macro,
     clippy::explicit_iter_loop,
+    // See https://github.com/influxdata/influxdb_iox/pull/1671
     clippy::future_not_send,
     clippy::todo,
     clippy::use_self,
     missing_copy_implementations,
     missing_debug_implementations,
+    unused_crate_dependencies,
     missing_docs
 )]
+#![allow(clippy::default_constructed_unit_structs)]
 
-/// A macro to conditionally prepend `pub` to the inner tokens for benchmarking
-/// purposes, should the `benches` feature be enabled.
-///
-/// Call as `maybe_pub!(mod name)` to conditionally export a private module.
-///
-/// Call as `maybe_pub!( <block> )` to conditionally define a private module
-/// called "benches".
-#[macro_export]
-macro_rules! maybe_pub {
-    (mod $($t:tt)+) => {
-        #[cfg(feature = "benches")]
-        #[allow(missing_docs)]
-        pub mod $($t)+;
-        #[cfg(not(feature = "benches"))]
-        mod $($t)+;
-    };
-    ($($t:tt)+) => {
-        #[cfg(feature = "benches")]
-        #[allow(missing_docs)]
-        pub mod benches {
-            $($t)+
-        }
-    };
-}
+// Workaround for "unused crate" lint false positives.
+#[cfg(test)]
+use criterion as _;
+#[cfg(test)]
+use influxdb_iox_client as _;
+#[cfg(test)]
+use ingester_test_ctx as _;
+#[cfg(test)]
+use itertools as _;
+use workspace_hack as _;
 
 /// Ingester initialisation methods & types.
 ///
@@ -241,22 +230,32 @@ pub use init::*;
 // Ideally anything that NEEDS to be shared with other components happens via a
 // shared common crate. Any external components should interact with an Ingester
 // through its public API only, and not by poking around at the internals.
-//
 
-maybe_pub!(mod buffer_tree);
-maybe_pub!(mod dml_sink);
-maybe_pub!(mod persist);
-maybe_pub!(mod partition_iter);
-maybe_pub!(mod wal);
+/// This module needs to be pub for the benchmarks but should not be used outside the crate.
+#[cfg(feature = "benches")]
+pub mod internal_implementation_details {
+    pub use super::buffer_tree::*;
+    pub use super::dml_payload::*;
+    pub use super::dml_sink::*;
+    pub use super::partition_iter::*;
+    pub use super::persist::*;
+}
+
 mod arcmap;
+mod buffer_tree;
 mod cancellation_safe;
 mod deferred_load;
+mod dml_payload;
+mod dml_sink;
 mod ingest_state;
 mod ingester_id;
+mod partition_iter;
+mod persist;
 mod query;
 mod query_adaptor;
 pub(crate) mod server;
 mod timestamp_oracle;
+mod wal;
 
 #[cfg(test)]
 mod test_util;

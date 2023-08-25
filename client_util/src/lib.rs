@@ -11,11 +11,16 @@
     clippy::todo,
     clippy::dbg_macro,
     clippy::clone_on_ref_ptr,
+    // See https://github.com/influxdata/influxdb_iox/pull/1671
     clippy::future_not_send,
     clippy::todo,
-    clippy::dbg_macro
+    clippy::dbg_macro,
+    unused_crate_dependencies
 )]
 #![allow(clippy::missing_docs_in_private_items)]
+
+// Workaround for "unused crate" lint false positives.
+use workspace_hack as _;
 
 /// Builder for constructing connections for use with the various gRPC clients
 pub mod connection;

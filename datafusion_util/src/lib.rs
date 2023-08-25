@@ -1,4 +1,13 @@
-#![deny(rustdoc::broken_intra_doc_links, rustdoc::bare_urls, rust_2018_idioms)]
+#![deny(
+    clippy::future_not_send,
+    clippy::todo,
+    clippy::dbg_macro,
+    clippy::clone_on_ref_ptr,
+    rustdoc::broken_intra_doc_links,
+    rustdoc::bare_urls,
+    rust_2018_idioms,
+    unused_crate_dependencies
+)]
 #![allow(clippy::clone_on_ref_ptr)]
 
 //! This module contains various DataFusion utility functions.
@@ -9,6 +18,10 @@
 //! For example, check out
 //! [datafusion_optimizer::utils](https://docs.rs/datafusion-optimizer/13.0.0/datafusion_optimizer/utils/index.html)
 //! for expression manipulation functions.
+
+use datafusion::execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
+// Workaround for "unused crate" lint false positives.
+use workspace_hack as _;
 
 pub mod config;
 pub mod sender;
@@ -380,6 +393,11 @@ pub fn create_pruning_predicate(
     PruningPredicate::try_new(expr, Arc::clone(schema))
 }
 
+/// Create a memory pool that has no limit
+pub fn unbounded_memory_pool() -> Arc<dyn MemoryPool> {
+    Arc::new(UnboundedMemoryPool::default())
+}
+
 #[cfg(test)]
 mod tests {
     use datafusion::arrow::datatypes::{DataType, Field};
@@ -394,7 +412,7 @@ mod tests {
         let ts_predicate_expr = make_range_expr(101, 202, "time");
         let expected_string =
             "TimestampNanosecond(101, None) <= time AND time < TimestampNanosecond(202, None)";
-        let actual_string = format!("{ts_predicate_expr:?}");
+        let actual_string = format!("{ts_predicate_expr}");
 
         assert_eq!(actual_string, expected_string);
     }

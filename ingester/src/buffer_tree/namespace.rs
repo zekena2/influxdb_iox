@@ -6,21 +6,24 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use data_types::{NamespaceId, TableId};
-use dml::DmlOperation;
 use metric::U64Counter;
-use observability_deps::tracing::warn;
+use predicate::Predicate;
 use trace::span::Span;
 
 use super::{
     partition::resolver::PartitionProvider,
     post_write::PostWriteObserver,
-    table::{name_resolver::TableNameProvider, TableData},
+    table::{metadata_resolver::TableProvider, TableData},
 };
 use crate::{
     arcmap::ArcMap,
     deferred_load::DeferredLoad,
+    dml_payload::IngestOp,
     dml_sink::DmlSink,
-    query::{response::QueryResponse, tracing::QueryExecTracing, QueryError, QueryExec},
+    query::{
+        projection::OwnedProjection, response::QueryResponse, tracing::QueryExecTracing,
+        QueryError, QueryExec,
+    },
 };
 
 /// The string name / identifier of a Namespace.
@@ -59,14 +62,15 @@ pub(crate) struct NamespaceData<O> {
     namespace_name: Arc<DeferredLoad<NamespaceName>>,
 
     /// A set of tables this [`NamespaceData`] instance has processed
-    /// [`DmlOperation`]'s for.
+    /// [`IngestOp`]'s for.
     ///
-    /// The [`TableNameProvider`] acts as a [`DeferredLoad`] constructor to
-    /// resolve the [`TableName`] for new [`TableData`] out of the hot path.
+    /// The [`TableProvider`] acts as a [`DeferredLoad`] constructor to
+    /// resolve the catalog [`Table`] for new [`TableData`] out of the hot path.
     ///
-    /// [`TableName`]: crate::buffer_tree::table::TableName
+    ///
+    /// [`Table`]: data_types::Table
     tables: ArcMap<TableId, TableData<O>>,
-    table_name_resolver: Arc<dyn TableNameProvider>,
+    catalog_table_resolver: Arc<dyn TableProvider>,
     /// The count of tables initialised in this Ingester so far, across all
     /// namespaces.
     table_count: U64Counter,
@@ -84,7 +88,7 @@ impl<O> NamespaceData<O> {
     pub(super) fn new(
         namespace_id: NamespaceId,
         namespace_name: Arc<DeferredLoad<NamespaceName>>,
-        table_name_resolver: Arc<dyn TableNameProvider>,
+        catalog_table_resolver: Arc<dyn TableProvider>,
         partition_provider: Arc<dyn PartitionProvider>,
         post_write_observer: Arc<O>,
         metrics: &metric::Registry,
@@ -100,7 +104,7 @@ impl<O> NamespaceData<O> {
             namespace_id,
             namespace_name,
             tables: Default::default(),
-            table_name_resolver,
+            catalog_table_resolver,
             table_count,
             partition_provider,
             post_write_observer,
@@ -139,11 +143,9 @@ where
 {
     type Error = mutable_batch::Error;
 
-    async fn apply(&self, op: DmlOperation) -> Result<(), Self::Error> {
-        let sequence_number = op.meta().sequence().expect("applying unsequenced op");
-
+    async fn apply(&self, op: IngestOp) -> Result<(), Self::Error> {
         match op {
-            DmlOperation::Write(write) => {
+            IngestOp::Write(write) => {
                 // Extract the partition key derived by the router.
                 let partition_key = write.partition_key().clone();
 
@@ -154,7 +156,7 @@ where
                         self.table_count.inc(1);
                         Arc::new(TableData::new(
                             table_id,
-                            Arc::new(self.table_name_resolver.for_table(table_id)),
+                            Arc::new(self.catalog_table_resolver.for_table(table_id)),
                             self.namespace_id,
                             Arc::clone(&self.namespace_name),
                             Arc::clone(&self.partition_provider),
@@ -162,21 +164,16 @@ where
                         ))
                     });
 
+                    let partitioned_data = b.into_partitioned_data();
+
                     table_data
-                        .buffer_table_write(sequence_number, b, partition_key.clone())
+                        .buffer_table_write(
+                            partitioned_data.sequence_number(),
+                            partitioned_data.into_data(),
+                            partition_key.clone(),
+                        )
                         .await?;
                 }
-            }
-            DmlOperation::Delete(delete) => {
-                // Deprecated delete support:
-                // https://github.com/influxdata/influxdb_iox/issues/5825
-                warn!(
-                    namespace_name=%self.namespace_name,
-                    namespace_id=%self.namespace_id,
-                    table_name=?delete.table_name(),
-                    sequence_number=?delete.meta().sequence(),
-                    "discarding unsupported delete op"
-                );
             }
         }
 
@@ -195,8 +192,9 @@ where
         &self,
         namespace_id: NamespaceId,
         table_id: TableId,
-        columns: Vec<String>,
+        projection: OwnedProjection,
         span: Option<Span>,
+        predicate: Option<Predicate>,
     ) -> Result<Self::Response, QueryError> {
         assert_eq!(
             self.namespace_id, namespace_id,
@@ -212,7 +210,7 @@ where
         // a tracing delegate to emit a child span.
         Ok(QueryResponse::new(
             QueryExecTracing::new(inner, "table")
-                .query_exec(namespace_id, table_id, columns, span)
+                .query_exec(namespace_id, table_id, projection, span, predicate)
                 .await?,
         ))
     }
@@ -234,7 +232,7 @@ mod tests {
         test_util::{
             defer_namespace_name_1_ms, make_write_op, PartitionDataBuilder, ARBITRARY_NAMESPACE_ID,
             ARBITRARY_NAMESPACE_NAME, ARBITRARY_PARTITION_KEY, ARBITRARY_TABLE_ID,
-            ARBITRARY_TABLE_NAME, ARBITRARY_TABLE_NAME_PROVIDER,
+            ARBITRARY_TABLE_NAME, ARBITRARY_TABLE_PROVIDER,
         },
     };
 
@@ -251,7 +249,7 @@ mod tests {
         let ns = NamespaceData::new(
             ARBITRARY_NAMESPACE_ID,
             defer_namespace_name_1_ms(),
-            Arc::clone(&*ARBITRARY_TABLE_NAME_PROVIDER),
+            Arc::clone(&*ARBITRARY_TABLE_PROVIDER),
             partition_provider,
             Arc::new(MockPostWriteObserver::default()),
             &metrics,
@@ -269,7 +267,7 @@ mod tests {
         assert!(ns.table(ARBITRARY_TABLE_ID).is_none());
 
         // Write some test data
-        ns.apply(DmlOperation::Write(make_write_op(
+        ns.apply(IngestOp::Write(make_write_op(
             &ARBITRARY_PARTITION_KEY,
             ARBITRARY_NAMESPACE_ID,
             &ARBITRARY_TABLE_NAME,
@@ -279,6 +277,7 @@ mod tests {
                 r#"{},city=Medford day="sun",temp=55 22"#,
                 &*ARBITRARY_TABLE_NAME
             ),
+            None,
         )))
         .await
         .expect("buffer op should succeed");

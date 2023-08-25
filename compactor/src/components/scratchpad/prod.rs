@@ -20,6 +20,7 @@ use super::{
 #[derive(Debug)]
 pub struct ProdScratchpadGen {
     concurrency: NonZeroUsize,
+    shadow_mode: bool,
     backoff_config: BackoffConfig,
     store_input: Arc<DynObjectStore>,
     store_scratchpad: Arc<DynObjectStore>,
@@ -28,6 +29,7 @@ pub struct ProdScratchpadGen {
 
 impl ProdScratchpadGen {
     pub fn new(
+        shadow_mode: bool,
         concurrency: NonZeroUsize,
         backoff_config: BackoffConfig,
         store_input: Arc<DynObjectStore>,
@@ -35,6 +37,7 @@ impl ProdScratchpadGen {
         store_output: Arc<DynObjectStore>,
     ) -> Self {
         Self {
+            shadow_mode,
             concurrency,
             backoff_config,
             store_input,
@@ -54,6 +57,7 @@ impl Display for ProdScratchpadGen {
 impl ScratchpadGen for ProdScratchpadGen {
     fn pad(&self) -> Arc<dyn Scratchpad> {
         Arc::new(ProdScratchpad {
+            shadow_mode: self.shadow_mode,
             concurrency: self.concurrency,
             backoff_config: self.backoff_config.clone(),
             store_input: Arc::clone(&self.store_input),
@@ -66,6 +70,7 @@ impl ScratchpadGen for ProdScratchpadGen {
 }
 
 struct ProdScratchpad {
+    shadow_mode: bool,
     concurrency: NonZeroUsize,
     backoff_config: BackoffConfig,
     store_input: Arc<DynObjectStore>,
@@ -101,7 +106,7 @@ impl ProdScratchpad {
             .iter()
             .map(|f| {
                 let uuid = Self::xor_uuids(f.objest_store_id(), self.mask);
-                let f = (*f).with_object_store_id(uuid);
+                let f = (f.clone()).with_object_store_id(uuid);
                 (f, uuid)
             })
             .unzip()
@@ -122,8 +127,8 @@ impl ProdScratchpad {
         files_unmasked
             .iter()
             .zip(files_masked)
-            .filter(
-                |(f_unmasked, _f_masked)| match ref_files_unmasked.entry(**f_unmasked) {
+            .filter(|(f_unmasked, _f_masked)| {
+                match ref_files_unmasked.entry((*f_unmasked).clone()) {
                     Entry::Occupied(mut o) => {
                         let old_var = *o.get();
                         *o.get_mut() |= output;
@@ -133,8 +138,9 @@ impl ProdScratchpad {
                         v.insert(output);
                         true
                     }
-                },
-            )
+                }
+            })
+            .map(|(un, masked)| (un.clone(), masked.clone()))
             .unzip()
     }
 }
@@ -172,6 +178,11 @@ impl Drop for ProdScratchpad {
 
 #[async_trait]
 impl Scratchpad for ProdScratchpad {
+    fn uuids(&self, files: &[ParquetFilePath]) -> Vec<Uuid> {
+        let (_, uuids) = self.apply_mask(files);
+        uuids
+    }
+
     async fn load_to_scratchpad(&self, files: &[ParquetFilePath]) -> Vec<Uuid> {
         let (files_to, uuids) = self.apply_mask(files);
         let (files_from, files_to) = self.check_known(files, &files_to, false);
@@ -234,6 +245,14 @@ impl Scratchpad for ProdScratchpad {
         .await;
     }
 
+    // clean_written_from_scratchpad is the same as clean_from_scratchpad, but it does not remove files
+    // when in shadow mode, since in shadow mode the scratchpad is the only copy of files.
+    async fn clean_written_from_scratchpad(&self, files: &[ParquetFilePath]) {
+        if !self.shadow_mode {
+            self.clean_from_scratchpad(files).await;
+        }
+    }
+
     async fn clean(&self) {
         // clean will remove all files in the scratchpad as of the time files_unmasked is locked.
         let files: Vec<_> = self
@@ -265,6 +284,7 @@ mod tests {
     fn test_display() {
         let (store_input, store_scratchpad, store_output) = stores();
         let gen = ProdScratchpadGen::new(
+            true,
             NonZeroUsize::new(1).unwrap(),
             BackoffConfig::default(),
             store_input,
@@ -280,6 +300,7 @@ mod tests {
 
         let (store_input, store_scratchpad, store_output) = stores();
         let gen = ProdScratchpadGen::new(
+            true,
             NonZeroUsize::new(1).unwrap(),
             BackoffConfig::default(),
             Arc::clone(&store_input),
@@ -307,19 +328,22 @@ mod tests {
         assert_content(&store_scratchpad, []).await;
         assert_content(&store_output, []).await;
 
-        let uuids = pad.load_to_scratchpad(&[f1, f2]).await;
+        let early_get_uuids = pad.uuids(&[f1.clone(), f2.clone()]);
+
+        let uuids = pad.load_to_scratchpad(&[f1.clone(), f2.clone()]).await;
         assert_eq!(uuids.len(), 2);
-        let f1_masked = f1.with_object_store_id(uuids[0]);
-        let f2_masked = f2.with_object_store_id(uuids[1]);
+        assert_eq!(early_get_uuids, uuids);
+        let f1_masked = f1.clone().with_object_store_id(uuids[0]);
+        let f2_masked = f2.clone().with_object_store_id(uuids[1]);
 
         assert_content(&store_input, [&f1, &f2, &f3, &f4]).await;
         assert_content(&store_scratchpad, [&f1_masked, &f2_masked]).await;
         assert_content(&store_output, []).await;
 
-        let uuids = pad.load_to_scratchpad(&[f2, f3]).await;
+        let uuids = pad.load_to_scratchpad(&[f2.clone(), f3.clone()]).await;
         assert_eq!(uuids.len(), 2);
         assert_eq!(f2_masked.objest_store_id(), uuids[0]);
-        let f3_masked = f3.with_object_store_id(uuids[1]);
+        let f3_masked = f3.clone().with_object_store_id(uuids[1]);
 
         assert_content(&store_input, [&f1, &f2, &f3, &f4]).await;
         assert_content(&store_scratchpad, [&f1_masked, &f2_masked, &f3_masked]).await;
@@ -342,10 +366,12 @@ mod tests {
         .await;
         assert_content(&store_output, []).await;
 
-        let uuids = pad.make_public(&[f5_masked, f6_masked]).await;
+        let uuids = pad
+            .make_public(&[f5_masked.clone(), f6_masked.clone()])
+            .await;
         assert_eq!(uuids.len(), 2);
-        let f5 = f5_masked.with_object_store_id(uuids[0]);
-        let f6 = f6_masked.with_object_store_id(uuids[1]);
+        let f5 = f5_masked.clone().with_object_store_id(uuids[0]);
+        let f6 = f6_masked.clone().with_object_store_id(uuids[1]);
 
         assert_content(&store_input, [&f1, &f2, &f3, &f4]).await;
         assert_content(
@@ -357,7 +383,7 @@ mod tests {
         .await;
         assert_content(&store_output, [&f5, &f6]).await;
 
-        let uuids = pad.make_public(&[f1_masked]).await;
+        let uuids = pad.make_public(&[f1_masked.clone()]).await;
         assert_eq!(uuids.len(), 1);
         assert_eq!(f1.objest_store_id(), uuids[0]);
 
@@ -371,12 +397,31 @@ mod tests {
         .await;
         assert_content(&store_output, [&f1, &f5, &f6]).await;
 
-        pad.clean_from_scratchpad(&[f1, f5]).await;
+        // we're in shadow mode, so written (compaction output) files must be be removed.
+        pad.clean_written_from_scratchpad(&[f1.clone(), f5.clone()])
+            .await;
+
+        // they're still there
+        assert_content(
+            &store_scratchpad,
+            [
+                &f1_masked, &f2_masked, &f3_masked, &f5_masked, &f6_masked, &f7_masked,
+            ],
+        )
+        .await;
+
+        pad.clean_from_scratchpad(&[f1.clone(), f5.clone()]).await;
+
+        assert_content(
+            &store_scratchpad,
+            [&f2_masked, &f3_masked, &f6_masked, &f7_masked],
+        )
+        .await;
 
         // Reload a cleaned file back into the scratchpad, simulating a backlogged partition that
         // requires several compaction loops (where the output of one compaction is later the input
         // to a subsequent compaction).
-        let uuids = pad.load_to_scratchpad(&[f1]).await;
+        let uuids = pad.load_to_scratchpad(&[f1.clone()]).await;
         assert_eq!(uuids.len(), 1);
         assert_eq!(f1_masked.objest_store_id(), uuids[0]);
 
@@ -399,6 +444,7 @@ mod tests {
     async fn test_collision() {
         let (store_input, store_scratchpad, store_output) = stores();
         let gen = ProdScratchpadGen::new(
+            false,
             NonZeroUsize::new(1).unwrap(),
             BackoffConfig::default(),
             Arc::clone(&store_input),
@@ -416,11 +462,11 @@ mod tests {
             .await
             .unwrap();
 
-        let uuids = pad1.load_to_scratchpad(&[f]).await;
+        let uuids = pad1.load_to_scratchpad(&[f.clone()]).await;
         assert_eq!(uuids.len(), 1);
-        let f_masked1 = f.with_object_store_id(uuids[0]);
+        let f_masked1 = f.clone().with_object_store_id(uuids[0]);
 
-        let uuids = pad2.load_to_scratchpad(&[f]).await;
+        let uuids = pad2.load_to_scratchpad(&[f.clone()]).await;
         assert_eq!(uuids.len(), 1);
         let f_masked2 = f.with_object_store_id(uuids[0]);
 
@@ -435,6 +481,7 @@ mod tests {
     async fn test_clean_on_drop() {
         let (store_input, store_scratchpad, store_output) = stores();
         let gen = ProdScratchpadGen::new(
+            false,
             NonZeroUsize::new(1).unwrap(),
             BackoffConfig::default(),
             Arc::clone(&store_input),
@@ -481,6 +528,7 @@ mod tests {
     async fn test_clean_does_not_crash_on_panic() {
         let (store_input, store_scratchpad, store_output) = stores();
         let gen = ProdScratchpadGen::new(
+            false,
             NonZeroUsize::new(1).unwrap(),
             BackoffConfig::default(),
             Arc::clone(&store_input),

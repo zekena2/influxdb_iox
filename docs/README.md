@@ -28,6 +28,7 @@ We hold monthly Tech Talks that explain the project's technical underpinnings. Y
 
 * [SQL command line tips and tricks](sql.md)
 * [CLI command line tips and tricks](cli.md)
+* [CLI cookbook for `influxdb_iox table create` and `influxdb_iox namespace create`](cli-create-namespace-table.md)
 
 ###  Developer Content
 
@@ -50,3 +51,5 @@ We hold monthly Tech Talks that explain the project's technical underpinnings. Y
 * [Notes on the use of local filesystems](local_filesystems.md)
 * [Querier <> Ingester Query Protocol](ingester_querier_protocol.md)
 * [Underground Guide to Running IOx Locally](underground_guide.md)
+* [Query Processing](query_processing.md)
+* [How to Reproduce and Debug Production Data Locally](debug.md)

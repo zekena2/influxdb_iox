@@ -4,12 +4,17 @@
     clippy::explicit_iter_loop,
     clippy::use_self,
     clippy::clone_on_ref_ptr,
+    // See https://github.com/influxdata/influxdb_iox/pull/1671
     clippy::future_not_send,
     clippy::todo,
-    clippy::dbg_macro
+    clippy::dbg_macro,
+    unused_crate_dependencies
 )]
 
-use std::{any::Any, collections::VecDeque};
+// Workaround for "unused crate" lint false positives.
+use workspace_hack as _;
+
+use std::{any::Any, collections::VecDeque, sync::Arc};
 
 use parking_lot::Mutex;
 
@@ -84,5 +89,18 @@ impl TraceCollector for RingBufferTraceCollector {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+impl<T> TraceCollector for Arc<T>
+where
+    T: TraceCollector,
+{
+    fn export(&self, span: Span) {
+        (**self).export(span)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        (**self).as_any()
     }
 }

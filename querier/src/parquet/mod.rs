@@ -1,9 +1,8 @@
 //! Querier Chunks
 
-use data_types::{
-    ChunkId, ChunkOrder, CompactionLevel, DeletePredicate, PartitionId, TableSummary,
-};
-use iox_query::util::create_basic_summary;
+use data_types::{ChunkId, ChunkOrder, TransitionPartitionId};
+use datafusion::physical_plan::Statistics;
+use iox_query::chunk_statistics::{create_chunk_statistics, ColumnRanges};
 use parquet_file::chunk::ParquetChunk;
 use schema::sort::SortKey;
 use std::sync::Arc;
@@ -25,11 +24,8 @@ pub struct QuerierParquetChunkMeta {
     /// Sort key.
     sort_key: Option<SortKey>,
 
-    /// Partition ID.
-    partition_id: PartitionId,
-
-    /// Compaction level of the parquet file of the chunk
-    compaction_level: CompactionLevel,
+    /// Partition identifier.
+    partition_id: TransitionPartitionId,
 }
 
 impl QuerierParquetChunkMeta {
@@ -43,14 +39,9 @@ impl QuerierParquetChunkMeta {
         self.sort_key.as_ref()
     }
 
-    /// Partition ID.
-    pub fn partition_id(&self) -> PartitionId {
-        self.partition_id
-    }
-
-    /// Compaction level of the parquet file of the chunk
-    pub fn compaction_level(&self) -> CompactionLevel {
-        self.compaction_level
+    /// Partition identifier.
+    pub fn partition_id(&self) -> &TransitionPartitionId {
+        &self.partition_id
     }
 }
 
@@ -59,38 +50,31 @@ pub struct QuerierParquetChunk {
     /// Immutable chunk metadata
     meta: Arc<QuerierParquetChunkMeta>,
 
-    /// Delete predicates to be combined with the chunk
-    delete_predicates: Vec<Arc<DeletePredicate>>,
-
     /// Chunk of the Parquet file
     parquet_chunk: Arc<ParquetChunk>,
 
-    /// Table summary
-    table_summary: Arc<TableSummary>,
+    /// Stats
+    stats: Arc<Statistics>,
 }
 
 impl QuerierParquetChunk {
     /// Create new parquet-backed chunk (object store data).
-    pub fn new(parquet_chunk: Arc<ParquetChunk>, meta: Arc<QuerierParquetChunkMeta>) -> Self {
-        let table_summary = Arc::new(create_basic_summary(
+    pub fn new(
+        parquet_chunk: Arc<ParquetChunk>,
+        meta: Arc<QuerierParquetChunkMeta>,
+        column_ranges: ColumnRanges,
+    ) -> Self {
+        let stats = Arc::new(create_chunk_statistics(
             parquet_chunk.rows() as u64,
             parquet_chunk.schema(),
-            parquet_chunk.timestamp_min_max(),
+            Some(parquet_chunk.timestamp_min_max()),
+            &column_ranges,
         ));
 
         Self {
             meta,
-            delete_predicates: Vec::new(),
             parquet_chunk,
-            table_summary,
-        }
-    }
-
-    /// Set delete predicates of the given chunk.
-    pub fn with_delete_predicates(self, delete_predicates: Vec<Arc<DeletePredicate>>) -> Self {
-        Self {
-            delete_predicates,
-            ..self
+            stats,
         }
     }
 
@@ -110,23 +94,25 @@ impl QuerierParquetChunk {
 
 #[cfg(test)]
 pub mod tests {
-    use crate::{
-        cache::{namespace::CachedNamespace, CatalogCache},
-        table::MetricPruningObserver,
+    use std::collections::HashMap;
+
+    use crate::cache::{
+        namespace::{CachedNamespace, CachedTable},
+        partition::PartitionRequest,
+        CatalogCache,
     };
 
     use super::*;
     use arrow::{datatypes::DataType, record_batch::RecordBatch};
     use arrow_util::assert_batches_eq;
-    use data_types::{ColumnType, NamespaceSchema, ParquetFile};
+    use data_types::{ColumnType, ParquetFile, SortedColumnSet};
     use datafusion_util::config::register_iox_object_store;
     use iox_query::{
         exec::{ExecutorType, IOxSessionContext},
-        QueryChunk, QueryChunkMeta,
+        QueryChunk,
     };
-    use iox_tests::{TestCatalog, TestNamespace, TestParquetFileBuilder};
+    use iox_tests::{TestCatalog, TestParquetFileBuilder};
     use metric::{Attributes, Observation, RawReporter};
-    use predicate::Predicate;
     use schema::{builder::SchemaBuilder, sort::SortKeyBuilder};
     use test_helpers::maybe_start_logging;
     use tokio::runtime::Handle;
@@ -135,10 +121,9 @@ pub mod tests {
     async fn test_new_parquet_chunk() {
         maybe_start_logging();
         let test_data = TestData::new().await;
-        let namespace_schema = Arc::new(test_data.ns.schema().await);
 
         // create chunk
-        let chunk = test_data.chunk(Arc::clone(&namespace_schema)).await;
+        let chunk = test_data.chunk().await;
 
         // check state
         assert_eq!(chunk.chunk_type(), "parquet");
@@ -152,8 +137,8 @@ pub mod tests {
         // check sort key
         assert_sort_key(&chunk);
 
-        // back up table summary
-        let table_summary_1 = chunk.summary();
+        // back up stats
+        let stats_1 = chunk.stats();
 
         // check if chunk can be queried
         assert_content(&chunk, &test_data).await;
@@ -161,12 +146,12 @@ pub mod tests {
         // check state again
         assert_eq!(chunk.chunk_type(), "parquet");
 
-        // summary has NOT changed
-        let table_summary_2 = chunk.summary();
-        assert_eq!(table_summary_1, table_summary_2);
+        // stats have NOT changed
+        let stats_2 = chunk.stats();
+        assert_eq!(stats_1, stats_2);
 
         // retrieving the chunk again should not require any catalog requests
-        test_data.chunk(namespace_schema).await;
+        test_data.chunk().await;
         let catalog_metrics2 = test_data.get_catalog_access_metrics();
         assert_eq!(catalog_metrics1, catalog_metrics2);
     }
@@ -184,9 +169,9 @@ pub mod tests {
 
     struct TestData {
         catalog: Arc<TestCatalog>,
-        ns: Arc<TestNamespace>,
         parquet_file: Arc<ParquetFile>,
         adapter: ChunkAdapter,
+        cached_table: Arc<CachedTable>,
     }
 
     impl TestData {
@@ -201,17 +186,20 @@ pub mod tests {
             .join("\n");
             let ns = catalog.create_namespace_1hr_retention("ns").await;
             let table = ns.create_table("table").await;
-            table.create_column("tag1", ColumnType::Tag).await;
-            table.create_column("tag2", ColumnType::Tag).await;
+            let tag1 = table.create_column("tag1", ColumnType::Tag).await;
+            let tag2 = table.create_column("tag2", ColumnType::Tag).await;
             table.create_column("tag3", ColumnType::Tag).await;
-            table.create_column("tag4", ColumnType::Tag).await;
+            let tag4 = table.create_column("tag4", ColumnType::Tag).await;
             table.create_column("field_int", ColumnType::I64).await;
             table.create_column("field_float", ColumnType::F64).await;
-            table.create_column("time", ColumnType::Time).await;
+            let col_time = table.create_column("time", ColumnType::Time).await;
             let partition = table
                 .create_partition("part")
                 .await
-                .update_sort_key(SortKey::from_columns(["tag1", "tag2", "tag4", "time"]))
+                .update_sort_key(
+                    SortKey::from_columns(["tag1", "tag2", "tag4", "time"]),
+                    &SortedColumnSet::from([tag1.id(), tag2.id(), tag4.id(), col_time.id()]),
+                )
                 .await;
             let builder = TestParquetFileBuilder::default().with_line_protocol(&lp);
             let parquet_file = Arc::new(partition.create_parquet_file(builder).await.parquet_file);
@@ -227,23 +215,53 @@ pub mod tests {
                 catalog.metric_registry(),
             );
 
+            let mut repos = catalog.catalog.repositories().await;
+            let tables = repos
+                .tables()
+                .list_by_namespace_id(ns.namespace.id)
+                .await
+                .unwrap();
+            let columns = repos
+                .columns()
+                .list_by_namespace_id(ns.namespace.id)
+                .await
+                .unwrap();
+            let cached_namespace = CachedNamespace::new(ns.namespace.clone(), tables, columns);
+            let cached_table =
+                Arc::clone(cached_namespace.tables.get("table").expect("table exists"));
+
             Self {
                 catalog,
-                ns,
                 parquet_file,
                 adapter,
+                cached_table,
             }
         }
 
-        async fn chunk(&self, namespace_schema: Arc<NamespaceSchema>) -> QuerierParquetChunk {
-            let cached_namespace: CachedNamespace = namespace_schema.as_ref().clone().into();
-            let cached_table = cached_namespace.tables.get("table").expect("table exists");
+        async fn chunk(&self) -> QuerierParquetChunk {
+            let cached_partition = self
+                .adapter
+                .catalog_cache()
+                .partition()
+                .get(
+                    Arc::clone(&self.cached_table),
+                    vec![PartitionRequest {
+                        partition_id: self.parquet_file.partition_id.clone(),
+                        sort_key_should_cover: vec![],
+                    }],
+                    None,
+                )
+                .await
+                .into_iter()
+                .next()
+                .unwrap();
+            let cached_partitions =
+                HashMap::from([(self.parquet_file.partition_id.clone(), cached_partition)]);
             self.adapter
                 .new_chunks(
-                    Arc::clone(cached_table),
-                    Arc::new(vec![Arc::clone(&self.parquet_file)]),
-                    &Predicate::new(),
-                    MetricPruningObserver::new_unregistered(),
+                    Arc::clone(&self.cached_table),
+                    vec![Arc::clone(&self.parquet_file)].into(),
+                    &cached_partitions,
                     None,
                 )
                 .await

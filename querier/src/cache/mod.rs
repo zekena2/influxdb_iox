@@ -21,7 +21,7 @@ pub mod projected_schema;
 mod ram;
 
 #[cfg(test)]
-mod test_util;
+pub(crate) mod test_util;
 
 /// Caches request to the [`Catalog`].
 #[derive(Debug)]
@@ -113,11 +113,13 @@ impl CatalogCache {
             "ram_metadata",
             RamSize(ram_pool_metadata_bytes),
             Arc::clone(&metric_registry),
+            &Handle::current(),
         ));
         let ram_pool_data = Arc::new(ResourcePool::new(
             "ram_data",
             RamSize(ram_pool_data_bytes),
             Arc::clone(&metric_registry),
+            &Handle::current(),
         ));
 
         let partition_cache = PartitionCache::new(
@@ -157,6 +159,7 @@ impl CatalogCache {
             Arc::clone(&time_provider),
             &metric_registry,
             Arc::clone(&ram_pool_data),
+            handle,
             testing,
         );
 
@@ -205,12 +208,6 @@ impl CatalogCache {
     /// Projected schema cache.
     pub(crate) fn projected_schema(&self) -> &ProjectedSchemaCache {
         &self.projected_schema_cache
-    }
-
-    /// Object store cache.
-    #[allow(dead_code)]
-    pub(crate) fn object_store(&self) -> &ObjectStoreCache {
-        &self.object_store_cache
     }
 
     /// Parquet store that points to the cached object store.

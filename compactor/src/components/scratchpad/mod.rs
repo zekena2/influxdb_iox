@@ -41,14 +41,18 @@ pub trait ScratchpadGen: Debug + Display + Send + Sync {
 /// object store IO. This was limiting our throughput substantially.
 ///
 /// **shadow mode**: De-coupling the stores in this way makes it easier
-/// to implement compactor: shadow mode #6645.
+/// to implement compactor: shadow mode #6645.  Shadow mode relies on
+/// leaving the compaction output in the scratchpad so
+/// `clean_written_from_scratchpad` is a no-op for shadow mode.
 ///
 /// Note that we assume here that the input parquet files are WAY
 /// SMALLER than the uncompressed Arrow data during compaction itself.
 #[async_trait]
 pub trait Scratchpad: Debug + Send + Sync + 'static {
+    fn uuids(&self, files: &[ParquetFilePath]) -> Vec<Uuid>;
     async fn load_to_scratchpad(&self, files: &[ParquetFilePath]) -> Vec<Uuid>;
     async fn make_public(&self, files: &[ParquetFilePath]) -> Vec<Uuid>;
     async fn clean_from_scratchpad(&self, files: &[ParquetFilePath]);
+    async fn clean_written_from_scratchpad(&self, files: &[ParquetFilePath]);
     async fn clean(&self);
 }

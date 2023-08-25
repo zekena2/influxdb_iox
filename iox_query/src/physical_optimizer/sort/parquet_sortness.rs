@@ -3,14 +3,11 @@ use std::sync::Arc;
 use datafusion::{
     common::tree_node::{RewriteRecursion, Transformed, TreeNode, TreeNodeRewriter},
     config::ConfigOptions,
+    datasource::physical_plan::{FileScanConfig, ParquetExec},
     error::Result,
     physical_expr::{PhysicalSortExpr, PhysicalSortRequirement},
     physical_optimizer::PhysicalOptimizerRule,
-    physical_plan::{
-        file_format::{FileScanConfig, ParquetExec},
-        sorts::sort::SortExec,
-        ExecutionPlan,
-    },
+    physical_plan::{sorts::sort::SortExec, ExecutionPlan},
 };
 use observability_deps::tracing::warn;
 
@@ -126,7 +123,7 @@ impl<'a> TreeNodeRewriter for ParquetSortnessRewriter<'a> {
         };
 
         let base_config = parquet_exec.base_config();
-        if base_config.output_ordering.is_none() {
+        if base_config.output_ordering.is_empty() {
             // no output ordering requested
             return Ok(node);
         }
@@ -207,7 +204,7 @@ mod tests {
             projection: None,
             limit: None,
             table_partition_cols: vec![],
-            output_ordering: Some(ordering(["col2", "col1"], &schema)),
+            output_ordering: vec![ordering(["col2", "col1"], &schema)],
             infinite_source: false,
         };
         let inner = ParquetExec::new(base_config, None, None);
@@ -215,7 +212,7 @@ mod tests {
             SortExec::new(ordering(["col2", "col1"], &schema), Arc::new(inner))
                 .with_fetch(Some(42)),
         );
-        let opt = ParquetSortness::default();
+        let opt = ParquetSortness;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -242,7 +239,7 @@ mod tests {
             projection: None,
             limit: None,
             table_partition_cols: vec![],
-            output_ordering: Some(ordering(["col2", "col1", CHUNK_ORDER_COLUMN_NAME], &schema)),
+            output_ordering: vec![ordering(["col2", "col1", CHUNK_ORDER_COLUMN_NAME], &schema)],
             infinite_source: false,
         };
         let inner = ParquetExec::new(base_config, None, None);
@@ -251,7 +248,7 @@ mod tests {
             ordering(["col2", "col1"], &schema),
             true,
         ));
-        let opt = ParquetSortness::default();
+        let opt = ParquetSortness;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -278,7 +275,7 @@ mod tests {
             projection: None,
             limit: None,
             table_partition_cols: vec![],
-            output_ordering: Some(ordering(["col2", "col1"], &schema)),
+            output_ordering: vec![ordering(["col2", "col1"], &schema)],
             infinite_source: false,
         };
         let inner = ParquetExec::new(base_config, None, None);
@@ -290,7 +287,7 @@ mod tests {
 
         assert_unknown_partitioning(plan.output_partitioning(), 2);
 
-        let opt = ParquetSortness::default();
+        let opt = ParquetSortness;
         let test = OptimizationTest::new(plan, opt);
         insta::assert_yaml_snapshot!(
             test,
@@ -320,7 +317,7 @@ mod tests {
             projection: None,
             limit: None,
             table_partition_cols: vec![],
-            output_ordering: Some(ordering(["col2", "col1"], &schema)),
+            output_ordering: vec![ordering(["col2", "col1"], &schema)],
             infinite_source: false,
         };
         let inner = ParquetExec::new(base_config, None, None);
@@ -328,7 +325,7 @@ mod tests {
             SortExec::new(ordering(["col2", "col1"], &schema), Arc::new(inner))
                 .with_fetch(Some(42)),
         );
-        let opt = ParquetSortness::default();
+        let opt = ParquetSortness;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -355,7 +352,7 @@ mod tests {
             projection: None,
             limit: None,
             table_partition_cols: vec![],
-            output_ordering: Some(ordering(["col1", "col2"], &schema)),
+            output_ordering: vec![ordering(["col1", "col2"], &schema)],
             infinite_source: false,
         };
         let inner = ParquetExec::new(base_config, None, None);
@@ -363,7 +360,7 @@ mod tests {
             SortExec::new(ordering(["col2", "col1"], &schema), Arc::new(inner))
                 .with_fetch(Some(42)),
         );
-        let opt = ParquetSortness::default();
+        let opt = ParquetSortness;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -390,7 +387,7 @@ mod tests {
             projection: None,
             limit: None,
             table_partition_cols: vec![],
-            output_ordering: None,
+            output_ordering: vec![vec![]],
             infinite_source: false,
         };
         let inner = ParquetExec::new(base_config, None, None);
@@ -398,7 +395,7 @@ mod tests {
             SortExec::new(ordering(["col2", "col1"], &schema), Arc::new(inner))
                 .with_fetch(Some(42)),
         );
-        let opt = ParquetSortness::default();
+        let opt = ParquetSortness;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -425,7 +422,7 @@ mod tests {
             projection: None,
             limit: None,
             table_partition_cols: vec![],
-            output_ordering: Some(ordering(["col2", "col1"], &schema)),
+            output_ordering: vec![ordering(["col2", "col1"], &schema)],
             infinite_source: false,
         };
         let inner = ParquetExec::new(base_config, None, None);
@@ -433,7 +430,7 @@ mod tests {
             SortExec::new(ordering(["col2", "col1"], &schema), Arc::new(inner))
                 .with_fetch(Some(42)),
         );
-        let opt = ParquetSortness::default();
+        let opt = ParquetSortness;
         let mut config = ConfigOptions::default();
         config.extensions.insert(IoxConfigExt {
             max_parquet_fanout: 2,
@@ -462,7 +459,7 @@ mod tests {
             SortExec::new(ordering(["col2", "col1"], &schema), Arc::new(inner))
                 .with_fetch(Some(42)),
         );
-        let opt = ParquetSortness::default();
+        let opt = ParquetSortness;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -489,11 +486,11 @@ mod tests {
             projection: None,
             limit: None,
             table_partition_cols: vec![],
-            output_ordering: Some(ordering(["col2", "col1"], &schema)),
+            output_ordering: vec![ordering(["col2", "col1"], &schema)],
             infinite_source: false,
         };
         let plan = Arc::new(ParquetExec::new(base_config, None, None));
-        let opt = ParquetSortness::default();
+        let opt = ParquetSortness;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -518,7 +515,7 @@ mod tests {
             projection: None,
             limit: None,
             table_partition_cols: vec![],
-            output_ordering: Some(ordering(["col1", "col2"], &schema)),
+            output_ordering: vec![ordering(["col1", "col2"], &schema)],
             infinite_source: false,
         };
         let plan = Arc::new(ParquetExec::new(base_config, None, None));
@@ -526,7 +523,7 @@ mod tests {
             Arc::new(SortExec::new(ordering(["col2", "col1"], &schema), plan).with_fetch(Some(42)));
         let plan =
             Arc::new(SortExec::new(ordering(["col1", "col2"], &schema), plan).with_fetch(Some(42)));
-        let opt = ParquetSortness::default();
+        let opt = ParquetSortness;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -555,7 +552,7 @@ mod tests {
             projection: None,
             limit: None,
             table_partition_cols: vec![],
-            output_ordering: Some(ordering(["col1", "col2"], &schema)),
+            output_ordering: vec![ordering(["col1", "col2"], &schema)],
             infinite_source: false,
         };
         let plan = Arc::new(ParquetExec::new(base_config, None, None));
@@ -563,7 +560,7 @@ mod tests {
             Arc::new(SortExec::new(ordering(["col1", "col2"], &schema), plan).with_fetch(Some(42)));
         let plan =
             Arc::new(SortExec::new(ordering(["col2", "col1"], &schema), plan).with_fetch(Some(42)));
-        let opt = ParquetSortness::default();
+        let opt = ParquetSortness;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -593,7 +590,7 @@ mod tests {
             projection: None,
             limit: None,
             table_partition_cols: vec![],
-            output_ordering: Some(ordering(["col2", "col1", CHUNK_ORDER_COLUMN_NAME], &schema)),
+            output_ordering: vec![ordering(["col2", "col1", CHUNK_ORDER_COLUMN_NAME], &schema)],
             infinite_source: false,
         };
         let plan_parquet = Arc::new(ParquetExec::new(base_config, None, None));
@@ -605,7 +602,7 @@ mod tests {
             ordering(["col2", "col1"], &schema),
             true,
         ));
-        let opt = ParquetSortness::default();
+        let opt = ParquetSortness;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -650,6 +647,7 @@ mod tests {
                 location: Path::parse(format!("{n}.parquet")).unwrap(),
                 last_modified: Default::default(),
                 size: 0,
+                e_tag: None,
             },
             partition_values: vec![],
             range: None,

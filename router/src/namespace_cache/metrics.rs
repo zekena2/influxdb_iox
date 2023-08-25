@@ -113,11 +113,9 @@ where
             };
         }
 
-        // Figure out the difference between the new namespace and the
-        // evicted old namespace
-        // Adjust the metrics to reflect the change
-        self.table_count.inc(change_stats.new_tables as u64);
-        self.column_count.inc(change_stats.new_columns as u64);
+        // Adjust the metrics to reflect the change in table and column counts
+        self.table_count.inc(change_stats.new_tables.len() as u64);
+        self.column_count.inc(change_stats.num_new_columns as u64);
 
         (result, change_stats)
     }
@@ -155,7 +153,7 @@ mod tests {
                     i.to_string(),
                     TableSchema {
                         id: TableId::new(i as _),
-                        partition_template: None,
+                        partition_template: Default::default(),
                         columns: ColumnsByName::new(columns),
                     },
                 )
@@ -168,7 +166,7 @@ mod tests {
             max_columns_per_table: 100,
             max_tables: 42,
             retention_period_ns: None,
-            partition_template: None,
+            partition_template: Default::default(),
         }
     }
 

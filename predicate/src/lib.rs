@@ -3,42 +3,34 @@
     missing_copy_implementations,
     missing_debug_implementations,
     clippy::explicit_iter_loop,
+    // See https://github.com/influxdata/influxdb_iox/pull/1671
     clippy::future_not_send,
     clippy::use_self,
     clippy::clone_on_ref_ptr,
     clippy::todo,
-    clippy::dbg_macro
+    clippy::dbg_macro,
+    unused_crate_dependencies
 )]
+
+// Workaround for "unused crate" lint false positives.
+use workspace_hack as _;
 
 pub mod delete_expr;
 pub mod delete_predicate;
 pub mod rpc_predicate;
 
-use arrow::{
-    array::{
-        BooleanArray, Float64Array, Int64Array, StringArray, TimestampNanosecondArray, UInt64Array,
-    },
-    datatypes::SchemaRef,
-};
-use data_types::{InfluxDbType, TableSummary, TimestampRange};
+use data_types::TimestampRange;
 use datafusion::{
-    common::tree_node::{TreeNode, TreeNodeVisitor, VisitRecursion},
+    common::tree_node::{TreeNodeVisitor, VisitRecursion},
     error::DataFusionError,
-    logical_expr::{binary_expr, utils::expr_to_columns, BinaryExpr},
-    optimizer::utils::split_conjunction,
-    physical_expr::execution_props::ExecutionProps,
-    physical_optimizer::pruning::PruningStatistics,
+    logical_expr::{binary_expr, BinaryExpr},
     prelude::{col, lit_timestamp_nano, Expr},
 };
-use datafusion_util::{create_pruning_predicate, make_range_expr, nullable_schema, AsExpr};
+use datafusion_util::{make_range_expr, AsExpr};
 use observability_deps::tracing::debug;
 use rpc_predicate::VALUE_COLUMN_NAME;
 use schema::TIME_COLUMN_NAME;
-use std::{
-    collections::{BTreeSet, HashSet},
-    fmt,
-    sync::Arc,
-};
+use std::{collections::BTreeSet, fmt, ops::Not};
 
 /// This `Predicate` represents the empty predicate (aka that evaluates to true for all rows).
 pub const EMPTY_PREDICATE: Predicate = Predicate {
@@ -242,124 +234,6 @@ impl Predicate {
 
         self
     }
-
-    /// Apply predicate to given table summary and avoid having to
-    /// look at actual data.
-    pub fn apply_to_table_summary(
-        &self,
-        props: &ExecutionProps,
-        table_summary: &TableSummary,
-        schema: SchemaRef,
-    ) -> PredicateMatch {
-        let summary = SummaryWrapper {
-            summary: table_summary,
-        };
-
-        // If we don't have statistics for a particular column, its
-        // value will be null, so we need to ensure the schema we used
-        // in pruning predicates allows for null.
-        let schema = nullable_schema(schema);
-
-        if let Some(expr) = self.filter_expr() {
-            match create_pruning_predicate(props, &expr, &schema) {
-                Ok(pp) => {
-                    match pp.prune(&summary) {
-                        Ok(matched) => {
-                            assert_eq!(matched.len(), 1);
-                            if matched[0] {
-                                // might match
-                                return PredicateMatch::Unknown;
-                            } else {
-                                // does not match => since expressions are `AND`ed, we know that we will have zero matches
-                                return PredicateMatch::Zero;
-                            }
-                        }
-                        Err(e) => {
-                            debug!(
-                                %e,
-                                %expr,
-                                "cannot prune summary with PruningPredicate",
-                            );
-                            return PredicateMatch::Unknown;
-                        }
-                    }
-                }
-                Err(e) => {
-                    debug!(
-                        %e,
-                        %expr,
-                        "cannot create PruningPredicate from expression",
-                    );
-                    return PredicateMatch::Unknown;
-                }
-            }
-        }
-
-        PredicateMatch::Unknown
-    }
-}
-
-struct SummaryWrapper<'a> {
-    summary: &'a TableSummary,
-}
-
-impl<'a> PruningStatistics for SummaryWrapper<'a> {
-    fn min_values(&self, column: &datafusion::prelude::Column) -> Option<arrow::array::ArrayRef> {
-        let col = self.summary.column(&column.name)?;
-        let stats = &col.stats;
-
-        // special handling for timestamps
-        if col.influxdb_type == InfluxDbType::Timestamp {
-            let val = stats.as_i64()?;
-            return Some(Arc::new(TimestampNanosecondArray::from(vec![val.min])));
-        }
-
-        let array = match stats {
-            data_types::Statistics::I64(val) => Arc::new(Int64Array::from(vec![val.min])) as _,
-            data_types::Statistics::U64(val) => Arc::new(UInt64Array::from(vec![val.min])) as _,
-            data_types::Statistics::F64(val) => Arc::new(Float64Array::from(vec![val.min])) as _,
-            data_types::Statistics::Bool(val) => Arc::new(BooleanArray::from(vec![val.min])) as _,
-            data_types::Statistics::String(val) => {
-                Arc::new(StringArray::from(vec![val.min.as_deref()])) as _
-            }
-        };
-
-        Some(array)
-    }
-
-    fn max_values(&self, column: &datafusion::prelude::Column) -> Option<arrow::array::ArrayRef> {
-        let col = self.summary.column(&column.name)?;
-        let stats = &col.stats;
-
-        // special handling for timestamps
-        if col.influxdb_type == InfluxDbType::Timestamp {
-            let val = stats.as_i64()?;
-            return Some(Arc::new(TimestampNanosecondArray::from(vec![val.max])));
-        }
-
-        let array = match stats {
-            data_types::Statistics::I64(val) => Arc::new(Int64Array::from(vec![val.max])) as _,
-            data_types::Statistics::U64(val) => Arc::new(UInt64Array::from(vec![val.max])) as _,
-            data_types::Statistics::F64(val) => Arc::new(Float64Array::from(vec![val.max])) as _,
-            data_types::Statistics::Bool(val) => Arc::new(BooleanArray::from(vec![val.max])) as _,
-            data_types::Statistics::String(val) => {
-                Arc::new(StringArray::from(vec![val.max.as_deref()])) as _
-            }
-        };
-
-        Some(array)
-    }
-
-    fn num_containers(&self) -> usize {
-        // the summary represents a single virtual container
-        1
-    }
-
-    fn null_counts(&self, column: &datafusion::prelude::Column) -> Option<arrow::array::ArrayRef> {
-        let null_count = self.summary.column(&column.name)?.stats.null_count();
-
-        Some(Arc::new(UInt64Array::from(vec![null_count])))
-    }
 }
 
 impl fmt::Display for Predicate {
@@ -399,21 +273,6 @@ impl fmt::Display for Predicate {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// The result of evaluating a predicate on a set of rows
-pub enum PredicateMatch {
-    /// There is at least one row that matches the predicate that has
-    /// at least one non null value in each field of the predicate
-    AtLeastOneNonNullField,
-
-    /// There are exactly zero rows that match the predicate
-    Zero,
-
-    /// There *may* be rows that match, OR there *may* be no rows that
-    /// match
-    Unknown,
-}
-
 impl Predicate {
     /// Sets the timestamp range
     pub fn with_range(mut self, start: i64, end: i64) -> Self {
@@ -440,9 +299,9 @@ impl Predicate {
         self
     }
 
-    /// Add an  exprestion "time >= retention_time"
+    /// Add an  exprestion "time > retention_time"
     pub fn with_retention(mut self, retention_time: i64) -> Self {
-        let expr = col(TIME_COLUMN_NAME).gt_eq(lit_timestamp_nano(retention_time));
+        let expr = col(TIME_COLUMN_NAME).gt(lit_timestamp_nano(retention_time));
         self.exprs.push(expr);
         self
     }
@@ -497,55 +356,6 @@ impl Predicate {
     pub fn with_exprs(mut self, filters: impl IntoIterator<Item = Expr>) -> Self {
         self.exprs.extend(filters.into_iter());
         self
-    }
-
-    /// Remove any clauses of this predicate that can not be run before deduplication.
-    ///
-    /// See <https://github.com/influxdata/influxdb_iox/issues/6066> for more details.
-    ///
-    /// Only expressions that are row-based and refer to primary key columns (and constants)
-    /// can be evaluated prior to deduplication.
-    ///
-    /// If a predicate can filter out some but not all of the rows with
-    /// the same primary key, it may filter out the row that should have been updated
-    /// allowing the original through, producing incorrect results.
-    ///
-    /// Any predicate that operates solely on primary key columns will either pass or filter
-    /// all rows with that primary key and thus is safe to push through.
-    pub fn push_through_dedup(self, schema: &schema::Schema) -> Self {
-        let pk: HashSet<_> = schema.primary_key().into_iter().collect();
-
-        let exprs = self
-            .exprs
-            .iter()
-            .flat_map(split_conjunction)
-            .filter(|expr| {
-                let mut columns = HashSet::default();
-                if expr_to_columns(expr, &mut columns).is_err() {
-                    // bail out, do NOT include this weird expression
-                    return false;
-                }
-
-                // check if all columns are part of the primary key
-                if !columns.into_iter().all(|c| pk.contains(c.name.as_str())) {
-                    return false;
-                }
-
-                let mut visitor = RowBasedVisitor::default();
-                expr.visit(&mut visitor).expect("never fails");
-
-                visitor.row_based
-            })
-            .cloned()
-            .collect();
-
-        Self {
-            // can always push time range through de-dup because it is a primary keys set operation
-            range: self.range,
-            exprs,
-            field_columns: None,
-            value_expr: vec![],
-        }
     }
 }
 
@@ -624,7 +434,7 @@ impl TreeNodeVisitor for RowBasedVisitor {
 
     fn pre_visit(&mut self, expr: &Expr) -> Result<VisitRecursion, DataFusionError> {
         match expr {
-            Expr::Alias(_, _)
+            Expr::Alias(_)
             | Expr::Between { .. }
             | Expr::BinaryExpr { .. }
             | Expr::Case { .. }
@@ -632,7 +442,6 @@ impl TreeNodeVisitor for RowBasedVisitor {
             | Expr::Column(_)
             | Expr::Exists { .. }
             | Expr::GetIndexedField { .. }
-            | Expr::ILike { .. }
             | Expr::InList { .. }
             | Expr::InSubquery { .. }
             | Expr::IsFalse(_)
@@ -672,11 +481,8 @@ impl TreeNodeVisitor for RowBasedVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::DataType as ArrowDataType;
-    use data_types::{ColumnSummary, InfluxDbType, StatValues, MAX_NANO_TIME, MIN_NANO_TIME};
-    use datafusion::prelude::{col, cube, lit};
-    use schema::builder::SchemaBuilder;
-    use test_helpers::maybe_start_logging;
+    use data_types::{MAX_NANO_TIME, MIN_NANO_TIME};
+    use datafusion::prelude::{col, lit};
 
     #[test]
     fn test_default_predicate_is_empty() {
@@ -784,281 +590,5 @@ mod tests {
         let expected = Predicate::new().with_expr(col("foo").eq(lit(42)));
         // rewrite
         assert_eq!(p.with_clear_timestamp_if_max_range(), expected);
-    }
-
-    #[test]
-    fn test_apply_to_table_summary() {
-        maybe_start_logging();
-        let props = ExecutionProps::new();
-
-        let p = Predicate::new()
-            .with_range(100, 200)
-            .with_expr(col("foo").eq(lit(42i64)))
-            .with_expr(col("bar").eq(lit(42i64)))
-            .with_expr(col(TIME_COLUMN_NAME).gt(lit_timestamp_nano(120i64)));
-
-        let schema = SchemaBuilder::new()
-            .field("foo", ArrowDataType::Int64)
-            .unwrap()
-            .field("bar", ArrowDataType::Int64)
-            .unwrap()
-            .timestamp()
-            .build()
-            .unwrap();
-
-        let summary = TableSummary {
-            columns: vec![ColumnSummary {
-                name: "foo".to_owned(),
-                influxdb_type: InfluxDbType::Field,
-                stats: data_types::Statistics::I64(StatValues {
-                    min: Some(10),
-                    max: Some(20),
-                    null_count: Some(0),
-                    total_count: 1_000,
-                    distinct_count: None,
-                }),
-            }],
-        };
-        assert_eq!(
-            p.apply_to_table_summary(&props, &summary, schema.as_arrow()),
-            PredicateMatch::Zero,
-        );
-
-        let summary = TableSummary {
-            columns: vec![ColumnSummary {
-                name: "foo".to_owned(),
-                influxdb_type: InfluxDbType::Field,
-                stats: data_types::Statistics::I64(StatValues {
-                    min: Some(10),
-                    max: Some(50),
-                    null_count: Some(0),
-                    total_count: 1_000,
-                    distinct_count: None,
-                }),
-            }],
-        };
-        assert_eq!(
-            p.apply_to_table_summary(&props, &summary, schema.as_arrow()),
-            PredicateMatch::Unknown,
-        );
-
-        let summary = TableSummary {
-            columns: vec![ColumnSummary {
-                name: TIME_COLUMN_NAME.to_owned(),
-                influxdb_type: InfluxDbType::Timestamp,
-                stats: data_types::Statistics::I64(StatValues {
-                    min: Some(115),
-                    max: Some(115),
-                    null_count: Some(0),
-                    total_count: 1_000,
-                    distinct_count: None,
-                }),
-            }],
-        };
-        assert_eq!(
-            p.apply_to_table_summary(&props, &summary, schema.as_arrow()),
-            PredicateMatch::Zero,
-        );
-
-        let summary = TableSummary {
-            columns: vec![ColumnSummary {
-                name: TIME_COLUMN_NAME.to_owned(),
-                influxdb_type: InfluxDbType::Timestamp,
-                stats: data_types::Statistics::I64(StatValues {
-                    min: Some(300),
-                    max: Some(300),
-                    null_count: Some(0),
-                    total_count: 1_000,
-                    distinct_count: None,
-                }),
-            }],
-        };
-        assert_eq!(
-            p.apply_to_table_summary(&props, &summary, schema.as_arrow()),
-            PredicateMatch::Zero,
-        );
-
-        let summary = TableSummary {
-            columns: vec![ColumnSummary {
-                name: TIME_COLUMN_NAME.to_owned(),
-                influxdb_type: InfluxDbType::Timestamp,
-                stats: data_types::Statistics::I64(StatValues {
-                    min: Some(150),
-                    max: Some(300),
-                    null_count: Some(0),
-                    total_count: 1_000,
-                    distinct_count: None,
-                }),
-            }],
-        };
-        assert_eq!(
-            p.apply_to_table_summary(&props, &summary, schema.as_arrow()),
-            PredicateMatch::Unknown,
-        )
-    }
-
-    /// Test that pruning works even when some expressions within the predicate cannot be evaluated by DataFusion
-    #[test]
-    fn test_apply_to_table_summary_partially_unsupported() {
-        maybe_start_logging();
-        let props = ExecutionProps::new();
-
-        let p = Predicate::new()
-            .with_range(100, 200)
-            .with_expr(col("foo").eq(lit(42i64)).not()); // NOT expressions are currently mostly unsupported by DataFusion
-
-        let schema = SchemaBuilder::new()
-            .field("foo", ArrowDataType::Int64)
-            .unwrap()
-            .timestamp()
-            .build()
-            .unwrap();
-
-        let summary = TableSummary {
-            columns: vec![
-                ColumnSummary {
-                    name: TIME_COLUMN_NAME.to_owned(),
-                    influxdb_type: InfluxDbType::Timestamp,
-                    stats: data_types::Statistics::I64(StatValues {
-                        min: Some(10),
-                        max: Some(20),
-                        null_count: Some(0),
-                        total_count: 1_000,
-                        distinct_count: None,
-                    }),
-                },
-                ColumnSummary {
-                    name: "foo".to_owned(),
-                    influxdb_type: InfluxDbType::Field,
-                    stats: data_types::Statistics::I64(StatValues {
-                        min: Some(10),
-                        max: Some(20),
-                        null_count: Some(0),
-                        total_count: 1_000,
-                        distinct_count: None,
-                    }),
-                },
-            ],
-        };
-        assert_eq!(
-            p.apply_to_table_summary(&props, &summary, schema.as_arrow()),
-            PredicateMatch::Zero,
-        );
-    }
-
-    #[test]
-    fn test_push_through_dedup() {
-        let schema = SchemaBuilder::default()
-            .tag("tag1")
-            .tag("tag2")
-            .field("field1", ArrowDataType::Float64)
-            .unwrap()
-            .field("field2", ArrowDataType::Float64)
-            .unwrap()
-            .timestamp()
-            .build()
-            .unwrap();
-
-        // no-op predicate
-        assert_eq!(
-            Predicate {
-                field_columns: None,
-                range: None,
-                exprs: vec![],
-                value_expr: vec![],
-            }
-            .push_through_dedup(&schema),
-            Predicate {
-                field_columns: None,
-                range: None,
-                exprs: vec![],
-                value_expr: vec![],
-            },
-        );
-
-        // simple case
-        assert_eq!(
-            Predicate {
-                field_columns: Some(BTreeSet::from([
-                    String::from("tag1"),
-                    String::from("field1"),
-                    String::from("time"),
-                ])),
-                range: Some(TimestampRange::new(42, 1337)),
-                exprs: vec![
-                    col("tag1").eq(lit("foo")),
-                    col("field1").eq(lit(1.0)), // filtered out
-                    col("time").eq(lit(1)),
-                ],
-                value_expr: vec![ValueExpr::try_from(col("_value").eq(lit(1.0))).unwrap()],
-            }
-            .push_through_dedup(&schema),
-            Predicate {
-                field_columns: None,
-                range: Some(TimestampRange::new(42, 1337)),
-                exprs: vec![col("tag1").eq(lit("foo")), col("time").eq(lit(1)),],
-                value_expr: vec![],
-            },
-        );
-
-        // disassemble AND
-        assert_eq!(
-            Predicate {
-                field_columns: None,
-                range: None,
-                exprs: vec![col("tag1")
-                    .eq(lit("foo"))
-                    .and(col("field1").eq(lit(1.0)))
-                    .and(col("time").eq(lit(1))),],
-                value_expr: vec![],
-            }
-            .push_through_dedup(&schema),
-            Predicate {
-                field_columns: None,
-                range: None,
-                exprs: vec![col("tag1").eq(lit("foo")), col("time").eq(lit(1)),],
-                value_expr: vec![],
-            },
-        );
-
-        // filter no-row operations
-        assert_eq!(
-            Predicate {
-                field_columns: None,
-                range: None,
-                exprs: vec![
-                    col("tag1").eq(lit("foo")),
-                    cube(vec![col("time").eq(lit(1))]),
-                ],
-                value_expr: vec![],
-            }
-            .push_through_dedup(&schema),
-            Predicate {
-                field_columns: None,
-                range: None,
-                exprs: vec![col("tag1").eq(lit("foo"))],
-                value_expr: vec![],
-            },
-        );
-
-        // do NOT disassemble OR
-        assert_eq!(
-            Predicate {
-                field_columns: None,
-                range: None,
-                exprs: vec![col("tag1")
-                    .eq(lit("foo"))
-                    .or(col("field1").eq(lit(1.0)))
-                    .or(col("time").eq(lit(1))),],
-                value_expr: vec![],
-            }
-            .push_through_dedup(&schema),
-            Predicate {
-                field_columns: None,
-                range: None,
-                exprs: vec![],
-                value_expr: vec![],
-            },
-        );
     }
 }

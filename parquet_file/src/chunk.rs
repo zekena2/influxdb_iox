@@ -6,8 +6,8 @@ use crate::{
     ParquetFilePath,
 };
 use data_types::{ParquetFile, TimestampMinMax};
-use schema::{Projection, Schema};
-use std::{collections::BTreeSet, mem, sync::Arc};
+use schema::Schema;
+use std::{mem, sync::Arc};
 use uuid::Uuid;
 
 /// A abstract representation of a Parquet file in object storage, with
@@ -60,30 +60,12 @@ impl ParquetChunk {
         &self.schema
     }
 
-    /// Return the columns names that belong to the given column selection
-    pub fn column_names(&self, selection: Projection<'_>) -> Option<BTreeSet<String>> {
-        let fields = self.schema.inner().fields().iter();
-
-        Some(match selection {
-            Projection::Some(cols) => fields
-                .filter_map(|x| {
-                    if cols.contains(&x.name().as_str()) {
-                        Some(x.name().clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect(),
-            Projection::All => fields.map(|x| x.name().clone()).collect(),
-        })
-    }
-
     /// Return stream of data read from parquet file
     /// Inputs for [`ParquetExec`].
     ///
     /// See [`ParquetExecInput`] for more information.
     ///
-    /// [`ParquetExec`]: datafusion::physical_plan::file_format::ParquetExec
+    /// [`ParquetExec`]: datafusion::datasource::physical_plan::ParquetExec
     pub fn parquet_exec_input(&self) -> ParquetExecInput {
         let path: ParquetFilePath = self.parquet_file.as_ref().into();
         self.store.parquet_exec_input(&path, self.file_size_bytes())

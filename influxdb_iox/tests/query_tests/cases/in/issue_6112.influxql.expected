@@ -265,25 +265,15 @@ name: cpu
 +------+-----+------------+
 +------+-----+------------+
 -- InfluxQL: SELECT cpu, usage_idle FROM cpu WHERE time = 1667181610000000000 OR time = 1667181600000000000 AND cpu = 'cpu0';
-name: cpu
-+---------------------+------+------------+
-| time                | cpu  | usage_idle |
-+---------------------+------+------------+
-| 2022-10-31T02:00:00 | cpu0 | 0.98       |
-| 2022-10-31T02:00:10 | cpu0 | 0.99       |
-+---------------------+------+------------+
++------+-----+------------+
+| time | cpu | usage_idle |
++------+-----+------------+
++------+-----+------------+
 -- InfluxQL: SELECT cpu, usage_idle FROM cpu WHERE time = 1667181610000000000 OR time = 1667181600000000000;
-name: cpu
-+---------------------+-----------+------------+
-| time                | cpu       | usage_idle |
-+---------------------+-----------+------------+
-| 2022-10-31T02:00:00 | cpu-total | 2.98       |
-| 2022-10-31T02:00:00 | cpu0      | 0.98       |
-| 2022-10-31T02:00:00 | cpu1      | 1.98       |
-| 2022-10-31T02:00:10 | cpu-total | 2.99       |
-| 2022-10-31T02:00:10 | cpu0      | 0.99       |
-| 2022-10-31T02:00:10 | cpu1      | 1.99       |
-+---------------------+-----------+------------+
++------+-----+------------+
+| time | cpu | usage_idle |
++------+-----+------------+
++------+-----+------------+
 -- InfluxQL: SELECT tag1, f64 FROM m0 WHERE tag1 != '';
 name: m0
 +---------------------+-------+------+
@@ -291,6 +281,37 @@ name: m0
 +---------------------+-------+------+
 | 2022-10-31T02:00:10 | val10 | 18.9 |
 +---------------------+-------+------+
+-- InfluxQL: SELECT tag1, f64 FROM m0 WHERE tag1 !~ /^$/;
+name: m0
++---------------------+-------+------+
+| time                | tag1  | f64  |
++---------------------+-------+------+
+| 2022-10-31T02:00:10 | val10 | 18.9 |
++---------------------+-------+------+
+-- InfluxQL: SELECT tag1, f64 FROM m0 WHERE tag1 = '';
+name: m0
++---------------------+------+------+
+| time                | tag1 | f64  |
++---------------------+------+------+
+| 2022-10-31T02:00:00 |      | 10.1 |
+| 2022-10-31T02:00:00 |      | 11.3 |
+| 2022-10-31T02:00:00 |      | 10.4 |
+| 2022-10-31T02:00:10 |      | 21.2 |
+| 2022-10-31T02:00:20 |      | 11.2 |
+| 2022-10-31T02:00:30 |      | 19.2 |
++---------------------+------+------+
+-- InfluxQL: SELECT tag1, f64 FROM m0 WHERE tag1 =~ /^$/;
+name: m0
++---------------------+------+------+
+| time                | tag1 | f64  |
++---------------------+------+------+
+| 2022-10-31T02:00:00 |      | 10.1 |
+| 2022-10-31T02:00:00 |      | 11.3 |
+| 2022-10-31T02:00:00 |      | 10.4 |
+| 2022-10-31T02:00:10 |      | 21.2 |
+| 2022-10-31T02:00:20 |      | 11.2 |
+| 2022-10-31T02:00:30 |      | 19.2 |
++---------------------+------+------+
 -- InfluxQL: SELECT tag0, f64 FROM m0 LIMIT 1;
 name: m0
 +---------------------+-------+------+
@@ -351,7 +372,7 @@ name: m0
 +---------------------+-----+-------+---------------------+--------------------+--------------------+--------------------+-------------------+-----------+----------------------+-----------+------------------+-------------------+--------------------+-------------------+-------+-------+-------+-------+
 | time                | i64 | abs   | sin                 | cos                | tan                | acos               | atan              | atan2     | exp                  | log       | ln               | log2              | log10              | sqrt              | pow   | floor | ceil  | round |
 +---------------------+-----+-------+---------------------+--------------------+--------------------+--------------------+-------------------+-----------+----------------------+-----------+------------------+-------------------+--------------------+-------------------+-------+-------+-------+-------+
-| 2022-10-31T02:00:00 | 101 | 101.0 | 0.45202578717835057 | 0.8920048697881602 | 0.5067526002248183 | 1.5707963267948966 | 1.560895660206908 | 1.5509969 | 7.307059979368067e43 | 2.2194037 | 4.61512051684126 | 6.658211482751795 | 2.0043213737826426 | 10.04987562112089 | 10201 | 101.0 | 101.0 | 101.0 |
+| 2022-10-31T02:00:00 | 101 | 101.0 | 0.45202578717835057 | 0.8920048697881602 | 0.5067526002248183 | 1.5608951749237256 | 1.560895660206908 | 1.5509969 | 7.307059979368067e43 | 2.2194037 | 4.61512051684126 | 6.658211482751795 | 2.0043213737826426 | 10.04987562112089 | 10201 | 101.0 | 101.0 | 101.0 |
 +---------------------+-----+-------+---------------------+--------------------+--------------------+--------------------+-------------------+-----------+----------------------+-----------+------------------+-------------------+--------------------+-------------------+-------+-------+-------+-------+
 -- InfluxQL: SELECT log(f64) FROM m0 LIMIT 1;
 Error while planning query: Error during planning: invalid number of arguments for log, expected 2, got 1
@@ -898,29 +919,30 @@ name: logical_plan
  plan
  Sort: iox::measurement ASC NULLS LAST, tag0 ASC NULLS LAST, time ASC NULLS LAST
    Union
-     Projection: Dictionary(Int32, Utf8("m0")) AS iox::measurement, TimestampNanosecond(0, None) AS time, m0.tag0 AS tag0, COUNT(m0.f64) AS count, SUM(m0.f64) AS sum, STDDEV(m0.f64) AS stddev
+     Projection: Dictionary(Int32, Utf8("m0")) AS iox::measurement, TimestampNanosecond(0, None) AS time, m0.tag0 AS tag0, coalesce_struct(COUNT(m0.f64), Int64(0)) AS count, SUM(m0.f64) AS sum, STDDEV(m0.f64) AS stddev
        Aggregate: groupBy=[[m0.tag0]], aggr=[[COUNT(m0.f64), SUM(m0.f64), STDDEV(m0.f64)]]
          TableScan: m0 projection=[f64, tag0]
-     Projection: Dictionary(Int32, Utf8("m1")) AS iox::measurement, TimestampNanosecond(0, None) AS time, m1.tag0 AS tag0, COUNT(m1.f64) AS count, SUM(m1.f64) AS sum, STDDEV(m1.f64) AS stddev
+     Projection: Dictionary(Int32, Utf8("m1")) AS iox::measurement, TimestampNanosecond(0, None) AS time, m1.tag0 AS tag0, coalesce_struct(COUNT(m1.f64), Int64(0)) AS count, SUM(m1.f64) AS sum, STDDEV(m1.f64) AS stddev
        Aggregate: groupBy=[[m1.tag0]], aggr=[[COUNT(m1.f64), SUM(m1.f64), STDDEV(m1.f64)]]
          TableScan: m1 projection=[f64, tag0]
 name: physical_plan
  plan
  SortPreservingMergeExec: [iox::measurement@0 ASC NULLS LAST,tag0@2 ASC NULLS LAST,time@1 ASC NULLS LAST]
-   SortExec: expr=[iox::measurement@0 ASC NULLS LAST,tag0@2 ASC NULLS LAST,time@1 ASC NULLS LAST]
-     InterleaveExec
-       ProjectionExec: expr=[m0 as iox::measurement, 0 as time, tag0@0 as tag0, COUNT(m0.f64)@1 as count, SUM(m0.f64)@2 as sum, STDDEV(m0.f64)@3 as stddev]
+   UnionExec
+     SortExec: expr=[iox::measurement@0 ASC NULLS LAST,tag0@2 ASC NULLS LAST,time@1 ASC NULLS LAST]
+       ProjectionExec: expr=[m0 as iox::measurement, 0 as time, tag0@0 as tag0, coalesce_struct(COUNT(m0.f64)@1, 0) as count, SUM(m0.f64)@2 as sum, STDDEV(m0.f64)@3 as stddev]
          AggregateExec: mode=FinalPartitioned, gby=[tag0@0 as tag0], aggr=[COUNT(m0.f64), SUM(m0.f64), STDDEV(m0.f64)]
            CoalesceBatchesExec: target_batch_size=8192
-             RepartitionExec: partitioning=Hash([Column { name: "tag0", index: 0 }], 4), input_partitions=4
+             RepartitionExec: partitioning=Hash([tag0@0], 4), input_partitions=4
                RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
                  AggregateExec: mode=Partial, gby=[tag0@1 as tag0], aggr=[COUNT(m0.f64), SUM(m0.f64), STDDEV(m0.f64)]
                    ParquetExec: file_groups={1 group: [[1/1/1/00000000-0000-0000-0000-000000000000.parquet]]}, projection=[f64, tag0]
-       ProjectionExec: expr=[m1 as iox::measurement, 0 as time, tag0@0 as tag0, COUNT(m1.f64)@1 as count, SUM(m1.f64)@2 as sum, STDDEV(m1.f64)@3 as stddev]
-         AggregateExec: mode=FinalPartitioned, gby=[tag0@0 as tag0], aggr=[COUNT(m1.f64), SUM(m1.f64), STDDEV(m1.f64)]
-           CoalesceBatchesExec: target_batch_size=8192
-             RepartitionExec: partitioning=Hash([Column { name: "tag0", index: 0 }], 4), input_partitions=4
-               RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+     SortExec: expr=[iox::measurement@0 ASC NULLS LAST,tag0@2 ASC NULLS LAST,time@1 ASC NULLS LAST]
+       ProjectionExec: expr=[m1 as iox::measurement, 0 as time, tag0@0 as tag0, coalesce_struct(COUNT(m1.f64)@1, 0) as count, SUM(m1.f64)@2 as sum, STDDEV(m1.f64)@3 as stddev]
+         RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=4
+           AggregateExec: mode=FinalPartitioned, gby=[tag0@0 as tag0], aggr=[COUNT(m1.f64), SUM(m1.f64), STDDEV(m1.f64)], ordering_mode=FullyOrdered
+             CoalesceBatchesExec: target_batch_size=8192
+               RepartitionExec: partitioning=Hash([tag0@0], 4), input_partitions=1
                  AggregateExec: mode=Partial, gby=[tag0@1 as tag0], aggr=[COUNT(m1.f64), SUM(m1.f64), STDDEV(m1.f64)], ordering_mode=FullyOrdered
                    ParquetExec: file_groups={1 group: [[1/1/1/00000000-0000-0000-0000-000000000001.parquet]]}, projection=[f64, tag0], output_ordering=[tag0@1 ASC]
 -- InfluxQL: SELECT COUNT(f64), SUM(f64), stddev(f64) FROM m0, m1 GROUP BY tag0;
@@ -1245,9 +1267,19 @@ name: cpu
 | time                | count |
 +---------------------+-------+
 | 2022-10-31T02:00:00 | 6     |
-| 2022-10-31T02:00:30 |       |
-| 2022-10-31T02:01:00 |       |
-| 2022-10-31T02:01:30 |       |
+| 2022-10-31T02:00:30 | 0     |
+| 2022-10-31T02:01:00 | 0     |
+| 2022-10-31T02:01:30 | 0     |
++---------------------+-------+
+-- InfluxQL: SELECT COUNT(usage_idle)+2 FROM cpu WHERE time >= '2022-10-31T02:00:00Z' AND time < '2022-10-31T02:02:00Z' GROUP BY TIME(30s);
+name: cpu
++---------------------+-------+
+| time                | count |
++---------------------+-------+
+| 2022-10-31T02:00:00 | 8     |
+| 2022-10-31T02:00:30 | 2     |
+| 2022-10-31T02:01:00 | 2     |
+| 2022-10-31T02:01:30 | 2     |
 +---------------------+-------+
 -- InfluxQL: SELECT COUNT(usage_idle), COUNT(bytes_free) FROM cpu, disk WHERE time >= '2022-10-31T02:00:00Z' AND time < '2022-10-31T02:02:00Z' GROUP BY TIME(30s);
 name: cpu
@@ -1255,18 +1287,37 @@ name: cpu
 | time                | count | count_1 |
 +---------------------+-------+---------+
 | 2022-10-31T02:00:00 | 6     |         |
-| 2022-10-31T02:00:30 |       |         |
-| 2022-10-31T02:01:00 |       |         |
-| 2022-10-31T02:01:30 |       |         |
+| 2022-10-31T02:00:30 | 0     |         |
+| 2022-10-31T02:01:00 | 0     |         |
+| 2022-10-31T02:01:30 | 0     |         |
 +---------------------+-------+---------+
 name: disk
 +---------------------+-------+---------+
 | time                | count | count_1 |
 +---------------------+-------+---------+
 | 2022-10-31T02:00:00 |       | 6       |
-| 2022-10-31T02:00:30 |       |         |
-| 2022-10-31T02:01:00 |       |         |
-| 2022-10-31T02:01:30 |       |         |
+| 2022-10-31T02:00:30 |       | 0       |
+| 2022-10-31T02:01:00 |       | 0       |
+| 2022-10-31T02:01:30 |       | 0       |
++---------------------+-------+---------+
+-- InfluxQL: SELECT COUNT(usage_idle)+1, COUNT(bytes_free)+2 FROM cpu, disk WHERE time >= '2022-10-31T02:00:00Z' AND time < '2022-10-31T02:02:00Z' GROUP BY TIME(30s);
+name: cpu
++---------------------+-------+---------+
+| time                | count | count_1 |
++---------------------+-------+---------+
+| 2022-10-31T02:00:00 | 7     |         |
+| 2022-10-31T02:00:30 | 1     |         |
+| 2022-10-31T02:01:00 | 1     |         |
+| 2022-10-31T02:01:30 | 1     |         |
++---------------------+-------+---------+
+name: disk
++---------------------+-------+---------+
+| time                | count | count_1 |
++---------------------+-------+---------+
+| 2022-10-31T02:00:00 |       | 8       |
+| 2022-10-31T02:00:30 |       | 2       |
+| 2022-10-31T02:01:00 |       | 2       |
+| 2022-10-31T02:01:30 |       | 2       |
 +---------------------+-------+---------+
 -- InfluxQL: SELECT COUNT(usage_idle) FROM cpu WHERE time >= '2022-10-31T02:00:00Z' AND time < '2022-10-31T02:02:00Z' GROUP BY TIME(30s) FILL(null);
 name: cpu
@@ -1274,9 +1325,9 @@ name: cpu
 | time                | count |
 +---------------------+-------+
 | 2022-10-31T02:00:00 | 6     |
-| 2022-10-31T02:00:30 |       |
-| 2022-10-31T02:01:00 |       |
-| 2022-10-31T02:01:30 |       |
+| 2022-10-31T02:00:30 | 0     |
+| 2022-10-31T02:01:00 | 0     |
+| 2022-10-31T02:01:30 | 0     |
 +---------------------+-------+
 -- InfluxQL: SELECT COUNT(usage_idle), COUNT(bytes_free) FROM cpu, disk WHERE time >= '2022-10-31T02:00:00Z' AND time < '2022-10-31T02:02:00Z' GROUP BY TIME(30s) FILL(null);
 name: cpu
@@ -1284,18 +1335,18 @@ name: cpu
 | time                | count | count_1 |
 +---------------------+-------+---------+
 | 2022-10-31T02:00:00 | 6     |         |
-| 2022-10-31T02:00:30 |       |         |
-| 2022-10-31T02:01:00 |       |         |
-| 2022-10-31T02:01:30 |       |         |
+| 2022-10-31T02:00:30 | 0     |         |
+| 2022-10-31T02:01:00 | 0     |         |
+| 2022-10-31T02:01:30 | 0     |         |
 +---------------------+-------+---------+
 name: disk
 +---------------------+-------+---------+
 | time                | count | count_1 |
 +---------------------+-------+---------+
 | 2022-10-31T02:00:00 |       | 6       |
-| 2022-10-31T02:00:30 |       |         |
-| 2022-10-31T02:01:00 |       |         |
-| 2022-10-31T02:01:30 |       |         |
+| 2022-10-31T02:00:30 |       | 0       |
+| 2022-10-31T02:01:00 |       | 0       |
+| 2022-10-31T02:01:30 |       | 0       |
 +---------------------+-------+---------+
 -- InfluxQL: SELECT COUNT(usage_idle) FROM cpu WHERE time >= '2022-10-31T02:00:00Z' AND time < '2022-10-31T02:02:00Z' GROUP BY TIME(30s) FILL(previous);
 name: cpu
@@ -1416,6 +1467,27 @@ name: disk
 | 2022-10-31T02:00:04 |      | 2236.0 |
 | 2022-10-31T02:00:06 |      | 2237.0 |
 +---------------------+------+--------+
+-- InfluxQL: SELECT MEAN(usage_idle) FROM cpu WHERE time >= '2022-10-31T02:00:04Z' AND time >= '2022-10-31T02:00:00Z' AND time <= '2022-10-31T02:00:10Z' GROUP BY TIME(2s) FILL(0);
+name: cpu
++---------------------+--------------------+
+| time                | mean               |
++---------------------+--------------------+
+| 2022-10-31T02:00:04 | 0.0                |
+| 2022-10-31T02:00:06 | 0.0                |
+| 2022-10-31T02:00:08 | 0.0                |
+| 2022-10-31T02:00:10 | 1.9900000000000002 |
++---------------------+--------------------+
+-- InfluxQL: SELECT MEAN(usage_idle) FROM cpu WHERE time >= '2022-10-31T02:00:00Z' AND time < '2022-10-31T02:00:10Z' AND time <= '2022-10-31T02:00:10Z' GROUP BY TIME(2s) FILL(0);
+name: cpu
++---------------------+--------------------+
+| time                | mean               |
++---------------------+--------------------+
+| 2022-10-31T02:00:00 | 1.9799999999999998 |
+| 2022-10-31T02:00:02 | 0.0                |
+| 2022-10-31T02:00:04 | 0.0                |
+| 2022-10-31T02:00:06 | 0.0                |
+| 2022-10-31T02:00:08 | 0.0                |
++---------------------+--------------------+
 -- InfluxQL: SELECT MEAN(usage_idle) FROM cpu WHERE time >= '2022-10-31T02:00:00Z' AND time < '2022-10-31T02:00:10Z' GROUP BY TIME(2s) FILL(linear);
 name: cpu
 +---------------------+--------------------+
@@ -1464,9 +1536,9 @@ tags: cpu=cpu-total
 | time                | count |
 +---------------------+-------+
 | 2022-10-31T02:00:00 | 2     |
-| 2022-10-31T02:00:30 |       |
-| 2022-10-31T02:01:00 |       |
-| 2022-10-31T02:01:30 |       |
+| 2022-10-31T02:00:30 | 0     |
+| 2022-10-31T02:01:00 | 0     |
+| 2022-10-31T02:01:30 | 0     |
 +---------------------+-------+
 name: cpu
 tags: cpu=cpu0
@@ -1474,9 +1546,9 @@ tags: cpu=cpu0
 | time                | count |
 +---------------------+-------+
 | 2022-10-31T02:00:00 | 2     |
-| 2022-10-31T02:00:30 |       |
-| 2022-10-31T02:01:00 |       |
-| 2022-10-31T02:01:30 |       |
+| 2022-10-31T02:00:30 | 0     |
+| 2022-10-31T02:01:00 | 0     |
+| 2022-10-31T02:01:30 | 0     |
 +---------------------+-------+
 name: cpu
 tags: cpu=cpu1
@@ -1484,9 +1556,9 @@ tags: cpu=cpu1
 | time                | count |
 +---------------------+-------+
 | 2022-10-31T02:00:00 | 2     |
-| 2022-10-31T02:00:30 |       |
-| 2022-10-31T02:01:00 |       |
-| 2022-10-31T02:01:30 |       |
+| 2022-10-31T02:00:30 | 0     |
+| 2022-10-31T02:01:00 | 0     |
+| 2022-10-31T02:01:30 | 0     |
 +---------------------+-------+
 -- InfluxQL: SELECT COUNT(usage_idle) FROM cpu WHERE time >= '2022-10-31T02:00:00Z' AND time < '2022-10-31T02:02:00Z' GROUP BY TIME(30s), cpu FILL(null);
 name: cpu
@@ -1495,9 +1567,9 @@ tags: cpu=cpu-total
 | time                | count |
 +---------------------+-------+
 | 2022-10-31T02:00:00 | 2     |
-| 2022-10-31T02:00:30 |       |
-| 2022-10-31T02:01:00 |       |
-| 2022-10-31T02:01:30 |       |
+| 2022-10-31T02:00:30 | 0     |
+| 2022-10-31T02:01:00 | 0     |
+| 2022-10-31T02:01:30 | 0     |
 +---------------------+-------+
 name: cpu
 tags: cpu=cpu0
@@ -1505,9 +1577,9 @@ tags: cpu=cpu0
 | time                | count |
 +---------------------+-------+
 | 2022-10-31T02:00:00 | 2     |
-| 2022-10-31T02:00:30 |       |
-| 2022-10-31T02:01:00 |       |
-| 2022-10-31T02:01:30 |       |
+| 2022-10-31T02:00:30 | 0     |
+| 2022-10-31T02:01:00 | 0     |
+| 2022-10-31T02:01:30 | 0     |
 +---------------------+-------+
 name: cpu
 tags: cpu=cpu1
@@ -1515,9 +1587,9 @@ tags: cpu=cpu1
 | time                | count |
 +---------------------+-------+
 | 2022-10-31T02:00:00 | 2     |
-| 2022-10-31T02:00:30 |       |
-| 2022-10-31T02:01:00 |       |
-| 2022-10-31T02:01:30 |       |
+| 2022-10-31T02:00:30 | 0     |
+| 2022-10-31T02:01:00 | 0     |
+| 2022-10-31T02:01:30 | 0     |
 +---------------------+-------+
 -- InfluxQL: SELECT COUNT(usage_idle), COUNT(bytes_free) FROM cpu, disk WHERE time >= '2022-10-31T02:00:00Z' AND time < '2022-10-31T02:02:00Z' GROUP BY TIME(30s), cpu, device FILL(null);
 name: cpu
@@ -1526,9 +1598,9 @@ tags: cpu=cpu-total, device=
 | time                | count | count_1 |
 +---------------------+-------+---------+
 | 2022-10-31T02:00:00 | 2     |         |
-| 2022-10-31T02:00:30 |       |         |
-| 2022-10-31T02:01:00 |       |         |
-| 2022-10-31T02:01:30 |       |         |
+| 2022-10-31T02:00:30 | 0     |         |
+| 2022-10-31T02:01:00 | 0     |         |
+| 2022-10-31T02:01:30 | 0     |         |
 +---------------------+-------+---------+
 name: cpu
 tags: cpu=cpu0, device=
@@ -1536,9 +1608,9 @@ tags: cpu=cpu0, device=
 | time                | count | count_1 |
 +---------------------+-------+---------+
 | 2022-10-31T02:00:00 | 2     |         |
-| 2022-10-31T02:00:30 |       |         |
-| 2022-10-31T02:01:00 |       |         |
-| 2022-10-31T02:01:30 |       |         |
+| 2022-10-31T02:00:30 | 0     |         |
+| 2022-10-31T02:01:00 | 0     |         |
+| 2022-10-31T02:01:30 | 0     |         |
 +---------------------+-------+---------+
 name: cpu
 tags: cpu=cpu1, device=
@@ -1546,9 +1618,9 @@ tags: cpu=cpu1, device=
 | time                | count | count_1 |
 +---------------------+-------+---------+
 | 2022-10-31T02:00:00 | 2     |         |
-| 2022-10-31T02:00:30 |       |         |
-| 2022-10-31T02:01:00 |       |         |
-| 2022-10-31T02:01:30 |       |         |
+| 2022-10-31T02:00:30 | 0     |         |
+| 2022-10-31T02:01:00 | 0     |         |
+| 2022-10-31T02:01:30 | 0     |         |
 +---------------------+-------+---------+
 name: disk
 tags: cpu=, device=disk1s1
@@ -1556,9 +1628,9 @@ tags: cpu=, device=disk1s1
 | time                | count | count_1 |
 +---------------------+-------+---------+
 | 2022-10-31T02:00:00 |       | 2       |
-| 2022-10-31T02:00:30 |       |         |
-| 2022-10-31T02:01:00 |       |         |
-| 2022-10-31T02:01:30 |       |         |
+| 2022-10-31T02:00:30 |       | 0       |
+| 2022-10-31T02:01:00 |       | 0       |
+| 2022-10-31T02:01:30 |       | 0       |
 +---------------------+-------+---------+
 name: disk
 tags: cpu=, device=disk1s2
@@ -1566,9 +1638,9 @@ tags: cpu=, device=disk1s2
 | time                | count | count_1 |
 +---------------------+-------+---------+
 | 2022-10-31T02:00:00 |       | 2       |
-| 2022-10-31T02:00:30 |       |         |
-| 2022-10-31T02:01:00 |       |         |
-| 2022-10-31T02:01:30 |       |         |
+| 2022-10-31T02:00:30 |       | 0       |
+| 2022-10-31T02:01:00 |       | 0       |
+| 2022-10-31T02:01:30 |       | 0       |
 +---------------------+-------+---------+
 name: disk
 tags: cpu=, device=disk1s5
@@ -1576,9 +1648,9 @@ tags: cpu=, device=disk1s5
 | time                | count | count_1 |
 +---------------------+-------+---------+
 | 2022-10-31T02:00:00 |       | 2       |
-| 2022-10-31T02:00:30 |       |         |
-| 2022-10-31T02:01:00 |       |         |
-| 2022-10-31T02:01:30 |       |         |
+| 2022-10-31T02:00:30 |       | 0       |
+| 2022-10-31T02:01:00 |       | 0       |
+| 2022-10-31T02:01:30 |       | 0       |
 +---------------------+-------+---------+
 -- InfluxQL: SELECT COUNT(usage_idle) FROM cpu WHERE time >= '2022-10-31T02:00:00Z' AND time < '2022-10-31T02:02:00Z' GROUP BY TIME(30s), cpu FILL(previous);
 name: cpu
@@ -2159,15 +2231,15 @@ name: cpu
 | time                | count |
 +---------------------+-------+
 | 2022-10-31T02:00:00 | 6     |
-| 2022-10-31T02:00:30 |       |
+| 2022-10-31T02:00:30 | 0     |
 +---------------------+-------+
 -- InfluxQL: SELECT COUNT(usage_idle) FROM cpu WHERE time >= '2022-10-31T02:00:00Z' AND time < '2022-10-31T02:05:00Z' GROUP BY TIME(30s) LIMIT 2 OFFSET 2;
 name: cpu
 +---------------------+-------+
 | time                | count |
 +---------------------+-------+
-| 2022-10-31T02:01:00 |       |
-| 2022-10-31T02:01:30 |       |
+| 2022-10-31T02:01:00 | 0     |
+| 2022-10-31T02:01:30 | 0     |
 +---------------------+-------+
 -- InfluxQL: SELECT COUNT(usage_idle) FROM cpu WHERE time >= '2022-10-31T02:00:00Z' AND time < '2022-10-31T02:05:00Z' GROUP BY TIME(30s), cpu LIMIT 2;
 name: cpu
@@ -2176,7 +2248,7 @@ tags: cpu=cpu-total
 | time                | count |
 +---------------------+-------+
 | 2022-10-31T02:00:00 | 2     |
-| 2022-10-31T02:00:30 |       |
+| 2022-10-31T02:00:30 | 0     |
 +---------------------+-------+
 name: cpu
 tags: cpu=cpu0
@@ -2184,7 +2256,7 @@ tags: cpu=cpu0
 | time                | count |
 +---------------------+-------+
 | 2022-10-31T02:00:00 | 2     |
-| 2022-10-31T02:00:30 |       |
+| 2022-10-31T02:00:30 | 0     |
 +---------------------+-------+
 name: cpu
 tags: cpu=cpu1
@@ -2192,7 +2264,7 @@ tags: cpu=cpu1
 | time                | count |
 +---------------------+-------+
 | 2022-10-31T02:00:00 | 2     |
-| 2022-10-31T02:00:30 |       |
+| 2022-10-31T02:00:30 | 0     |
 +---------------------+-------+
 -- InfluxQL: SELECT COUNT(usage_idle), COUNT(bytes_free) FROM cpu, disk WHERE time >= '2022-10-31T02:00:00Z' AND time < '2022-10-31T02:02:00Z' GROUP BY TIME(30s) LIMIT 1;
 name: cpu
@@ -2225,13 +2297,13 @@ name: cpu
 +---------------------+-------+---------+
 | time                | count | count_1 |
 +---------------------+-------+---------+
-| 2022-10-31T02:01:30 |       |         |
+| 2022-10-31T02:01:30 | 0     |         |
 +---------------------+-------+---------+
 name: disk
 +---------------------+-------+---------+
 | time                | count | count_1 |
 +---------------------+-------+---------+
-| 2022-10-31T02:01:30 |       |         |
+| 2022-10-31T02:01:30 |       | 0       |
 +---------------------+-------+---------+
 -- InfluxQL: SELECT COUNT(usage_idle), COUNT(bytes_free) FROM cpu, disk WHERE time >= '2022-10-31T02:00:00Z' AND time < '2022-10-31T02:02:00Z' GROUP BY TIME(30s), cpu, device LIMIT 1;
 name: cpu
@@ -2462,7 +2534,33 @@ tags: cpu=cpu1
 | 2022-10-31T02:01:30 | 0.0   |
 +---------------------+-------+
 -- InfluxQL: SELECT FIRST(usage_idle), usage_user, usage_system FROM cpu;
-Error while planning query: This feature is not implemented: projections with a single selector and fields: See https://github.com/influxdata/influxdb_iox/issues/7533
+name: cpu
++---------------------+-------+------------+--------------+
+| time                | first | usage_user | usage_system |
++---------------------+-------+------------+--------------+
+| 2022-10-31T02:00:00 | 2.98  |            | 2.2          |
++---------------------+-------+------------+--------------+
+-- InfluxQL: SELECT field1, FIRST(field2), field3 FROM selector_test_1 WHERE time >=0 AND time < 10 GROUP BY TIME(30s);
+name: selector_test_1
++---------------------+--------+-------+--------+
+| time                | field1 | first | field3 |
++---------------------+--------+-------+--------+
+| 1970-01-01T00:00:00 |        | 2.0   |        |
++---------------------+--------+-------+--------+
+-- InfluxQL: SELECT field1, FIRST(field2), field3 FROM selector_test_1 WHERE time >=0 AND time < 10 GROUP BY TIME(30s) FILL(0);
+name: selector_test_1
++---------------------+--------+-------+--------+
+| time                | field1 | first | field3 |
++---------------------+--------+-------+--------+
+| 1970-01-01T00:00:00 | 0.0    | 2.0   | 0.0    |
++---------------------+--------+-------+--------+
+-- InfluxQL: SELECT FIRST(f), first FROM selector_test_2 WHERE time >=0 AND time < 10 GROUP BY TIME(30s);
+name: selector_test_2
++---------------------+-------+---------+
+| time                | first | first_1 |
++---------------------+-------+---------+
+| 1970-01-01T00:00:00 | 1.0   | a       |
++---------------------+-------+---------+
 -- InfluxQL: SELECT COUNT(DISTINCT str) FROM m0;
 name: m0
 +---------------------+-------+
@@ -2887,12 +2985,49 @@ name: cpu
 | 1970-01-01T00:00:00 | cpu0      |
 | 1970-01-01T00:00:00 | cpu1      |
 +---------------------+-----------+
+-- InfluxQL: SELECT LAST(usage_idle) FROM cpu, cpu GROUP BY cpu;
+name: cpu
+tags: cpu=cpu-total
++---------------------+------+
+| time                | last |
++---------------------+------+
+| 2022-10-31T02:00:10 | 2.99 |
++---------------------+------+
+name: cpu
+tags: cpu=cpu0
++---------------------+------+
+| time                | last |
++---------------------+------+
+| 2022-10-31T02:00:10 | 0.99 |
++---------------------+------+
+name: cpu
+tags: cpu=cpu1
++---------------------+------+
+| time                | last |
++---------------------+------+
+| 2022-10-31T02:00:10 | 1.99 |
++---------------------+------+
+-- InfluxQL: SELECT last(usage_idle), last(usage_system) FROM (SELECT usage_idle FROM cpu WHERE cpu = 'cpu-total'), (SELECT usage_system FROM cpu WHERE cpu = 'cpu-total');
+name: cpu
++---------------------+------+--------+
+| time                | last | last_1 |
++---------------------+------+--------+
+| 1970-01-01T00:00:00 | 2.99 | 2.1    |
++---------------------+------+--------+
 -- InfluxQL: SELECT last(usage_idle), last(usage_system) FROM (SELECT usage_idle, usage_system FROM cpu WHERE cpu = 'cpu-total');
 name: cpu
 +---------------------+------+--------+
 | time                | last | last_1 |
 +---------------------+------+--------+
 | 1970-01-01T00:00:00 | 2.99 | 2.1    |
++---------------------+------+--------+
+-- InfluxQL: SELECT last(sum_idle), last(sum_system) FROM (SELECT sum(usage_idle) AS sum_idle FROM cpu WHERE cpu = 'cpu-total' GROUP BY time(10s)), (SELECT sum(usage_system) AS sum_system FROM cpu WHERE cpu = 'cpu-total' GROUP BY time(10s)) GROUP BY time(10s) FILL(none);
+name: cpu
++---------------------+------+--------+
+| time                | last | last_1 |
++---------------------+------+--------+
+| 2022-10-31T02:00:00 | 2.98 | 2.2    |
+| 2022-10-31T02:00:10 | 2.99 | 2.1    |
 +---------------------+------+--------+
 -- InfluxQL: SELECT last(sum_idle), last(sum_system) FROM (SELECT sum(usage_idle) AS sum_idle, sum(usage_system) AS sum_system FROM cpu WHERE cpu = 'cpu-total' GROUP BY time(10s)) GROUP BY time(10s) FILL(none);
 name: cpu
@@ -2902,3 +3037,91 @@ name: cpu
 | 2022-10-31T02:00:00 | 2.98 | 2.2    |
 | 2022-10-31T02:00:10 | 2.99 | 2.1    |
 +---------------------+------+--------+
+-- InfluxQL: SELECT COUNT(usage_idle) FROM (SELECT cpu, usage_idle FROM cpu WHERE time >= '2022-10-31T02:00:00Z' AND time <= '2022-10-31T02:00:30Z') WHERE time >= '2022-10-31T02:00:10Z' AND time <= '2022-10-31T02:00:20Z' GROUP BY time(5s), cpu FILL(0);
+name: cpu
+tags: cpu=cpu-total
++---------------------+-------+
+| time                | count |
++---------------------+-------+
+| 2022-10-31T02:00:10 | 1     |
+| 2022-10-31T02:00:15 | 0     |
+| 2022-10-31T02:00:20 | 0     |
++---------------------+-------+
+name: cpu
+tags: cpu=cpu0
++---------------------+-------+
+| time                | count |
++---------------------+-------+
+| 2022-10-31T02:00:10 | 1     |
+| 2022-10-31T02:00:15 | 0     |
+| 2022-10-31T02:00:20 | 0     |
++---------------------+-------+
+name: cpu
+tags: cpu=cpu1
++---------------------+-------+
+| time                | count |
++---------------------+-------+
+| 2022-10-31T02:00:10 | 1     |
+| 2022-10-31T02:00:15 | 0     |
+| 2022-10-31T02:00:20 | 0     |
++---------------------+-------+
+-- InfluxQL: SELECT COUNT(usage_idle) FROM cpu WHERE time >= '2022-10-31T02:00:00Z' AND time <= '2022-10-31T02:00:05Z' AND time <= '2022-10-31T02:00:10Z' GROUP BY TIME(10s) FILL(0);
+name: cpu
++---------------------+-------+
+| time                | count |
++---------------------+-------+
+| 2022-10-31T02:00:00 | 3     |
++---------------------+-------+
+-- InfluxQL: SELECT min, max, max - min FROM (SELECT MIN(usage_idle), MAX(usage_system) FROM cpu GROUP BY TIME(1m));
+name: cpu
++---------------------+------+-----+--------------------+
+| time                | min  | max | max_min            |
++---------------------+------+-----+--------------------+
+| 2022-10-31T02:00:00 | 0.98 | 2.2 | 1.2200000000000002 |
++---------------------+------+-----+--------------------+
+-- InfluxQL: SELECT min, max, max - min FROM (SELECT MIN(usage_idle), MAX(usage_system) FROM cpu GROUP BY TIME(10s));
+name: cpu
++---------------------+------+-----+--------------------+
+| time                | min  | max | max_min            |
++---------------------+------+-----+--------------------+
+| 2022-10-31T02:00:00 | 0.98 | 2.2 | 1.2200000000000002 |
+| 2022-10-31T02:00:10 | 0.99 | 2.1 | 1.11               |
++---------------------+------+-----+--------------------+
+-- InfluxQL: SELECT * FROM (SELECT * FROM (SELECT FIRST(usage_idle) FROM cpu WHERE time >= '2022-10-31T02:00:00Z') WHERE time >= '2022-10-31T02:00:00Z') WHERE time >= '2022-10-31T02:00:10Z';
+name: cpu
++---------------------+-------+
+| time                | first |
++---------------------+-------+
+| 2022-10-31T02:00:10 | 2.99  |
++---------------------+-------+
+-- InfluxQL: SELECT bytes_free / bytes_used AS result FROM disk;
+name: disk
++---------------------+-----------------------+
+| time                | result                |
++---------------------+-----------------------+
+| 2022-10-31T02:00:00 | 0.005613224283335911  |
+| 2022-10-31T02:00:00 | 0.006984786047936768  |
+| 2022-10-31T02:00:00 | 0.007702971146013462  |
+| 2022-10-31T02:00:10 | 0.005636096491427584  |
+| 2022-10-31T02:00:10 | 0.007000528400759146  |
+| 2022-10-31T02:00:10 | 0.0077149723818756505 |
++---------------------+-----------------------+
+-- InfluxQL: SELECT SUM(bytes_free) / SUM(bytes_used) AS result FROM disk WHERE time >= '2022-10-31T02:00:00Z' AND time <= '2022-10-31T02:00:10Z' GROUP BY time(5s) FILL(null);
+name: disk
++---------------------+----------------------+
+| time                | result               |
++---------------------+----------------------+
+| 2022-10-31T02:00:00 | 0.006984786047936768 |
+| 2022-10-31T02:00:05 | 0.0                  |
+| 2022-10-31T02:00:10 | 0.007000528400759146 |
++---------------------+----------------------+
+-- InfluxQL: SELECT count(host) FROM (SELECT usage_idle AS host FROM cpu), (SELECT host, usage_idle FROM cpu);
+Error while planning query: This feature is not implemented: cannot mix tag and field columns with the same name: host
+-- InfluxQL: SELECT last(host) AS host, first(usage_idle) AS usage_idle FROM cpu GROUP BY host;
+name: cpu
+tags: host=
++---------------------+------+------------+
+| time                | host | usage_idle |
++---------------------+------+------------+
+| 1970-01-01T00:00:00 |      | 2.98       |
++---------------------+------+------------+

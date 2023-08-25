@@ -96,12 +96,18 @@ pub struct FlightClientImpl {
     /// for a very short period of time, and any actual connection (and
     /// waiting) is done in CachedConnection
     connections: parking_lot::Mutex<HashMap<String, CachedConnection>>,
+
+    /// Name of the http header that will contain the tracing context value.
+    trace_context_header_name: String,
 }
 
 impl FlightClientImpl {
     /// Create new client.
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(trace_context_header_name: &str) -> Self {
+        Self {
+            trace_context_header_name: trace_context_header_name.to_string(),
+            ..Default::default()
+        }
     }
 
     /// Establish connection to given addr and perform handshake.
@@ -166,7 +172,7 @@ impl IngesterFlightClient for FlightClientImpl {
         if let Some(span) = span_recorder_comm.span() {
             client
                 .add_header(
-                    trace_exporters::DEFAULT_JAEGER_TRACE_CONTEXT_HEADER_NAME,
+                    &self.trace_context_header_name,
                     &format_jaeger_trace_context(&span.ctx),
                 )
                 // wrap in client error type
@@ -311,11 +317,43 @@ where
         let res = self.inner.next_message().await;
 
         match &res {
-            Ok(_) => span_recorder.ok("ok"),
+            Ok(res) => {
+                span_recorder.ok("ok");
+                self.record_metadata(&mut span_recorder, res.as_ref())
+            }
             Err(e) => span_recorder.error(e.to_string()),
         }
 
         res
+    }
+}
+
+impl<T> QueryDataTracer<T>
+where
+    T: QueryData,
+{
+    /// Record additional metadata on the
+    fn record_metadata(
+        &self,
+        span_recorder: &mut SpanRecorder,
+        res: Option<&(DecodedPayload, proto::IngesterQueryResponseMetadata)>,
+    ) {
+        let Some((payload, _metadata)) = res else {
+            return;
+        };
+        match payload {
+            DecodedPayload::None => {
+                span_recorder.set_metadata("payload_type", "none");
+            }
+            DecodedPayload::Schema(_) => {
+                span_recorder.set_metadata("payload_type", "schema");
+            }
+            DecodedPayload::RecordBatch(batch) => {
+                span_recorder.set_metadata("payload_type", "batch");
+                span_recorder.set_metadata("num_rows", batch.num_rows() as i64);
+                span_recorder.set_metadata("mem_bytes", batch.get_array_memory_size() as i64);
+            }
+        }
     }
 }
 

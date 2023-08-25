@@ -5,17 +5,11 @@ pub mod client;
 pub mod lazy_connector;
 mod upstream_snapshot;
 
-use crate::dml_handlers::rpc_write::client::WriteClient;
+use std::fmt::Debug;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+use std::time::Duration;
 
-use self::{
-    balancer::Balancer,
-    circuit_breaker::CircuitBreaker,
-    circuit_breaking_client::{CircuitBreakerState, CircuitBreakingClient},
-    client::RpcWriteClientError,
-    upstream_snapshot::UpstreamSnapshot,
-};
-
-use super::{DmlHandler, Partitioned};
 use async_trait::async_trait;
 use data_types::{NamespaceName, NamespaceSchema, TableId};
 use dml::{DmlMeta, DmlWrite};
@@ -25,9 +19,18 @@ use hashbrown::HashMap;
 use mutable_batch::MutableBatch;
 use mutable_batch_pb::encode::encode_write;
 use observability_deps::tracing::*;
-use std::{fmt::Debug, num::NonZeroUsize, sync::Arc, time::Duration};
 use thiserror::Error;
 use trace::ctx::SpanContext;
+
+use self::{
+    balancer::Balancer,
+    circuit_breaker::CircuitBreaker,
+    circuit_breaking_client::{CircuitBreakerState, CircuitBreakingClient},
+    client::RpcWriteClientError,
+    upstream_snapshot::UpstreamSnapshot,
+};
+use super::{DmlHandler, Partitioned};
+use crate::dml_handlers::rpc_write::client::WriteClient;
 
 /// The bound on RPC request duration.
 ///
@@ -113,7 +116,9 @@ pub struct RpcWrite<T, C = CircuitBreaker> {
 
 impl<T> RpcWrite<T> {
     /// Initialise a new [`RpcWrite`] that sends requests to an arbitrary
-    /// downstream Ingester, using a round-robin strategy.
+    /// downstream Ingester, using a round-robin strategy. Health checks are
+    /// configured by `error_window` and `num_probes` as laid out by the
+    /// documentation for [`CircuitBreaker`].
     ///
     /// If [`Some`], `replica_copies` specifies the number of additional
     /// upstream ingesters that must receive and acknowledge the write for it to
@@ -125,8 +130,9 @@ impl<T> RpcWrite<T> {
     /// needed than the number of `endpoints`; doing so will cause a panic.
     pub fn new<N>(
         endpoints: impl IntoIterator<Item = (T, N)>,
-        replica_copies: Option<NonZeroUsize>,
+        n_copies: NonZeroUsize,
         metrics: &metric::Registry,
+        num_probes: u64,
     ) -> Self
     where
         T: Send + Sync + Debug + 'static,
@@ -135,13 +141,13 @@ impl<T> RpcWrite<T> {
         let endpoints = Balancer::new(
             endpoints
                 .into_iter()
-                .map(|(client, name)| CircuitBreakingClient::new(client, name.into())),
+                .map(|(client, name)| CircuitBreakingClient::new(client, name.into(), num_probes)),
             Some(metrics),
         );
 
-        // Map the "replication factor" into the total number of distinct data
-        // copies necessary to consider a write a success.
-        let n_copies = replica_copies.map(NonZeroUsize::get).unwrap_or(1);
+        // Read the total number of distinct data copies necessary to consider a
+        // write a success.
+        let n_copies = n_copies.get();
 
         debug!(n_copies, "write replication factor");
 
@@ -193,7 +199,9 @@ where
             namespace_id,
             writes,
             partition_key.clone(),
-            DmlMeta::unsequenced(span_ctx.clone()),
+            // The downstream ingester does not receive the [`DmlMeta`] type,
+            // so the span context must be passed in the request.
+            DmlMeta::unsequenced(None),
         );
 
         // Serialise this write into the wire format.
@@ -223,7 +231,8 @@ where
                 // invariant.
                 let mut snap = snap.clone();
                 let req = req.clone();
-                async move { write_loop(&mut snap, &req).await }
+                let span_ctx = span_ctx.clone();
+                async move { write_loop(&mut snap, &req, span_ctx).await }
             })
             .collect::<FuturesUnordered<_>>()
             .enumerate();
@@ -286,6 +295,7 @@ where
 async fn write_loop<T>(
     endpoints: &mut UpstreamSnapshot<T>,
     req: &WriteRequest,
+    span_ctx: Option<SpanContext>,
 ) -> Result<(), RpcWriteError>
 where
     T: WriteClient,
@@ -308,7 +318,7 @@ where
                 .next()
                 .expect("not enough replicas in snapshot to satisfy replication factor");
 
-            match client.write(req.clone()).await {
+            match client.write(req.clone(), span_ctx.clone()).await {
                 Ok(()) => {
                     endpoints.remove(client);
                     return Ok(());
@@ -376,6 +386,7 @@ mod tests {
 
     const NAMESPACE_NAME: &str = "bananas";
     const NAMESPACE_ID: NamespaceId = NamespaceId::new(42);
+    const ARBITRARY_TEST_NUM_PROBES: u64 = 10;
 
     // Start a new `NamespaceSchema` with only the given ID; the rest of the fields are arbitrary.
     fn new_empty_namespace_schema() -> Arc<NamespaceSchema> {
@@ -385,7 +396,7 @@ mod tests {
             max_columns_per_table: 500,
             max_tables: 200,
             retention_period_ns: None,
-            partition_template: None,
+            partition_template: Default::default(),
         })
     }
 
@@ -451,8 +462,9 @@ mod tests {
         let client = Arc::new(MockWriteClient::default());
         let handler = RpcWrite::new(
             [(Arc::clone(&client), "mock client")],
-            None,
+            1.try_into().unwrap(),
             &metric::Registry::default(),
+            ARBITRARY_TEST_NUM_PROBES,
         );
 
         // Drive the RPC writer
@@ -513,8 +525,9 @@ mod tests {
                 (Arc::clone(&client2), "client2"),
                 (Arc::clone(&client3), "client3"),
             ],
-            None,
+            1.try_into().unwrap(),
             &metric::Registry::default(),
+            ARBITRARY_TEST_NUM_PROBES,
         );
 
         // Drive the RPC writer
@@ -581,8 +594,9 @@ mod tests {
                 (Arc::clone(&client1), "client1"),
                 (Arc::clone(&client2), "client2"),
             ],
-            None,
+            1.try_into().unwrap(),
             &metric::Registry::default(),
+            ARBITRARY_TEST_NUM_PROBES,
         );
 
         // Drive the RPC writer
@@ -633,7 +647,10 @@ mod tests {
         circuit_1.set_healthy(false);
 
         let got = make_request(
-            [CircuitBreakingClient::new(client_1, "client_1").with_circuit_breaker(circuit_1)],
+            [
+                CircuitBreakingClient::new(client_1, "client_1", ARBITRARY_TEST_NUM_PROBES)
+                    .with_circuit_breaker(circuit_1),
+            ],
             1,
         )
         .await;
@@ -654,7 +671,10 @@ mod tests {
         circuit_1.set_healthy(true);
 
         let got = make_request(
-            [CircuitBreakingClient::new(client_1, "client_1").with_circuit_breaker(circuit_1)],
+            [
+                CircuitBreakingClient::new(client_1, "client_1", ARBITRARY_TEST_NUM_PROBES)
+                    .with_circuit_breaker(circuit_1),
+            ],
             1,
         )
         .await;
@@ -675,7 +695,10 @@ mod tests {
         circuit_1.set_healthy(true);
 
         let got = make_request(
-            [CircuitBreakingClient::new(client_1, "client_1").with_circuit_breaker(circuit_1)],
+            [
+                CircuitBreakingClient::new(client_1, "client_1", ARBITRARY_TEST_NUM_PROBES)
+                    .with_circuit_breaker(circuit_1),
+            ],
             1,
         )
         .await;
@@ -707,8 +730,10 @@ mod tests {
 
         let got = make_request(
             [
-                CircuitBreakingClient::new(client_1, "client_1").with_circuit_breaker(circuit_1),
-                CircuitBreakingClient::new(client_2, "client_2").with_circuit_breaker(circuit_2),
+                CircuitBreakingClient::new(client_1, "client_1", ARBITRARY_TEST_NUM_PROBES)
+                    .with_circuit_breaker(circuit_1),
+                CircuitBreakingClient::new(client_2, "client_2", ARBITRARY_TEST_NUM_PROBES)
+                    .with_circuit_breaker(circuit_2),
             ],
             2, // 2 copies required
         )
@@ -731,10 +756,18 @@ mod tests {
 
         let got = make_request(
             [
-                CircuitBreakingClient::new(Arc::clone(&client_1), "client_1")
-                    .with_circuit_breaker(circuit_1),
-                CircuitBreakingClient::new(Arc::clone(&client_2), "client_2")
-                    .with_circuit_breaker(circuit_2),
+                CircuitBreakingClient::new(
+                    Arc::clone(&client_1),
+                    "client_1",
+                    ARBITRARY_TEST_NUM_PROBES,
+                )
+                .with_circuit_breaker(circuit_1),
+                CircuitBreakingClient::new(
+                    Arc::clone(&client_2),
+                    "client_2",
+                    ARBITRARY_TEST_NUM_PROBES,
+                )
+                .with_circuit_breaker(circuit_2),
             ],
             2, // 2 copies required
         )
@@ -767,10 +800,18 @@ mod tests {
         circuit_2.set_healthy(true);
 
         let mut clients = vec![
-            CircuitBreakingClient::new(Arc::clone(&client_1), "client_1")
-                .with_circuit_breaker(circuit_1),
-            CircuitBreakingClient::new(Arc::clone(&client_2), "client_2")
-                .with_circuit_breaker(circuit_2),
+            CircuitBreakingClient::new(
+                Arc::clone(&client_1),
+                "client_1",
+                ARBITRARY_TEST_NUM_PROBES,
+            )
+            .with_circuit_breaker(circuit_1),
+            CircuitBreakingClient::new(
+                Arc::clone(&client_2),
+                "client_2",
+                ARBITRARY_TEST_NUM_PROBES,
+            )
+            .with_circuit_breaker(circuit_2),
         ];
 
         // The order should never affect the outcome.
@@ -813,10 +854,18 @@ mod tests {
 
         let got = make_request(
             [
-                CircuitBreakingClient::new(Arc::clone(&client_1), "client_1")
-                    .with_circuit_breaker(circuit_1),
-                CircuitBreakingClient::new(Arc::clone(&client_2), "client_2")
-                    .with_circuit_breaker(circuit_2),
+                CircuitBreakingClient::new(
+                    Arc::clone(&client_1),
+                    "client_1",
+                    ARBITRARY_TEST_NUM_PROBES,
+                )
+                .with_circuit_breaker(circuit_1),
+                CircuitBreakingClient::new(
+                    Arc::clone(&client_2),
+                    "client_2",
+                    ARBITRARY_TEST_NUM_PROBES,
+                )
+                .with_circuit_breaker(circuit_2),
             ],
             2, // 2 copies required
         )
@@ -869,12 +918,24 @@ mod tests {
         circuit_3.set_healthy(true);
 
         let mut clients = vec![
-            CircuitBreakingClient::new(Arc::clone(&client_1), "client_1")
-                .with_circuit_breaker(circuit_1),
-            CircuitBreakingClient::new(Arc::clone(&client_2), "client_2")
-                .with_circuit_breaker(circuit_2),
-            CircuitBreakingClient::new(Arc::clone(&client_3), "client_3")
-                .with_circuit_breaker(circuit_3),
+            CircuitBreakingClient::new(
+                Arc::clone(&client_1),
+                "client_1",
+                ARBITRARY_TEST_NUM_PROBES,
+            )
+            .with_circuit_breaker(circuit_1),
+            CircuitBreakingClient::new(
+                Arc::clone(&client_2),
+                "client_2",
+                ARBITRARY_TEST_NUM_PROBES,
+            )
+            .with_circuit_breaker(circuit_2),
+            CircuitBreakingClient::new(
+                Arc::clone(&client_3),
+                "client_3",
+                ARBITRARY_TEST_NUM_PROBES,
+            )
+            .with_circuit_breaker(circuit_3),
         ];
 
         // The order should never affect the outcome.
@@ -976,8 +1037,12 @@ mod tests {
                 async move {
                     let endpoints = upstreams.into_iter()
                         .map(|(circuit, client)| {
-                            CircuitBreakingClient::new(client, "bananas")
-                                .with_circuit_breaker(circuit)
+                            CircuitBreakingClient::new(
+                                client,
+                                "bananas",
+                                ARBITRARY_TEST_NUM_PROBES,
+                            )
+                            .with_circuit_breaker(circuit)
                         });
 
                     make_request(endpoints, n_copies).await

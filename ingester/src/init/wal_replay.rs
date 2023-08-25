@@ -1,5 +1,4 @@
 use data_types::{NamespaceId, PartitionKey, SequenceNumber, TableId};
-use dml::{DmlMeta, DmlOperation, DmlWrite};
 use generated_types::influxdata::iox::wal::v1::sequenced_wal_op::Op;
 use metric::U64Counter;
 use mutable_batch_pb::decode::decode_database_batch;
@@ -9,6 +8,8 @@ use thiserror::Error;
 use wal::{SequencedWalOp, Wal};
 
 use crate::{
+    dml_payload::write::{PartitionedData, TableData, WriteOperation},
+    dml_payload::IngestOp,
     dml_sink::{DmlError, DmlSink},
     partition_iter::PartitionIter,
     persist::{drain_buffer::persist_partitions, queue::PersistQueue},
@@ -25,11 +26,11 @@ pub enum WalReplayError {
     #[error("failed to read wal entry: {0}")]
     ReadEntry(wal::Error),
 
-    /// An error converting the WAL entry into a [`DmlOperation`].
-    #[error("failed converting wal entry to dml operation: {0}")]
+    /// An error converting the WAL entry into a [`IngestOp`].
+    #[error("failed converting wal entry to ingest operation: {0}")]
     MapToDml(#[from] mutable_batch_pb::decode::Error),
 
-    /// A failure to apply a [`DmlOperation`] from the WAL to the in-memory
+    /// A failure to apply a [`IngestOp`] from the WAL to the in-memory
     /// [`BufferTree`].
     ///
     /// [`BufferTree`]: crate::buffer_tree::BufferTree
@@ -74,12 +75,12 @@ where
             "Number of WAL files that have started to be replayed",
         )
         .recorder(&[]);
-    let op_count_metric = metrics
-        .register_metric::<U64Counter>(
-            "ingester_wal_replay_ops",
-            "Number of operations successfully replayed from the WAL",
-        )
-        .recorder(&[]);
+    let op_count_metric = metrics.register_metric::<U64Counter>(
+        "ingester_wal_replay_ops",
+        "Number of operations replayed from the WAL",
+    );
+    let ok_op_count_metric = op_count_metric.recorder(&[("outcome", "success")]);
+    let empty_op_count_metric = op_count_metric.recorder(&[("outcome", "skipped_empty")]);
 
     let n_files = files.len();
     info!(n_files, "found wal files for replay");
@@ -111,7 +112,7 @@ where
         );
 
         // Replay this segment file
-        match replay_file(reader, sink, &op_count_metric).await? {
+        match replay_file(reader, sink, &ok_op_count_metric, &empty_op_count_metric).await? {
             v @ Some(_) => max_sequence = max_sequence.max(v),
             None => {
                 // This file was empty and should be deleted.
@@ -178,9 +179,10 @@ where
 /// Replay the entries in `file`, applying them to `buffer`. Returns the highest
 /// sequence number observed in the file, or [`None`] if the file was empty.
 async fn replay_file<T>(
-    mut file: wal::ClosedSegmentFileReader,
+    file: wal::ClosedSegmentFileReader,
     sink: &T,
-    op_count_metric: &U64Counter,
+    ok_op_count_metric: &U64Counter,
+    empty_op_count_metric: &U64Counter,
 ) -> Result<Option<SequenceNumber>, WalReplayError>
 where
     T: DmlSink,
@@ -188,29 +190,14 @@ where
     let mut max_sequence = None;
     let start = Instant::now();
 
-    loop {
-        let ops = match file.next_batch() {
-            Ok(Some(v)) => v,
-            Ok(None) => {
-                // This file is complete, return the last observed sequence
-                // number.
-                debug!("wal file replayed in {:?}", start.elapsed());
-                return Ok(max_sequence);
-            }
-            Err(e) => return Err(WalReplayError::ReadEntry(e)),
-        };
+    for batch in file {
+        let ops = batch.map_err(WalReplayError::ReadEntry)?;
 
         for op in ops {
             let SequencedWalOp {
-                sequence_number,
+                table_write_sequence_numbers,
                 op,
             } = op;
-
-            let sequence_number = SequenceNumber::new(
-                i64::try_from(sequence_number).expect("sequence number overflow"),
-            );
-
-            max_sequence = max_sequence.max(Some(sequence_number));
 
             let op = match op {
                 Op::Write(w) => w,
@@ -218,38 +205,71 @@ where
                 Op::Persist(_) => unreachable!(),
             };
 
-            debug!(?op, sequence_number = sequence_number.get(), "apply wal op");
+            let mut op_min_sequence_number = None;
+            let mut op_max_sequence_number = None;
 
-            // Reconstruct the DML operation
+            // Reconstruct the ingest operation
             let batches = decode_database_batch(&op)?;
             let namespace_id = NamespaceId::new(op.database_id);
             let partition_key = PartitionKey::from(op.partition_key);
 
-            let op = DmlWrite::new(
+            if batches.is_empty() {
+                warn!(%namespace_id, "encountered wal op containing no table data, skipping replay");
+                empty_op_count_metric.inc(1);
+                continue;
+            }
+
+            let op = WriteOperation::new(
                 namespace_id,
                 batches
                     .into_iter()
-                    .map(|(k, v)| (TableId::new(k), v))
+                    .map(|(k, v)| {
+                        let table_id = TableId::new(k);
+                        let sequence_number = SequenceNumber::new(
+                            *table_write_sequence_numbers
+                                .get(&table_id)
+                                .expect("attempt to apply unsequenced wal op"),
+                        );
+
+                        max_sequence = max_sequence.max(Some(sequence_number));
+                        op_min_sequence_number = op_min_sequence_number.min(Some(sequence_number));
+                        op_max_sequence_number = op_min_sequence_number.max(Some(sequence_number));
+
+                        (
+                            table_id,
+                            TableData::new(table_id, PartitionedData::new(sequence_number, v)),
+                        )
+                    })
                     .collect(),
                 partition_key,
-                // The tracing context should be propagated over the RPC boundary.
-                DmlMeta::sequenced(
-                    sequence_number,
-                    iox_time::Time::MAX, // TODO: remove this from DmlMeta
-                    // TODO: A tracing context should be added for WAL replay.
-                    None,
-                    42, // TODO: remove this from DmlMeta
-                ),
+                // TODO: A tracing context should be added for WAL replay.
+                None,
+            );
+
+            debug!(
+                ?op,
+                op_min_sequence_number = op_min_sequence_number
+                    .expect("attempt to apply unsequenced wal op")
+                    .get(),
+                op_max_sequence_number = op_max_sequence_number
+                    .expect("attempt to apply unsequenced wal op")
+                    .get(),
+                "apply wal op"
             );
 
             // Apply the operation to the provided DML sink
-            sink.apply(DmlOperation::Write(op))
+            sink.apply(IngestOp::Write(op))
                 .await
                 .map_err(Into::<DmlError>::into)?;
 
-            op_count_metric.inc(1);
+            ok_op_count_metric.inc(1);
         }
     }
+
+    // This file is complete, return the last observed sequence
+    // number.
+    debug!("wal file replayed in {:?}", start.elapsed());
+    Ok(max_sequence)
 }
 
 #[cfg(test)]
@@ -264,14 +284,15 @@ mod tests {
 
     use crate::{
         buffer_tree::partition::PartitionData,
+        dml_payload::IngestOp,
         dml_sink::mock_sink::MockDmlSink,
         persist::queue::mock::MockPersistQueue,
         test_util::{
-            assert_dml_writes_eq, make_write_op, PartitionDataBuilder, ARBITRARY_NAMESPACE_ID,
-            ARBITRARY_PARTITION_ID, ARBITRARY_PARTITION_KEY, ARBITRARY_TABLE_ID,
-            ARBITRARY_TABLE_NAME,
+            assert_write_ops_eq, make_multi_table_write_op, make_write_op, PartitionDataBuilder,
+            ARBITRARY_NAMESPACE_ID, ARBITRARY_PARTITION_KEY, ARBITRARY_TABLE_ID,
+            ARBITRARY_TABLE_NAME, ARBITRARY_TRANSITION_PARTITION_ID,
         },
-        wal::wal_sink::WalSink,
+        wal::wal_sink::{mock::MockUnbufferedWriteNotifier, WalSink},
     };
 
     use super::*;
@@ -292,10 +313,12 @@ mod tests {
     impl DmlSink for MockIter {
         type Error = <MockDmlSink as DmlSink>::Error;
 
-        async fn apply(&self, op: DmlOperation) -> Result<(), Self::Error> {
+        async fn apply(&self, op: IngestOp) -> Result<(), Self::Error> {
             self.sink.apply(op).await
         }
     }
+
+    const ALTERNATIVE_TABLE_NAME: &str = "arán";
 
     #[tokio::test]
     async fn test_replay() {
@@ -312,6 +335,7 @@ mod tests {
                 r#"{},region=Madrid temp=35 4242424242"#,
                 &*ARBITRARY_TABLE_NAME
             ),
+            None,
         );
         let op2 = make_write_op(
             &ARBITRARY_PARTITION_KEY,
@@ -323,40 +347,69 @@ mod tests {
                 r#"{},region=Asturias temp=25 4242424242"#,
                 &*ARBITRARY_TABLE_NAME
             ),
+            None,
         );
-        let op3 = make_write_op(
+
+        // Add a write hitting multiple tables for good measure
+        let op3 = make_multi_table_write_op(
             &ARBITRARY_PARTITION_KEY,
             ARBITRARY_NAMESPACE_ID,
-            &ARBITRARY_TABLE_NAME,
-            ARBITRARY_TABLE_ID,
-            42,
+            [
+                (
+                    ARBITRARY_TABLE_NAME.to_string().as_str(),
+                    ARBITRARY_TABLE_ID,
+                    SequenceNumber::new(42),
+                ),
+                (
+                    ALTERNATIVE_TABLE_NAME,
+                    TableId::new(ARBITRARY_TABLE_ID.get() + 1),
+                    SequenceNumber::new(43),
+                ),
+            ]
+            .into_iter(),
             // Overwrite op2
             &format!(
-                r#"{},region=Asturias temp=15 4242424242"#,
-                &*ARBITRARY_TABLE_NAME
+                r#"{},region=Asturias temp=15 4242424242
+                {},region=Mayo temp=12 4242424242"#,
+                &*ARBITRARY_TABLE_NAME, ALTERNATIVE_TABLE_NAME,
             ),
+        );
+
+        // Emulate a mid-write crash by inserting an op with no data
+        let empty_op = WriteOperation::new_empty_invalid(
+            ARBITRARY_NAMESPACE_ID,
+            ARBITRARY_PARTITION_KEY.clone(),
         );
 
         // The write portion of this test.
         //
         // Write two ops, rotate the file, and write a third op.
         {
-            let inner =
-                Arc::new(MockDmlSink::default().with_apply_return(vec![Ok(()), Ok(()), Ok(())]));
+            let inner = Arc::new(MockDmlSink::default().with_apply_return(vec![
+                Ok(()),
+                Ok(()),
+                Ok(()),
+                Ok(()),
+            ]));
             let wal = Wal::new(dir.path())
                 .await
                 .expect("failed to initialise WAL");
+            let notifier_handle = Arc::new(MockUnbufferedWriteNotifier::default());
 
-            let wal_sink = WalSink::new(Arc::clone(&inner), Arc::clone(&wal));
+            let wal_sink = WalSink::new(
+                Arc::clone(&inner),
+                Arc::clone(&wal),
+                Arc::clone(&notifier_handle),
+            );
 
             // Apply the first op through the decorator
             wal_sink
-                .apply(DmlOperation::Write(op1.clone()))
+                .apply(IngestOp::Write(op1.clone()))
                 .await
                 .expect("wal should not error");
             // And the second op
             wal_sink
-                .apply(DmlOperation::Write(op2.clone()))
+                .apply(IngestOp::Write(op2.clone()))
                 .await
                 .expect("wal should not error");
 
@@ -365,12 +418,18 @@ mod tests {
 
             // Write the third op
             wal_sink
-                .apply(DmlOperation::Write(op3.clone()))
+                .apply(IngestOp::Write(op3.clone()))
+                .await
+                .expect("wal should not error");
+
+            // Write the empty op
+            wal_sink
+                .apply(IngestOp::Write(empty_op))
                 .await
                 .expect("wal should not error");
 
             // Assert the mock inner sink saw the calls
-            assert_eq!(inner.get_calls().len(), 3);
+            assert_eq!(inner.get_calls().len(), 4);
         }
 
         // Reinitialise the WAL
@@ -390,7 +449,13 @@ mod tests {
         // Put at least one write into the buffer so it is a candidate for persistence
         partition
             .buffer_write(
-                op1.tables().next().unwrap().1.clone(),
+                op1.tables()
+                    .next()
+                    .unwrap()
+                    .1
+                    .partitioned_data()
+                    .data()
+                    .clone(),
                 SequenceNumber::new(1),
             )
             .unwrap();
@@ -404,27 +469,28 @@ mod tests {
             .await
             .expect("failed to replay WAL");
 
-        assert_eq!(max_sequence_number, Some(SequenceNumber::new(42)));
+        assert_eq!(max_sequence_number, Some(SequenceNumber::new(43)));
 
-        // Assert the ops were pushed into the DmlSink exactly as generated.
+        // Assert the ops were pushed into the DmlSink exactly as generated,
+        // barring the empty op which is skipped
         let ops = mock_iter.sink.get_calls();
         assert_matches!(
             &*ops,
             &[
-                DmlOperation::Write(ref w1),
-                DmlOperation::Write(ref w2),
-                DmlOperation::Write(ref w3)
+                IngestOp::Write(ref w1),
+                IngestOp::Write(ref w2),
+                IngestOp::Write(ref w3),
             ] => {
-                assert_dml_writes_eq(w1.clone(), op1);
-                assert_dml_writes_eq(w2.clone(), op2);
-                assert_dml_writes_eq(w3.clone(), op3);
+                assert_write_ops_eq(w1.clone(), op1);
+                assert_write_ops_eq(w2.clone(), op2);
+                assert_write_ops_eq(w3.clone(), op3);
             }
         );
 
         // Ensure all partitions were persisted
         let calls = persist.calls();
         assert_matches!(&*calls, [p] => {
-            assert_eq!(p.lock().partition_id(), ARBITRARY_PARTITION_ID);
+            assert_eq!(p.lock().partition_id(), &*ARBITRARY_TRANSITION_PARTITION_ID);
         });
 
         // Ensure there were no partition persist panics.
@@ -451,9 +517,16 @@ mod tests {
         let ops = metrics
             .get_instrument::<Metric<U64Counter>>("ingester_wal_replay_ops")
             .expect("file counter not found")
-            .get_observer(&Attributes::from([]))
+            .get_observer(&Attributes::from(&[("outcome", "success")]))
             .expect("attributes not found")
             .fetch();
         assert_eq!(ops, 3);
+        let ops = metrics
+            .get_instrument::<Metric<U64Counter>>("ingester_wal_replay_ops")
+            .expect("file counter not found")
+            .get_observer(&Attributes::from(&[("outcome", "skipped_empty")]))
+            .expect("attributes not found")
+            .fetch();
+        assert_eq!(ops, 1);
     }
 }

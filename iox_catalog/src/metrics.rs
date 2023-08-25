@@ -6,9 +6,11 @@ use crate::interface::{
 };
 use async_trait::async_trait;
 use data_types::{
-    Column, ColumnType, CompactionLevel, Namespace, NamespaceId, NamespaceName, ParquetFile,
-    ParquetFileId, ParquetFileParams, Partition, PartitionId, PartitionKey, SkippedCompaction,
-    Table, TableId, Timestamp,
+    partition_template::{NamespacePartitionTemplateOverride, TablePartitionTemplateOverride},
+    Column, ColumnType, CompactionLevel, Namespace, NamespaceId, NamespaceName,
+    NamespaceServiceProtectionLimitsOverride, ParquetFile, ParquetFileId, ParquetFileParams,
+    Partition, PartitionHashId, PartitionId, PartitionKey, SkippedCompaction, SortedColumnSet,
+    Table, TableId, Timestamp, TransitionPartitionId,
 };
 use iox_time::{SystemProvider, TimeProvider};
 use metric::{DurationHistogram, Metric};
@@ -131,7 +133,7 @@ macro_rules! decorate {
 decorate!(
     impl_trait = NamespaceRepo,
     methods = [
-        "namespace_create" = create(&mut self, name: &NamespaceName, retention_period_ns: Option<i64>) -> Result<Namespace>;
+        "namespace_create" = create(&mut self, name: &NamespaceName<'_>, partition_template: Option<NamespacePartitionTemplateOverride>, retention_period_ns: Option<i64>, service_protection_limits: Option<NamespaceServiceProtectionLimitsOverride>) -> Result<Namespace>;
         "namespace_update_retention_period" = update_retention_period(&mut self, name: &str, retention_period_ns: Option<i64>) -> Result<Namespace>;
         "namespace_list" = list(&mut self, deleted: SoftDeletedRows) -> Result<Vec<Namespace>>;
         "namespace_get_by_id" = get_by_id(&mut self, id: NamespaceId, deleted: SoftDeletedRows) -> Result<Option<Namespace>>;
@@ -145,7 +147,7 @@ decorate!(
 decorate!(
     impl_trait = TableRepo,
     methods = [
-        "table_create_or_get" = create_or_get(&mut self, name: &str, namespace_id: NamespaceId) -> Result<Table>;
+        "table_create" = create(&mut self, name: &str, partition_template: TablePartitionTemplateOverride, namespace_id: NamespaceId) -> Result<Table>;
         "table_get_by_id" = get_by_id(&mut self, table_id: TableId) -> Result<Option<Table>>;
         "table_get_by_namespace_and_name" = get_by_namespace_and_name(&mut self, namespace_id: NamespaceId, name: &str) -> Result<Option<Table>>;
         "table_list_by_namespace_id" = list_by_namespace_id(&mut self, namespace_id: NamespaceId) -> Result<Vec<Table>>;
@@ -169,33 +171,34 @@ decorate!(
     methods = [
         "partition_create_or_get" = create_or_get(&mut self, key: PartitionKey, table_id: TableId) -> Result<Partition>;
         "partition_get_by_id" = get_by_id(&mut self, partition_id: PartitionId) -> Result<Option<Partition>>;
+        "partition_get_by_id_batch" = get_by_id_batch(&mut self, partition_ids: Vec<PartitionId>) -> Result<Vec<Partition>>;
+        "partition_get_by_hash_id" = get_by_hash_id(&mut self, partition_hash_id: &PartitionHashId) -> Result<Option<Partition>>;
+        "partition_get_by_hash_id_batch" = get_by_hash_id_batch(&mut self, partition_hash_ids: &[&PartitionHashId]) -> Result<Vec<Partition>>;
         "partition_list_by_table_id" = list_by_table_id(&mut self, table_id: TableId) -> Result<Vec<Partition>>;
         "partition_list_ids" = list_ids(&mut self) -> Result<Vec<PartitionId>>;
-        "partition_update_sort_key" = cas_sort_key(&mut self, partition_id: PartitionId, old_sort_key: Option<Vec<String>>, new_sort_key: &[&str]) -> Result<Partition, CasFailure<Vec<String>>>;
+        "partition_update_sort_key" = cas_sort_key(&mut self, partition_id: &TransitionPartitionId, old_sort_key: Option<Vec<String>>, new_sort_key: &[&str], new_sort_key_ids: &SortedColumnSet) -> Result<Partition, CasFailure<Vec<String>>>;
         "partition_record_skipped_compaction" = record_skipped_compaction(&mut self, partition_id: PartitionId, reason: &str, num_files: usize, limit_num_files: usize, limit_num_files_first_in_partition: usize, estimated_bytes: u64, limit_bytes: u64) -> Result<()>;
         "partition_list_skipped_compactions" = list_skipped_compactions(&mut self) -> Result<Vec<SkippedCompaction>>;
         "partition_delete_skipped_compactions" = delete_skipped_compactions(&mut self, partition_id: PartitionId) -> Result<Option<SkippedCompaction>>;
         "partition_most_recent_n" = most_recent_n(&mut self, n: usize) -> Result<Vec<Partition>>;
-        "partitions_new_file_between" = partitions_new_file_between(&mut self, minimum_time: Timestamp, maximum_time: Option<Timestamp>) -> Result<Vec<PartitionId>>;
-        "get_in_skipped_compaction" = get_in_skipped_compaction(&mut self, partition_id: PartitionId) -> Result<Option<SkippedCompaction>>;
+        "partition_partitions_new_file_between" = partitions_new_file_between(&mut self, minimum_time: Timestamp, maximum_time: Option<Timestamp>) -> Result<Vec<PartitionId>>;
+        "partition_get_in_skipped_compactions" = get_in_skipped_compactions(&mut self, partition_ids: &[PartitionId]) -> Result<Vec<SkippedCompaction>>;
+        "partition_list_old_style" = list_old_style(&mut self) -> Result<Vec<Partition>>;
     ]
 );
 
 decorate!(
     impl_trait = ParquetFileRepo,
     methods = [
-        "parquet_create" = create( &mut self, parquet_file_params: ParquetFileParams) -> Result<ParquetFile>;
-        "parquet_flag_for_delete" = flag_for_delete(&mut self, id: ParquetFileId) -> Result<()>;
+        "parquet_create" = create(&mut self, parquet_file_params: ParquetFileParams) -> Result<ParquetFile>;
+        "parquet_list_all" = list_all(&mut self) -> Result<Vec<ParquetFile>>;
         "parquet_flag_for_delete_by_retention" = flag_for_delete_by_retention(&mut self) -> Result<Vec<ParquetFileId>>;
         "parquet_list_by_namespace_not_to_delete" = list_by_namespace_not_to_delete(&mut self, namespace_id: NamespaceId) -> Result<Vec<ParquetFile>>;
         "parquet_list_by_table_not_to_delete" = list_by_table_not_to_delete(&mut self, table_id: TableId) -> Result<Vec<ParquetFile>>;
-        "parquet_list_by_table" = list_by_table(&mut self, table_id: TableId) -> Result<Vec<ParquetFile>>;
         "parquet_delete_old_ids_only" = delete_old_ids_only(&mut self, older_than: Timestamp) -> Result<Vec<ParquetFileId>>;
-        "parquet_list_by_partition_not_to_delete" = list_by_partition_not_to_delete(&mut self, partition_id: PartitionId) -> Result<Vec<ParquetFile>>;
-        "parquet_update_compaction_level" = update_compaction_level(&mut self, parquet_file_ids: &[ParquetFileId], compaction_level: CompactionLevel) -> Result<Vec<ParquetFileId>>;
-        "parquet_exist" = exist(&mut self, id: ParquetFileId) -> Result<bool>;
-        "parquet_count" = count(&mut self) -> Result<i64>;
+        "parquet_list_by_partition_not_to_delete" = list_by_partition_not_to_delete(&mut self, partition_id: &TransitionPartitionId) -> Result<Vec<ParquetFile>>;
         "parquet_get_by_object_store_id" = get_by_object_store_id(&mut self, object_store_id: Uuid) -> Result<Option<ParquetFile>>;
-        "parquet_create_upgrade_delete" = create_upgrade_delete(&mut self, _partition_id: PartitionId, delete: &[ParquetFile], upgrade: &[ParquetFile], create: &[ParquetFileParams], target_level: CompactionLevel) -> Result<Vec<ParquetFileId>>;
+        "parquet_exists_by_object_store_id_batch" = exists_by_object_store_id_batch(&mut self, object_store_ids: Vec<Uuid>) -> Result<Vec<Uuid>>;
+        "parquet_create_upgrade_delete" = create_upgrade_delete(&mut self, delete: &[ParquetFileId], upgrade: &[ParquetFileId], create: &[ParquetFileParams], target_level: CompactionLevel) -> Result<Vec<ParquetFileId>>;
     ]
 );

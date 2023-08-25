@@ -1,12 +1,15 @@
+use crate::error;
 use crate::plan::expr_type_evaluator::TypeEvaluator;
 use crate::plan::field::{field_by_name, field_name};
 use crate::plan::field_mapper::{field_and_dimensions, FieldTypeMap};
-use crate::plan::ir::{DataSource, Field, Select, SelectQuery, TagSet};
+use crate::plan::ir::{DataSource, Field, Interval, Select, SelectQuery, TagSet};
 use crate::plan::var_ref::{influx_type_to_var_ref_data_type, var_ref_data_type_to_influx_type};
-use crate::plan::{error, util, SchemaProvider};
+use crate::plan::{util, SchemaProvider};
 use datafusion::common::{DataFusionError, Result};
-use influxdb_influxql_parser::common::{MeasurementName, QualifiedMeasurementName};
-use influxdb_influxql_parser::expression::walk::{walk_expr, walk_expr_mut};
+use influxdb_influxql_parser::common::{MeasurementName, QualifiedMeasurementName, WhereClause};
+use influxdb_influxql_parser::expression::walk::{
+    walk_expr, walk_expr_mut, walk_expression_mut, ExpressionMut,
+};
 use influxdb_influxql_parser::expression::{
     AsVarRefExpr, Call, Expr, VarRef, VarRefDataType, WildcardType,
 };
@@ -17,11 +20,15 @@ use influxdb_influxql_parser::select::{
     Dimension, FillClause, FromMeasurementClause, GroupByClause, MeasurementSelection,
     SelectStatement,
 };
+use influxdb_influxql_parser::time_range::{
+    duration_expr_to_nanoseconds, split_cond, ReduceContext, TimeRange,
+};
+use influxdb_influxql_parser::timestamp::Timestamp;
 use itertools::Itertools;
 use schema::InfluxColumnType;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Debug;
-use std::ops::{ControlFlow, Deref};
+use std::ops::{ControlFlow, Deref, DerefMut};
 
 /// Recursively rewrite the specified [`SelectStatement`] by performing a series of passes
 /// to validate and normalize the statement.
@@ -33,32 +40,25 @@ pub(super) fn rewrite_statement(
     from_drop_empty(s, &mut select);
     field_list_normalize_time(&mut select);
 
-    let has_multiple_measurements = has_multiple_measurements(&select);
-
-    Ok(SelectQuery {
-        select,
-        has_multiple_measurements,
-    })
+    Ok(SelectQuery { select })
 }
 
-/// Determines if s projects more than a single unique table
-fn has_multiple_measurements(s: &Select) -> bool {
+/// Find the unique list of tables used by `s`, recursively following all `FROM` clauses and
+/// return the results in lexicographically in ascending order.
+pub(super) fn find_table_names(s: &Select) -> BTreeSet<&str> {
     let mut data_sources = vec![s.from.as_slice()];
-    let mut table_name: Option<&str> = None;
+    let mut tables = BTreeSet::new();
     while let Some(from) = data_sources.pop() {
         for ds in from {
             match ds {
-                DataSource::Table(name) if matches!(table_name, None) => table_name = Some(name),
                 DataSource::Table(name) => {
-                    if name != table_name.unwrap() {
-                        return true;
-                    }
+                    tables.insert(name.as_str());
                 }
                 DataSource::Subquery(q) => data_sources.push(q.from.as_slice()),
             }
         }
     }
-    false
+    tables
 }
 
 /// Transform a `SelectStatement` to a `Select`, which is an intermediate representation used by
@@ -99,11 +99,39 @@ impl RewriteSelect {
         check_features(stmt)?;
 
         let from = self.expand_from(s, stmt)?;
-        let (fields, group_by) = self.expand_projection(s, stmt, &from)?;
-        let tag_set = select_tag_set(s, &from);
+        let tag_set = from_tag_set(s, &from);
+        let (fields, group_by) = self.expand_projection(s, stmt, &from, &tag_set)?;
+        let condition = self.condition_resolve_types(s, stmt, &from)?;
 
-        let SelectStatementInfo { projection_type } =
-            select_statement_info(&fields, &group_by, stmt.fill)?;
+        let now = Timestamp::from(s.execution_props().query_execution_start_time);
+        let rc = ReduceContext {
+            now: Some(now),
+            tz: stmt.timezone.map(|tz| *tz),
+        };
+
+        let interval = self.find_interval_offset(&rc, group_by.as_ref())?;
+
+        let (condition, time_range) = match condition {
+            Some(where_clause) => split_cond(&rc, &where_clause).map_err(error::map::expr_error)?,
+            None => (None, TimeRange::default()),
+        };
+
+        // If the interval is non-zero and there is no upper bound, default to `now`
+        // for compatibility with InfluxQL OG.
+        //
+        // See: https://github.com/influxdata/influxdb/blob/f365bb7e3a9c5e227dbf66d84adf674d3d127176/query/compile.go#L172-L179
+        let time_range = match (interval, time_range.upper) {
+            (Some(interval), None) if interval.duration > 0 => TimeRange {
+                lower: time_range.lower,
+                upper: Some(now.timestamp_nanos()),
+            },
+            _ => time_range,
+        };
+
+        let SelectStatementInfo {
+            projection_type,
+            extra_intervals,
+        } = select_statement_info(&fields, &group_by, stmt.fill)?;
 
         // Following InfluxQL OG behaviour, if this is a subquery, and the fill strategy equates
         // to `FILL(null)`, switch to `FILL(none)`.
@@ -119,11 +147,13 @@ impl RewriteSelect {
         };
 
         Ok(Select {
-            depth: self.depth,
             projection_type,
+            interval,
+            extra_intervals,
             fields,
             from,
-            condition: stmt.condition.clone(),
+            condition,
+            time_range,
             group_by,
             tag_set,
             fill,
@@ -163,6 +193,7 @@ impl RewriteSelect {
         s: &dyn SchemaProvider,
         stmt: &SelectStatement,
         from: &[DataSource],
+        from_tag_set: &TagSet,
     ) -> Result<(Vec<Field>, Option<GroupByClause>)> {
         let tv = TypeEvaluator::new(s, from);
         let fields = stmt
@@ -211,14 +242,14 @@ impl RewriteSelect {
 
         let (has_field_wildcard, has_group_by_wildcard) = has_wildcards(stmt);
 
-        let (fields, group_by) = if has_field_wildcard || has_group_by_wildcard {
+        let (fields, mut group_by) = if has_field_wildcard || has_group_by_wildcard {
             let (field_set, mut tag_set) = from_field_and_dimensions(s, from)?;
 
             if !has_group_by_wildcard {
                 if let Some(group_by) = &stmt.group_by {
                     // Remove any explicitly listed tags in the GROUP BY clause, so they are not
                     // expanded by any wildcards specified in the SELECT projection list
-                    group_by.tags().for_each(|ident| {
+                    group_by.tag_names().for_each(|ident| {
                         tag_set.remove(ident.as_str());
                     });
                 }
@@ -259,7 +290,10 @@ impl RewriteSelect {
 
                     for dim in group_by.iter() {
                         let add_dim = |dim: &String| {
-                            new_dimensions.push(Dimension::Tag(Identifier::new(dim.clone())))
+                            new_dimensions.push(Dimension::VarRef(VarRef {
+                                name: Identifier::new(dim.clone()),
+                                data_type: Some(VarRefDataType::Tag),
+                            }))
                         };
 
                         match dim {
@@ -289,6 +323,16 @@ impl RewriteSelect {
         } else {
             (fields, stmt.group_by.clone())
         };
+
+        // resolve possible tag references in group_by
+        if let Some(group_by) = group_by.as_mut() {
+            for dim in group_by.iter_mut() {
+                let Dimension::VarRef(var_ref) = dim else { continue };
+                if from_tag_set.contains(var_ref.name.as_str()) {
+                    var_ref.data_type = Some(VarRefDataType::Tag);
+                }
+            }
+        }
 
         Ok((fields_resolve_aliases_and_types(s, fields, from)?, group_by))
     }
@@ -329,11 +373,72 @@ impl RewriteSelect {
         }
         Ok(new_from)
     }
+
+    /// Resolve the data types of any [`VarRef`] expressions in the `WHERE` condition.
+    fn condition_resolve_types(
+        &self,
+        s: &dyn SchemaProvider,
+        stmt: &SelectStatement,
+        from: &[DataSource],
+    ) -> Result<Option<WhereClause>> {
+        let Some(mut where_clause) = stmt.condition.clone() else { return Ok(None) };
+
+        let tv = TypeEvaluator::new(s, from);
+
+        if let ControlFlow::Break(err) = walk_expression_mut(where_clause.deref_mut(), &mut |e| {
+            match e {
+                ExpressionMut::Arithmetic(e) => walk_expr_mut(e, &mut |e| match e {
+                    // Attempt to rewrite all variable (column) references with their concrete types,
+                    // if one hasn't been specified.
+                    Expr::VarRef(ref mut v) => {
+                        v.data_type = match tv.eval_var_ref(v) {
+                            Ok(v) => v,
+                            Err(e) => ControlFlow::Break(e)?,
+                        };
+                        ControlFlow::Continue(())
+                    }
+                    _ => ControlFlow::Continue(()),
+                }),
+                ExpressionMut::Conditional(_) => ControlFlow::<DataFusionError>::Continue(()),
+            }
+        }) {
+            Err(err)
+        } else {
+            Ok(Some(where_clause))
+        }
+    }
+
+    /// Return the interval value of the `GROUP BY` clause if it specifies a `TIME`.
+    fn find_interval_offset(
+        &self,
+        ctx: &ReduceContext,
+        group_by: Option<&GroupByClause>,
+    ) -> Result<Option<Interval>> {
+        Ok(
+            if let Some(td) = group_by.and_then(|v| v.time_dimension()) {
+                let duration = duration_expr_to_nanoseconds(ctx, &td.interval)
+                    .map_err(error::map::expr_error)?;
+                let offset = td
+                    .offset
+                    .as_ref()
+                    .map(|o| duration_expr_to_nanoseconds(ctx, o))
+                    .transpose()
+                    .map_err(error::map::expr_error)?;
+                Some(Interval { duration, offset })
+            } else {
+                None
+            },
+        )
+    }
 }
 
-/// Ensure the time field is added to all projections,
-/// and is moved to the first position, which is a requirement
-/// for InfluxQL compatibility.
+/// Ensures the `time` column is presented consistently across all `SELECT` queries.
+///
+/// The following transformations may occur
+///
+/// * Ensure the `time` field is added to all projections;
+/// * move the `time` field to the first position; and
+/// * remove column alias for `time` in subqueries.
 fn field_list_normalize_time(stmt: &mut Select) {
     fn normalize_time(stmt: &mut Select, is_subquery: bool) {
         if let Some(f) = match stmt
@@ -430,7 +535,7 @@ fn from_drop_empty(s: &dyn SchemaProvider, stmt: &mut Select) {
 }
 
 /// Determine the combined tag set for the specified `from`.
-fn select_tag_set(s: &dyn SchemaProvider, from: &[DataSource]) -> TagSet {
+fn from_tag_set(s: &dyn SchemaProvider, from: &[DataSource]) -> TagSet {
     let mut tag_set = TagSet::new();
 
     for ds in from {
@@ -497,7 +602,7 @@ fn from_field_and_dimensions(
 
                 if let Some(group_by) = &select.group_by {
                     // Merge the dimensions from the subquery
-                    ts.extend(group_by.tags().map(|i| i.deref().to_string()));
+                    ts.extend(group_by.tag_names().map(|i| i.deref().to_string()));
                 }
             }
         }
@@ -610,7 +715,7 @@ fn fields_expand_wildcards(
                 ]);
 
                 // Modify the supported types for certain functions.
-                match name.to_lowercase().as_str() {
+                match name.as_str() {
                     "count" | "first" | "last" | "distinct" | "elapsed" | "mode" | "sample" => {
                         supported_types
                             .extend([Some(VarRefDataType::String), Some(VarRefDataType::Boolean)]);
@@ -802,11 +907,29 @@ macro_rules! lit_string {
     };
 }
 
+/// Set the `extra_intervals` field of [`FieldChecker`] if it is
+/// less than then proposed new value.
+macro_rules! set_extra_intervals {
+    ($SELF:expr, $NEW:expr) => {
+        if $SELF.extra_intervals < $NEW as usize {
+            $SELF.extra_intervals = $NEW as usize
+        }
+    };
+}
+
 /// Checks a number of expectations for the fields of a [`SelectStatement`].
 #[derive(Default)]
 struct FieldChecker {
     /// `true` if the statement contains a `GROUP BY TIME` clause.
     has_group_by_time: bool,
+
+    /// The number of additional intervals that must be read
+    /// for queries that group by time and use window functions such as
+    /// `DIFFERENCE` or `DERIVATIVE`. This ensures data for the first
+    /// window is available.
+    ///
+    /// See: <https://github.com/influxdata/influxdb/blob/f365bb7e3a9c5e227dbf66d84adf674d3d127176/query/compile.go#L50>
+    extra_intervals: usize,
 
     /// `true` if the interval was inherited by a parent.
     /// If this is set, then an interval that was inherited will not cause
@@ -825,8 +948,16 @@ struct FieldChecker {
     /// Accumulator for the number of aggregate or window expressions for the statement.
     aggregate_count: usize,
 
+    /// Accumulator for the number of window expressions for the statement.
+    window_count: usize,
+
     /// Accumulator for the number of selector expressions for the statement.
     selector_count: usize,
+    // Set to `true` if any window or aggregate functions are expected to
+    // only produce non-null results.
+    //
+    // This replicates the
+    // filter_null_rows: bool,
 }
 
 impl FieldChecker {
@@ -834,7 +965,7 @@ impl FieldChecker {
         &mut self,
         fields: &[Field],
         fill: Option<FillClause>,
-    ) -> Result<ProjectionType> {
+    ) -> Result<SelectStatementInfo> {
         fields.iter().try_for_each(|f| self.check_expr(&f.expr))?;
 
         match self.function_count() {
@@ -879,7 +1010,7 @@ impl FieldChecker {
 
         // Validate we are using a selector or raw query if non-aggregate fields are projected.
         if self.has_non_aggregate_fields {
-            if self.aggregate_count > 0 {
+            if self.window_aggregate_count() > 0 {
                 return error::query("mixing aggregate and non-aggregate columns is not supported");
             } else if self.selector_count > 1 {
                 return error::query(
@@ -888,29 +1019,52 @@ impl FieldChecker {
             }
         }
 
-        // By this point the statement is valid, so lets
-        // determine the projection type
+        // At this point the statement is valid, and numerous preconditions
+        // have been met. The final state of the `FieldChecker` is inspected
+        // to determine the type of projection. The ProjectionType dictates
+        // how the query will be planned and other cases, such as how NULL
+        // values are handled, to ensure compatibility with InfluxQL OG.
 
-        if self.has_top_bottom {
-            Ok(ProjectionType::TopBottomSelector)
+        let projection_type = if self.has_top_bottom {
+            ProjectionType::TopBottomSelector
         } else if self.has_group_by_time {
-            Ok(ProjectionType::Aggregate)
+            if self.window_count > 0 {
+                if self.window_count == self.aggregate_count + self.selector_count {
+                    ProjectionType::WindowAggregate
+                } else {
+                    ProjectionType::WindowAggregateMixed
+                }
+            } else {
+                ProjectionType::Aggregate
+            }
         } else if self.has_distinct {
-            Ok(ProjectionType::RawDistinct)
+            ProjectionType::RawDistinct
         } else if self.selector_count == 1 && self.aggregate_count == 0 {
-            Ok(ProjectionType::Selector {
+            ProjectionType::Selector {
                 has_fields: self.has_non_aggregate_fields,
-            })
+            }
         } else if self.selector_count > 1 || self.aggregate_count > 0 {
-            Ok(ProjectionType::Aggregate)
+            ProjectionType::Aggregate
+        } else if self.window_count > 0 {
+            ProjectionType::Window
         } else {
-            Ok(ProjectionType::Raw)
-        }
+            ProjectionType::Raw
+        };
+
+        Ok(SelectStatementInfo {
+            projection_type,
+            extra_intervals: self.extra_intervals,
+        })
     }
 
     /// The total number of functions observed.
     fn function_count(&self) -> usize {
-        self.aggregate_count + self.selector_count
+        self.window_aggregate_count() + self.selector_count
+    }
+
+    /// The total number of window and aggregate functions observed.
+    fn window_aggregate_count(&self) -> usize {
+        self.aggregate_count + self.window_count
     }
 }
 
@@ -1132,9 +1286,12 @@ impl FieldChecker {
     }
 
     fn check_derivative(&mut self, name: &str, args: &[Expr]) -> Result<()> {
-        self.inc_aggregate_count();
+        self.inc_window_count();
 
         check_exp_args!(name, 1, 2, args);
+
+        set_extra_intervals!(self, 1);
+
         match args.get(1) {
             Some(Expr::Literal(Literal::Duration(d))) if **d <= 0 => {
                 return error::query(format!("duration argument must be positive, got {d}"))
@@ -1151,8 +1308,10 @@ impl FieldChecker {
     }
 
     fn check_elapsed(&mut self, name: &str, args: &[Expr]) -> Result<()> {
-        self.inc_aggregate_count();
+        self.inc_window_count();
         check_exp_args!(name, 1, 2, args);
+
+        set_extra_intervals!(self, 1);
 
         match args.get(1) {
             Some(Expr::Literal(Literal::Duration(d))) if **d <= 0 => {
@@ -1170,21 +1329,22 @@ impl FieldChecker {
     }
 
     fn check_difference(&mut self, name: &str, args: &[Expr]) -> Result<()> {
-        self.inc_aggregate_count();
+        self.inc_window_count();
         check_exp_args!(name, 1, args);
+
+        set_extra_intervals!(self, 1);
 
         self.check_nested_symbol(name, &args[0])
     }
 
     fn check_cumulative_sum(&mut self, args: &[Expr]) -> Result<()> {
-        self.inc_aggregate_count();
+        self.inc_window_count();
         check_exp_args!("cumulative_sum", 1, args);
-
         self.check_nested_symbol("cumulative_sum", &args[0])
     }
 
     fn check_moving_average(&mut self, args: &[Expr]) -> Result<()> {
-        self.inc_aggregate_count();
+        self.inc_window_count();
         check_exp_args!("moving_average", 2, args);
 
         let v = lit_integer!("moving_average", args, 1);
@@ -1194,17 +1354,21 @@ impl FieldChecker {
             ));
         }
 
+        set_extra_intervals!(self, v);
+
         self.check_nested_symbol("moving_average", &args[0])
     }
 
     fn check_exponential_moving_average(&mut self, name: &str, args: &[Expr]) -> Result<()> {
-        self.inc_aggregate_count();
+        self.inc_window_count();
         check_exp_args!(name, 2, 4, args);
 
         let v = lit_integer!(name, args, 1);
         if v < 1 {
             return error::query(format!("{name} period must be greater than 1, got {v}"));
         }
+
+        set_extra_intervals!(self, v);
 
         if let Some(v) = lit_integer!(name, args, 2?) {
             match (v, name) {
@@ -1236,13 +1400,15 @@ impl FieldChecker {
     }
 
     fn check_kaufmans(&mut self, name: &str, args: &[Expr]) -> Result<()> {
-        self.inc_aggregate_count();
+        self.inc_window_count();
         check_exp_args!(name, 2, 3, args);
 
         let v = lit_integer!(name, args, 1);
         if v < 1 {
             return error::query(format!("{name} period must be greater than 1, got {v}"));
         }
+
+        set_extra_intervals!(self, v);
 
         if let Some(v) = lit_integer!(name, args, 2?) {
             if v < 0 && v != -1 {
@@ -1256,13 +1422,15 @@ impl FieldChecker {
     }
 
     fn check_chande_momentum_oscillator(&mut self, name: &str, args: &[Expr]) -> Result<()> {
-        self.inc_aggregate_count();
+        self.inc_window_count();
         check_exp_args!(name, 2, 4, args);
 
         let v = lit_integer!(name, args, 1);
         if v < 1 {
             return error::query(format!("{name} period must be greater than 1, got {v}"));
         }
+
+        set_extra_intervals!(self, v);
 
         if let Some(v) = lit_integer!(name, args, 2?) {
             if v < 0 && v != -1 {
@@ -1338,9 +1506,14 @@ impl FieldChecker {
         }
     }
 
-    /// Increments the function call count
+    /// Increments the aggregate function call count
     fn inc_aggregate_count(&mut self) {
         self.aggregate_count += 1
+    }
+
+    /// Increments the window function call count
+    fn inc_window_count(&mut self) {
+        self.window_count += 1
     }
 
     fn inc_selector_count(&mut self) {
@@ -1390,6 +1563,14 @@ pub(crate) enum ProjectionType {
     /// A query that projects one or more aggregate functions or
     /// two or more selector functions.
     Aggregate,
+    /// A query that projects one or more window functions.
+    Window,
+    /// A query that projects a combination of window and nested aggregate functions.
+    WindowAggregate,
+    /// A query that projects a combination of window and nested aggregate functions, including
+    /// separate projections that are just aggregates. This requires special handling of
+    /// windows that produce `NULL` results.
+    WindowAggregateMixed,
     /// A query that projects a single selector function,
     /// such as `last` or `first`.
     Selector {
@@ -1403,9 +1584,13 @@ pub(crate) enum ProjectionType {
 /// Holds high-level information as the result of analysing
 /// a `SELECT` query.
 #[derive(Default, Debug, Copy, Clone)]
-pub(crate) struct SelectStatementInfo {
+struct SelectStatementInfo {
     /// Identifies the projection type for the `SELECT` query.
-    pub projection_type: ProjectionType,
+    projection_type: ProjectionType,
+    /// Copied from [extra_intervals](FieldChecker::extra_intervals)
+    ///
+    /// [See also](Select::extra_intervals).
+    extra_intervals: usize,
 }
 
 /// Gather information about the semantics of a [`SelectStatement`] and verify
@@ -1454,9 +1639,7 @@ fn select_statement_info(
         ..Default::default()
     };
 
-    let projection_type = fc.check_fields(fields, fill)?;
-
-    Ok(SelectStatementInfo { projection_type })
+    fc.check_fields(fields, fill)
 }
 
 #[cfg(test)]
@@ -1464,13 +1647,45 @@ mod test {
     use super::Result;
     use crate::plan::ir::{Field, Select};
     use crate::plan::rewriter::{
-        has_wildcards, rewrite_select, rewrite_statement, ProjectionType, SelectStatementInfo,
+        find_table_names, has_wildcards, rewrite_select, rewrite_statement, ProjectionType,
+        SelectStatementInfo,
     };
     use crate::plan::test_utils::{parse_select, MockSchemaProvider};
     use assert_matches::assert_matches;
     use datafusion::error::DataFusionError;
     use influxdb_influxql_parser::select::SelectStatement;
     use test_helpers::{assert_contains, assert_error};
+
+    #[test]
+    fn test_find_table_names() {
+        let namespace = MockSchemaProvider::default();
+        let parse_select = |s: &str| -> Select {
+            let select = parse_select(s);
+            rewrite_select(&namespace, &select).unwrap()
+        };
+
+        /// Return `find_table_names` as a `Vec` for tests.
+        fn find_table_names_vec(s: &Select) -> Vec<&str> {
+            find_table_names(s).into_iter().collect()
+        }
+
+        let s = parse_select("SELECT usage_idle FROM cpu");
+        assert_eq!(find_table_names_vec(&s), &["cpu"]);
+
+        let s = parse_select("SELECT usage_idle FROM cpu, disk");
+        assert_eq!(find_table_names_vec(&s), &["cpu", "disk"]);
+
+        let s = parse_select("SELECT usage_idle FROM disk, cpu, disk");
+        assert_eq!(find_table_names_vec(&s), &["cpu", "disk"]);
+
+        // subqueries
+
+        let s = parse_select("SELECT usage_idle FROM (select * from cpu, disk)");
+        assert_eq!(find_table_names_vec(&s), &["cpu", "disk"]);
+
+        let s = parse_select("SELECT usage_idle FROM cpu, (select * from cpu, disk)");
+        assert_eq!(find_table_names_vec(&s), &["cpu", "disk"]);
+    }
 
     #[test]
     fn test_select_statement_info() {
@@ -1496,6 +1711,22 @@ mod test {
             ProjectionType::Selector { has_fields: false }
         );
 
+        // updates extra_intervals
+        let info = select_statement_info(&parse_select("SELECT difference(foo) FROM cpu")).unwrap();
+        assert_matches!(info.projection_type, ProjectionType::Window);
+        assert_matches!(info.extra_intervals, 1);
+        // derives extra intervals from the window function
+        let info =
+            select_statement_info(&parse_select("SELECT moving_average(foo, 5) FROM cpu")).unwrap();
+        assert_matches!(info.projection_type, ProjectionType::Window);
+        assert_matches!(info.extra_intervals, 5);
+        // uses the maximum extra intervals
+        let info = select_statement_info(&parse_select(
+            "SELECT difference(foo), moving_average(foo, 4) FROM cpu",
+        ))
+        .unwrap();
+        assert_matches!(info.extra_intervals, 4);
+
         let info = select_statement_info(&parse_select("SELECT last(foo), bar FROM cpu")).unwrap();
         assert_matches!(
             info.projection_type,
@@ -1514,6 +1745,18 @@ mod test {
 
         let info = select_statement_info(&parse_select("SELECT count(foo) FROM cpu")).unwrap();
         assert_matches!(info.projection_type, ProjectionType::Aggregate);
+
+        let info = select_statement_info(&parse_select(
+            "SELECT difference(count(foo)) FROM cpu GROUP BY TIME(10s)",
+        ))
+        .unwrap();
+        assert_matches!(info.projection_type, ProjectionType::WindowAggregate);
+
+        let info = select_statement_info(&parse_select(
+            "SELECT difference(count(foo)), mean(foo) FROM cpu GROUP BY TIME(10s)",
+        ))
+        .unwrap();
+        assert_matches!(info.projection_type, ProjectionType::WindowAggregateMixed);
 
         let info = select_statement_info(&parse_select("SELECT top(foo, 3) FROM cpu")).unwrap();
         assert_matches!(info.projection_type, ProjectionType::TopBottomSelector);
@@ -1783,7 +2026,7 @@ mod test {
         use crate::plan::ir::TagSet;
         use datafusion::common::Result;
         use influxdb_influxql_parser::select::SelectStatement;
-        use schema::{InfluxColumnType, InfluxFieldType};
+        use schema::{InfluxColumnType, InfluxFieldType, SchemaBuilder};
 
         /// Test implementation that converts `Select` to `SelectStatement` so that it can be
         /// converted back to a string.
@@ -1820,7 +2063,7 @@ mod test {
             // cpu is a Tag
             assert_matches!(q.select.fields[3].data_type, Some(InfluxColumnType::Tag));
 
-            let stmt = parse_select("SELECT field_i64 + field_f64 FROM all_types");
+            let stmt = parse_select("SELECT field_i64 + field_f64, field_i64 / field_i64, field_u64 / field_i64 FROM all_types");
             let q = rewrite_statement(&namespace, &stmt).unwrap();
             // first field is always the time column and thus a Timestamp
             assert_matches!(
@@ -1831,6 +2074,16 @@ mod test {
             assert_matches!(
                 q.select.fields[1].data_type,
                 Some(InfluxColumnType::Field(InfluxFieldType::Float))
+            );
+            // Integer division is promoted to a Float
+            assert_matches!(
+                q.select.fields[2].data_type,
+                Some(InfluxColumnType::Field(InfluxFieldType::Float))
+            );
+            // Unsigned division is still Unsigned
+            assert_matches!(
+                q.select.fields[3].data_type,
+                Some(InfluxColumnType::Field(InfluxFieldType::UInteger))
             );
         }
 
@@ -2024,6 +2277,53 @@ mod test {
             );
         }
 
+        /// Validate type resolution of [`VarRef`] nodes in the `WHERE` clause.
+        #[test]
+        fn condition() {
+            let namespace = MockSchemaProvider::default();
+
+            // resolves float field
+            let stmt = parse_select("SELECT usage_idle FROM cpu WHERE usage_user > 0");
+            let stmt = rewrite_select_statement(&namespace, &stmt).unwrap();
+            assert_eq!(
+                stmt.to_string(),
+                "SELECT time::timestamp AS time, usage_idle::float AS usage_idle FROM cpu WHERE usage_user::float > 0"
+            );
+
+            // resolves tag field
+            let stmt = parse_select("SELECT usage_idle FROM cpu WHERE cpu =~ /foo/");
+            let stmt = rewrite_select_statement(&namespace, &stmt).unwrap();
+            assert_eq!(
+                stmt.to_string(),
+                "SELECT time::timestamp AS time, usage_idle::float AS usage_idle FROM cpu WHERE cpu::tag =~ /foo/"
+            );
+
+            // Does not resolve an unknown field
+            let stmt = parse_select("SELECT usage_idle FROM cpu WHERE non_existent = 'bar'");
+            let stmt = rewrite_select_statement(&namespace, &stmt).unwrap();
+            assert_eq!(
+                stmt.to_string(),
+                "SELECT time::timestamp AS time, usage_idle::float AS usage_idle FROM cpu WHERE non_existent = 'bar'"
+            );
+
+            // Handles multiple measurements; `bytes_free` is from the `disk` measurement
+            let stmt =
+                parse_select("SELECT usage_idle, bytes_free FROM cpu, disk WHERE bytes_free = 3");
+            let stmt = rewrite_select_statement(&namespace, &stmt).unwrap();
+            assert_eq!(
+                stmt.to_string(),
+                "SELECT time::timestamp AS time, usage_idle::float AS usage_idle, bytes_free::integer AS bytes_free FROM cpu, disk WHERE bytes_free::integer = 3"
+            );
+
+            // Resolves recursively through subqueries and aliases
+            let stmt = parse_select("SELECT bytes FROM (SELECT bytes_free AS bytes FROM disk WHERE bytes_free = 3) WHERE bytes > 0");
+            let stmt = rewrite_select_statement(&namespace, &stmt).unwrap();
+            assert_eq!(
+                stmt.to_string(),
+                "SELECT time::timestamp AS time, bytes::integer AS bytes FROM (SELECT time::timestamp AS time, bytes_free::integer AS bytes FROM disk WHERE bytes_free::integer = 3) WHERE bytes::integer > 0"
+            );
+        }
+
         #[test]
         fn group_by() {
             let namespace = MockSchemaProvider::default();
@@ -2032,14 +2332,31 @@ mod test {
             let stmt = rewrite_select_statement(&namespace, &stmt).unwrap();
             assert_eq!(
                 stmt.to_string(),
-                "SELECT time::timestamp AS time, usage_idle::float AS usage_idle FROM cpu GROUP BY host"
+                "SELECT time::timestamp AS time, usage_idle::float AS usage_idle FROM cpu GROUP BY host::tag"
+            );
+
+            // resolves tag types from multiple measurements
+            let stmt =
+                parse_select("SELECT usage_idle, bytes_free FROM cpu, disk GROUP BY host, device");
+            let stmt = rewrite_select_statement(&namespace, &stmt).unwrap();
+            assert_eq!(
+                stmt.to_string(),
+                "SELECT time::timestamp AS time, usage_idle::float AS usage_idle, bytes_free::integer AS bytes_free FROM cpu, disk GROUP BY host::tag, device::tag"
+            );
+
+            // does not resolve non-existent tag
+            let stmt = parse_select("SELECT usage_idle FROM cpu GROUP BY host, non_existent");
+            let stmt = rewrite_select_statement(&namespace, &stmt).unwrap();
+            assert_eq!(
+                stmt.to_string(),
+                "SELECT time::timestamp AS time, usage_idle::float AS usage_idle FROM cpu GROUP BY host::tag, non_existent"
             );
 
             let stmt = parse_select("SELECT usage_idle FROM cpu GROUP BY *");
             let stmt = rewrite_select_statement(&namespace, &stmt).unwrap();
             assert_eq!(
                 stmt.to_string(),
-                "SELECT time::timestamp AS time, usage_idle::float AS usage_idle FROM cpu GROUP BY cpu, host, region"
+                "SELECT time::timestamp AS time, usage_idle::float AS usage_idle FROM cpu GROUP BY cpu::tag, host::tag, region::tag"
             );
 
             // Does not include tags in projection when expanded in GROUP BY
@@ -2047,7 +2364,7 @@ mod test {
             let stmt = rewrite_select_statement(&namespace, &stmt).unwrap();
             assert_eq!(
                 stmt.to_string(),
-                "SELECT time::timestamp AS time, usage_idle::float AS usage_idle, usage_system::float AS usage_system, usage_user::float AS usage_user FROM cpu GROUP BY cpu, host, region"
+                "SELECT time::timestamp AS time, usage_idle::float AS usage_idle, usage_system::float AS usage_system, usage_user::float AS usage_user FROM cpu GROUP BY cpu::tag, host::tag, region::tag"
             );
 
             // Does include explicitly listed tags in projection
@@ -2055,7 +2372,27 @@ mod test {
             let stmt = rewrite_select_statement(&namespace, &stmt).unwrap();
             assert_eq!(
                 stmt.to_string(),
-                "SELECT time::timestamp AS time, host::tag AS host, usage_idle::float AS usage_idle, usage_system::float AS usage_system, usage_user::float AS usage_user FROM cpu GROUP BY cpu, host, region"
+                "SELECT time::timestamp AS time, host::tag AS host, usage_idle::float AS usage_idle, usage_system::float AS usage_system, usage_user::float AS usage_user FROM cpu GROUP BY cpu::tag, host::tag, region::tag"
+            );
+
+            //
+            // TIME
+            //
+
+            // Explicitly adds an upper bound for the time-range for aggregate queries
+            let stmt = parse_select("SELECT mean(usage_idle) FROM cpu WHERE time >= '2022-04-09T12:13:14Z' GROUP BY TIME(30s)");
+            let stmt = rewrite_select_statement(&namespace, &stmt).unwrap();
+            assert_eq!(
+                stmt.to_string(),
+                "SELECT time::timestamp AS time, mean(usage_idle::float) AS mean FROM cpu WHERE time >= 1649506394000000000 AND time <= 1672531200000000000 GROUP BY TIME(30s)"
+            );
+
+            // Does not add an upper bound time range if already specified
+            let stmt = parse_select("SELECT mean(usage_idle) FROM cpu WHERE time >= '2022-04-09T12:13:14Z' AND time < '2022-04-10T12:00:00Z' GROUP BY TIME(30s)");
+            let stmt = rewrite_select_statement(&namespace, &stmt).unwrap();
+            assert_eq!(
+                stmt.to_string(),
+                "SELECT time::timestamp AS time, mean(usage_idle::float) AS mean FROM cpu WHERE time >= 1649506394000000000 AND time <= 1649591999999999999 GROUP BY TIME(30s)"
             );
         }
 
@@ -2191,7 +2528,7 @@ mod test {
             let stmt = rewrite_select_statement(&namespace, &stmt).unwrap();
             assert_eq!(
                 stmt.to_string(),
-                "SELECT time::timestamp AS time, cpu::tag AS cpu, usage_system::float AS usage_system FROM (SELECT time::timestamp AS time, usage_system::float AS usage_system FROM cpu GROUP BY cpu)"
+                "SELECT time::timestamp AS time, cpu::tag AS cpu, usage_system::float AS usage_system FROM (SELECT time::timestamp AS time, usage_system::float AS usage_system FROM cpu GROUP BY cpu::tag)"
             );
 
             // Specifically project cpu tag from GROUP BY
@@ -2201,7 +2538,7 @@ mod test {
             let stmt = rewrite_select_statement(&namespace, &stmt).unwrap();
             assert_eq!(
                 stmt.to_string(),
-                "SELECT time::timestamp AS time, cpu::tag AS cpu, usage_system::float AS usage_system FROM (SELECT time::timestamp AS time, usage_system::float AS usage_system FROM cpu GROUP BY cpu)"
+                "SELECT time::timestamp AS time, cpu::tag AS cpu, usage_system::float AS usage_system FROM (SELECT time::timestamp AS time, usage_system::float AS usage_system FROM cpu GROUP BY cpu::tag)"
             );
 
             // Projects cpu tag in outer query separately from aliased cpu tag "foo"
@@ -2211,7 +2548,7 @@ mod test {
             let stmt = rewrite_select_statement(&namespace, &stmt).unwrap();
             assert_eq!(
                 stmt.to_string(),
-                "SELECT time::timestamp AS time, cpu::tag AS cpu, foo::tag AS foo, usage_system::float AS usage_system FROM (SELECT time::timestamp AS time, cpu::tag AS foo, usage_system::float AS usage_system FROM cpu GROUP BY cpu)"
+                "SELECT time::timestamp AS time, cpu::tag AS cpu, foo::tag AS foo, usage_system::float AS usage_system FROM (SELECT time::timestamp AS time, cpu::tag AS foo, usage_system::float AS usage_system FROM cpu GROUP BY cpu::tag)"
             );
 
             // Projects non-existent foo as a tag in the outer query
@@ -2221,7 +2558,7 @@ mod test {
             let stmt = rewrite_select_statement(&namespace, &stmt).unwrap();
             assert_eq!(
                 stmt.to_string(),
-                "SELECT time::timestamp AS time, foo::tag AS foo, usage_idle::float AS usage_idle FROM (SELECT time::timestamp AS time, usage_idle::float AS usage_idle FROM cpu GROUP BY foo) GROUP BY cpu"
+                "SELECT time::timestamp AS time, foo::tag AS foo, usage_idle::float AS usage_idle FROM (SELECT time::timestamp AS time, usage_idle::float AS usage_idle FROM cpu GROUP BY foo) GROUP BY cpu::tag"
             );
             // Normalises time to all leaf subqueries
             let stmt = parse_select(
@@ -2230,7 +2567,7 @@ mod test {
             let stmt = rewrite_select_statement(&namespace, &stmt).unwrap();
             assert_eq!(
                 stmt.to_string(),
-                "SELECT time::timestamp AS time, max::float AS max FROM (SELECT time::timestamp AS time, max(value::float) AS max FROM (SELECT time::timestamp AS time, distinct(usage_idle::float) AS value FROM cpu FILL(NONE)) FILL(NONE)) GROUP BY cpu"
+                "SELECT time::timestamp AS time, max::float AS max FROM (SELECT time::timestamp AS time, max(value::float) AS max FROM (SELECT time::timestamp AS time, distinct(usage_idle::float) AS value FROM cpu FILL(NONE)) FILL(NONE)) GROUP BY cpu::tag"
             );
 
             // Projects non-existent tag, "bytes_free" from cpu and also bytes_free field from disk
@@ -2268,7 +2605,7 @@ mod test {
             let stmt = rewrite_select_statement(&namespace, &stmt).unwrap();
             assert_eq!(
                 stmt.to_string(),
-                "SELECT time::timestamp AS time, bytes_free::integer AS bytes_free, bytes_free::tag AS bytes_free_1, usage_idle::float AS usage_idle FROM (SELECT time::timestamp AS time, usage_idle::float AS usage_idle FROM cpu GROUP BY bytes_free), (SELECT time::timestamp AS time, bytes_free::integer AS bytes_free FROM disk) GROUP BY cpu"
+                "SELECT time::timestamp AS time, bytes_free::integer AS bytes_free, bytes_free::tag AS bytes_free_1, usage_idle::float AS usage_idle FROM (SELECT time::timestamp AS time, usage_idle::float AS usage_idle FROM cpu GROUP BY bytes_free), (SELECT time::timestamp AS time, bytes_free::integer AS bytes_free FROM disk) GROUP BY cpu::tag"
             );
         }
 
@@ -2318,7 +2655,18 @@ mod test {
         /// Projections which contain function calls
         #[test]
         fn projection_call_expr() {
-            let namespace = MockSchemaProvider::default();
+            let mut namespace = MockSchemaProvider::default();
+            // Add a schema with tags that could conflict with aliasing against an
+            // existing call expression, in this case "last"
+            namespace.add_schema(
+                SchemaBuilder::new()
+                    .measurement("conflicts")
+                    .timestamp()
+                    .tag("last")
+                    .influx_field("field_f64", InfluxFieldType::Float)
+                    .build()
+                    .unwrap(),
+            );
 
             let stmt = parse_select("SELECT COUNT(field_i64) FROM temp_01");
             let stmt = rewrite_select_statement(&namespace, &stmt).unwrap();
@@ -2364,6 +2712,14 @@ mod test {
             assert_eq!(
                 stmt.to_string(),
                 "SELECT time::timestamp AS time, sum(field_f64::float) AS sum_field_f64, sum(field_i64::integer) AS sum_field_i64, sum(field_u64::unsigned) AS sum_field_u64, sum(shared_field0::float) AS sum_shared_field0 FROM temp_01"
+            );
+
+            // Handles conflicts when call expression is renamed to match an existing tag
+            let stmt = parse_select("SELECT LAST(field_f64), last FROM conflicts");
+            let stmt = rewrite_select_statement(&namespace, &stmt).unwrap();
+            assert_eq!(
+                stmt.to_string(),
+                "SELECT time::timestamp AS time, last(field_f64::float) AS last, last::tag AS last_1 FROM conflicts"
             );
         }
     }

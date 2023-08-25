@@ -3,6 +3,7 @@ use std::{collections::HashSet, sync::Arc};
 use datafusion::{
     common::tree_node::{RewriteRecursion, Transformed, TreeNode, TreeNodeRewriter},
     config::ConfigOptions,
+    datasource::physical_plan::ParquetExec,
     error::{DataFusionError, Result},
     logical_expr::Operator,
     physical_expr::{split_conjunction, utils::collect_columns},
@@ -10,7 +11,6 @@ use datafusion::{
     physical_plan::{
         empty::EmptyExec,
         expressions::{BinaryExpr, Column},
-        file_format::ParquetExec,
         filter::FilterExec,
         union::UnionExec,
         ExecutionPlan, PhysicalExpr,
@@ -165,11 +165,11 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::{
         datasource::object_store::ObjectStoreUrl,
+        datasource::physical_plan::FileScanConfig,
         logical_expr::Operator,
         physical_expr::PhysicalSortExpr,
         physical_plan::{
             expressions::{BinaryExpr, Column, Literal},
-            file_format::FileScanConfig,
             PhysicalExpr, Statistics,
         },
         scalar::ScalarValue,
@@ -190,7 +190,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = PredicatePushdown::default();
+        let opt = PredicatePushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -215,7 +215,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = PredicatePushdown::default();
+        let opt = PredicatePushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -245,7 +245,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = PredicatePushdown::default();
+        let opt = PredicatePushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -280,7 +280,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = PredicatePushdown::default();
+        let opt = PredicatePushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -314,7 +314,7 @@ mod tests {
             projection: None,
             limit: None,
             table_partition_cols: vec![],
-            output_ordering: None,
+            output_ordering: vec![vec![]],
             infinite_source: false,
         };
         let plan = Arc::new(
@@ -328,7 +328,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = PredicatePushdown::default();
+        let opt = PredicatePushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -358,7 +358,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = PredicatePushdown::default();
+        let opt = PredicatePushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -390,7 +390,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = PredicatePushdown::default();
+        let opt = PredicatePushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -429,7 +429,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = PredicatePushdown::default();
+        let opt = PredicatePushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"

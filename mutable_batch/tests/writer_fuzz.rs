@@ -14,7 +14,10 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use arrow_util::bitset::BitSet;
-use data_types::{IsNan, PartitionTemplate, StatValues, Statistics, TemplatePart};
+use data_types::{
+    partition_template::{test_table_partition_override, TemplatePart},
+    IsNan, StatValues, Statistics,
+};
 use hashbrown::HashSet;
 use mutable_batch::{writer::Writer, MutableBatch, PartitionWrite, WritePayload};
 use rand::prelude::*;
@@ -22,7 +25,7 @@ use schema::Projection;
 use std::{collections::BTreeMap, num::NonZeroU64, ops::Range, sync::Arc};
 
 fn make_rng() -> StdRng {
-    let seed = rand::rngs::OsRng::default().next_u64();
+    let seed = rand::rngs::OsRng.next_u64();
     println!("Seed: {seed}");
     StdRng::seed_from_u64(seed)
 }
@@ -432,12 +435,10 @@ fn test_partition_write() {
         assert_eq!(write.rows().get() as u64, stats.total_count);
     };
 
-    let partitioned = PartitionWrite::partition(
-        &batch,
-        &PartitionTemplate {
-            parts: vec![TemplatePart::Column("b1".to_string())],
-        },
-    );
+    let table_partition_template =
+        test_table_partition_override(vec![TemplatePart::TagValue("t1")]);
+
+    let partitioned = PartitionWrite::partition(&batch, &table_partition_template).unwrap();
 
     for (_, write) in &partitioned {
         verify_write(write);

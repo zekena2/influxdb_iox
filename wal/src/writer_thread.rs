@@ -122,8 +122,12 @@ impl WriterIoThread {
                 .ops
                 .into_iter()
                 .map(|v| {
-                    let id = SequenceNumber::new(v.sequence_number as _);
-                    (proto::SequencedWalOp::from(v), id)
+                    let op_ids: SequenceNumberSet = v
+                        .table_write_sequence_numbers
+                        .values()
+                        .map(|&id| SequenceNumber::new(id as _))
+                        .collect();
+                    (proto::SequencedWalOp::from(v), op_ids)
                 })
                 .unzip();
             let proto_batch = proto::WalOpBatch { ops };

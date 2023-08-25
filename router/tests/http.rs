@@ -110,9 +110,10 @@ async fn test_write_outside_retention_period() {
         &response,
         router::server::http::Error::DmlHandler(
             DmlError::Retention(
-                RetentionError::OutsideRetention(e))
+                RetentionError::OutsideRetention{table_name, min_acceptable_ts, observed_ts})
         ) => {
-            assert_eq!(e, "apple");
+            assert_eq!(table_name, "apple");
+            assert!(observed_ts < min_acceptable_ts);
         }
     );
     assert_eq!(response.as_status_code(), StatusCode::FORBIDDEN);
@@ -277,7 +278,7 @@ async fn test_write_propagate_ids() {
                     .repositories()
                     .await
                     .tables()
-                    .create_or_get(t, ns.id)
+                    .create(t, Default::default(), ns.id)
                     .await
                     .unwrap();
                 (*t, table.id)
@@ -347,6 +348,8 @@ async fn test_delete_unsupported() {
         .namespaces()
         .create(
             &data_types::NamespaceName::new("bananas_test").unwrap(),
+            None,
+            None,
             None,
         )
         .await

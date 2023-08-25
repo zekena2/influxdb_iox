@@ -9,7 +9,16 @@ use std::{
 ///
 /// Can be used to represent in-RAM memory as well as on-disc memory.
 pub trait Resource:
-    Add<Output = Self> + Copy + Debug + Into<u64> + PartialOrd + Send + Sub<Output = Self> + 'static
+    Add<Output = Self>
+    + Copy
+    + Debug
+    + Into<u64>
+    + Ord
+    + PartialOrd
+    + Send
+    + Sync
+    + Sub<Output = Self>
+    + 'static
 {
     /// Create resource consumption of zero.
     fn zero() -> Self;
@@ -97,7 +106,7 @@ where
     pub fn new(f: F) -> Self {
         Self {
             estimator: f,
-            _phantom: PhantomData::default(),
+            _phantom: PhantomData,
         }
     }
 }

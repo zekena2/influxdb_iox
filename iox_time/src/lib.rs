@@ -4,10 +4,15 @@
     clippy::explicit_iter_loop,
     clippy::use_self,
     clippy::clone_on_ref_ptr,
+    // See https://github.com/influxdata/influxdb_iox/pull/1671
     clippy::future_not_send,
     clippy::todo,
-    clippy::dbg_macro
+    clippy::dbg_macro,
+    unused_crate_dependencies
 )]
+
+// Workaround for "unused crate" lint false positives.
+use workspace_hack as _;
 
 use chrono::{DateTime, TimeZone, Timelike, Utc};
 use parking_lot::{lock_api::RwLockUpgradableReadGuard, RwLock};
@@ -44,22 +49,6 @@ impl Sub<Duration> for Time {
     fn sub(self, rhs: Duration) -> Self::Output {
         let duration = chrono::Duration::from_std(rhs).unwrap();
         Self(self.0 - duration)
-    }
-}
-
-impl Sub<Self> for Time {
-    type Output = Duration;
-
-    /// Calculates difference in wall-clock time
-    ///
-    /// **Warning: Because monotonicity is not guaranteed, `t2 - t1` might be negative
-    /// even when `t2` was generated after `t1!**
-    ///
-    /// # Panic
-    ///
-    /// Panics if the result would be negative
-    fn sub(self, rhs: Self) -> Self::Output {
-        (self.0 - rhs.0).to_std().unwrap()
     }
 }
 
@@ -253,7 +242,7 @@ struct MockProviderInner {
 }
 
 /// A [`TimeProvider`] that returns a fixed `Time` that can be set by [`MockProvider::set`]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MockProvider {
     inner: Arc<RwLock<MockProviderInner>>,
 }
@@ -354,7 +343,7 @@ mod test {
         let b = provider.now();
         let c = provider.now();
 
-        let delta = b - a;
+        let delta = b.checked_duration_since(a).unwrap();
         assert!(delta > Duration::from_millis(500));
         assert!(delta < Duration::from_secs(5));
         assert!(b <= c);
@@ -368,7 +357,7 @@ mod test {
         provider.sleep(Duration::from_secs(1)).await;
         let b = provider.now();
 
-        let delta = b - a;
+        let delta = b.checked_duration_since(a).unwrap();
         assert!(delta > Duration::from_millis(500));
         assert!(delta < Duration::from_secs(5));
     }
@@ -381,7 +370,7 @@ mod test {
         provider.sleep_until(a + Duration::from_secs(1)).await;
         let b = provider.now();
 
-        let delta = b - a;
+        let delta = b.checked_duration_since(a).unwrap();
         assert!(delta > Duration::from_millis(500));
         assert!(delta < Duration::from_secs(5));
     }

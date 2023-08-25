@@ -86,7 +86,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
       # Disable full debug symbol generation to speed up CI build
       # "1" means line tables only, which is useful for panic tracebacks.
-      RUSTFLAGS: "-C debuginfo=1"
+      CARGO_PROFILE_DEV_DEBUG: "1"
       # https://github.com/rust-lang/cargo/issues/10280
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
@@ -103,7 +103,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
       # Disable full debug symbol generation to speed up CI build
       # "1" means line tables only, which is useful for panic tracebacks.
-      RUSTFLAGS: "-C debuginfo=1"
+      CARGO_PROFILE_DEV_DEBUG: "1"
       # https://github.com/rust-lang/cargo/issues/10280
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
@@ -118,6 +118,9 @@ jobs:
       - run:
           name: Yamllint
           command: yamllint --config-file .circleci/yamllint.yml --strict .
+      - run:
+          name: migrations check
+          command: iox_catalog/check_linear_migrations.sh migrations
   cargo_audit:
     docker:
       - image: quay.io/influxdb/rust:ci
@@ -126,7 +129,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
       # Disable full debug symbol generation to speed up CI build
       # "1" means line tables only, which is useful for panic tracebacks.
-      RUSTFLAGS: "-C debuginfo=1"
+      CARGO_PROFILE_DEV_DEBUG: "1"
       # https://github.com/rust-lang/cargo/issues/10280
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
@@ -147,7 +150,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
       # Disable full debug symbol generation to speed up CI build
       # "1" means line tables only, which is useful for panic tracebacks.
-      RUSTFLAGS: "-C debuginfo=1"
+      CARGO_PROFILE_DEV_DEBUG: "1"
       # https://github.com/rust-lang/cargo/issues/10280
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
       # Turn warnings into errors
@@ -207,13 +210,17 @@ jobs:
       - image: postgres
         environment:
           POSTGRES_HOST_AUTH_METHOD: trust
+        command:
+          - "postgres"
+          - "-c"
+          - "max_connections=200"
     resource_class: xlarge # use of a smaller executor tends crashes on link
     environment:
       # Disable incremental compilation to avoid overhead. We are not preserving these files anyway.
       CARGO_INCREMENTAL: "0"
       # Disable full debug symbol generation to speed up CI build
       # "1" means line tables only, which is useful for panic tracebacks.
-      RUSTFLAGS: "-C debuginfo=1"
+      CARGO_PROFILE_DEV_DEBUG: "1"
       # https://github.com/rust-lang/cargo/issues/10280
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
       RUST_BACKTRACE: "1"
@@ -229,11 +236,6 @@ jobs:
       TEST_INFLUXDB_JDBC: "true"
     steps:
       - checkout
-      - run:
-          name: Install javac
-          command: |
-            sudo apt-get update
-            sudo apt-get install openjdk-11-jdk -y
       - rust_components
       - run:
           name: Download flight-sql-jdbc-driver-10.0.0.jar
@@ -258,7 +260,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
       # Disable full debug symbol generation to speed up CI build
       # "1" means line tables only, which is useful for panic tracebacks.
-      RUSTFLAGS: "-C debuginfo=1"
+      CARGO_PROFILE_DEV_DEBUG: "1"
       # https://github.com/rust-lang/cargo/issues/10280
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
       RUST_BACKTRACE: "1"
@@ -280,7 +282,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
       # Disable full debug symbol generation to speed up CI build
       # "1" means line tables only, which is useful for panic tracebacks.
-      RUSTFLAGS: "-C debuginfo=1"
+      CARGO_PROFILE_DEV_DEBUG: "1"
       # https://github.com/rust-lang/cargo/issues/10280
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
       RUST_BACKTRACE: "1"
@@ -302,10 +304,9 @@ jobs:
     environment:
       # Disable incremental compilation to avoid overhead. We are not preserving these files anyway.
       CARGO_INCREMENTAL: "0"
-      # - Disable full debug symbol generation to speed up CI build
-      #   "1" means line tables only, which is useful for panic tracebacks.
-      # - Enable tokio-console
-      RUSTFLAGS: "-C debuginfo=1 --cfg tokio_unstable"
+      # Disable full debug symbol generation to speed up CI build
+      # "1" means line tables only, which is useful for panic tracebacks.
+      CARGO_PROFILE_DEV_DEBUG: "1"
       # https://github.com/rust-lang/cargo/issues/10280
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
       # The `2xlarge` resource class that we use has 32GB RAM but also 16 CPUs. This means we have 2GB RAM per core on
@@ -382,13 +383,6 @@ jobs:
     machine:
       image: ubuntu-2004:2022.04.2
     resource_class: 2xlarge # CPU bound, so make it fast
-    environment:
-      # Disable incremental compilation to avoid overhead. We are not preserving these files anyway.
-      CARGO_INCREMENTAL: "0"
-      # Enable tokio-console
-      RUSTFLAGS: "--cfg tokio_unstable"
-      # https://github.com/rust-lang/cargo/issues/10280
-      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
       - checkout
       - run:
@@ -396,23 +390,15 @@ jobs:
           command: |
             COMMIT_SHA="$(git rev-parse HEAD)"
 
-            RUST_VERSION="$(sed -E -ne 's/channel = "(.*)"/\1/p' rust-toolchain.toml)"
+            .circleci/docker_build_release.bash \
+              "influxdb_iox" \
+              "aws,gcp,azure,jemalloc_replacing_malloc,tokio_console,pprof" \
+              "quay.io/influxdb/iox:$COMMIT_SHA"
 
-            docker buildx build \
-              --build-arg FEATURES="aws,gcp,azure,jemalloc_replacing_malloc,tokio_console,pprof" \
-              --build-arg RUST_VERSION="$RUST_VERSION" \
-              --build-arg RUSTFLAGS="$RUSTFLAGS" \
-              --progress plain \
-              --tag quay.io/influxdb/iox:"$COMMIT_SHA" \
-              .
-            docker buildx build \
-              --build-arg FEATURES="" \
-              --build-arg PACKAGE="iox_data_generator" \
-              --build-arg RUST_VERSION="$RUST_VERSION" \
-              --build-arg RUSTFLAGS="$RUSTFLAGS" \
-              --progress plain \
-              --tag quay.io/influxdb/iox_data_generator:"$COMMIT_SHA" \
-              .
+            .circleci/docker_build_release.bash \
+              "iox_data_generator" \
+              "" \
+              "quay.io/influxdb/iox_data_generator:$COMMIT_SHA"
 
             docker run -it --rm quay.io/influxdb/iox:$COMMIT_SHA debug print-cpu
 
@@ -458,10 +444,26 @@ jobs:
             tags=( "$COMMIT_SHA" "$BRANCH" )
 
             for image in "${images[@]}"; do
+              echo "Image: $image"
+              oci_path="oci-archive:///tmp/images/$image.oci.tar"
+
+              # convert the gzipped docker image into OCI
+              gzip -d "/tmp/images/$image.tar.gz"
+              skopeo copy --format oci --quiet "docker-archive:///tmp/images/$image.tar" "$oci_path"
+
               for registry in "${registries[@]}"; do
+                echo "  Registry: $registry"
+
+                # upload all tags
+                # Note: Uploading the 2nd tag for the same image (to the same registry) is very cheap since all layers
+                #       exist already (from the previous tag).
                 for tag in "${tags[@]}"; do
-                  echo "Upload: image=$image registry=$registry tag=$tag"
-                  skopeo copy "docker-archive:///tmp/images/$image.tar.gz" "docker://$registry/$image:$tag" --quiet
+                  echo "    Upload: tag=$tag"
+                  docker_url="docker://$registry/$image:$tag"
+                  skopeo copy --quiet "$oci_path" "$docker_url"
+
+                  # print out digest AFTER upload, see https://github.com/containers/skopeo/issues/469
+                  echo "      Digest: $(skopeo inspect "$docker_url" | jq ".Digest")"
                 done
               done
             done

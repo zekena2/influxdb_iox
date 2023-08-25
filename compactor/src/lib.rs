@@ -195,13 +195,18 @@
     missing_copy_implementations,
     missing_docs,
     clippy::explicit_iter_loop,
+    // See https://github.com/influxdata/influxdb_iox/pull/1671
     clippy::future_not_send,
     clippy::use_self,
     clippy::clone_on_ref_ptr,
     clippy::todo,
-    clippy::dbg_macro
+    clippy::dbg_macro,
+    unused_crate_dependencies
 )]
 #![allow(rustdoc::private_intra_doc_links)]
+
+// Workaround for "unused crate" lint false positives.
+use workspace_hack as _;
 
 pub mod compactor;
 mod components;
@@ -216,12 +221,8 @@ mod round_info;
 
 // publically expose items needed for testing
 pub use components::{
-    commit::{Commit, CommitWrapper},
-    df_planner::panic::PanicDataFusionPlanner,
-    hardcoded::hardcoded_components,
-    namespaces_source::mock::NamespaceWrapper,
-    parquet_files_sink::ParquetFilesSink,
-    Components,
+    df_planner::panic::PanicDataFusionPlanner, hardcoded::hardcoded_components,
+    namespaces_source::mock::NamespaceWrapper, parquet_files_sink::ParquetFilesSink, Components,
 };
 pub use driver::compact;
 pub use error::DynError;

@@ -5,6 +5,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use iox_time::{MockProvider, Time};
 use parking_lot::Mutex;
 use rand::rngs::mock::StepRng;
+use test_helpers::maybe_start_logging;
 use tokio::{runtime::Handle, sync::Notify};
 
 use crate::{
@@ -12,15 +13,13 @@ use crate::{
         policy::refresh::test_util::{backoff_cfg, NotifyExt},
         CacheBackend,
     },
+    loader::test_util::TestLoader,
     resource_consumption::{test_util::TestSize, ResourceEstimator},
 };
 
 use super::{
     lru::{LruPolicy, ResourcePool},
-    refresh::{
-        test_util::{TestLoader, TestRefreshDurationProvider},
-        RefreshPolicy,
-    },
+    refresh::{test_util::TestRefreshDurationProvider, RefreshPolicy},
     remove_if::{RemoveIfHandle, RemoveIfPolicy},
     ttl::{test_util::TestTtlProvider, TtlPolicy},
     PolicyBackend,
@@ -118,6 +117,7 @@ async fn test_refresh_does_not_update_lru_time() {
         time_provider,
         loader,
         notify_idle,
+        pool,
         ..
     } = TestStateLruAndRefresh::new();
 
@@ -137,12 +137,14 @@ async fn test_refresh_does_not_update_lru_time() {
 
     let barrier = loader.block_next(1, String::from("foo"));
     backend.set(1, String::from("a"));
+    pool.wait_converged().await;
 
     // trigger refresh
     time_provider.inc(Duration::from_secs(1));
 
     time_provider.inc(Duration::from_secs(1));
     backend.set(2, String::from("b"));
+    pool.wait_converged().await;
 
     time_provider.inc(Duration::from_secs(1));
 
@@ -152,6 +154,7 @@ async fn test_refresh_does_not_update_lru_time() {
 
     // add a third item to the cache, forcing LRU to evict one of the items
     backend.set(3, String::from("c"));
+    pool.wait_converged().await;
 
     // Should evict `1` even though it was refreshed after `2` was added
     assert_eq!(backend.get(&1), None);
@@ -194,6 +197,8 @@ async fn test_if_refresh_to_slow_then_expire() {
 
 #[tokio::test]
 async fn test_refresh_can_trigger_lru_eviction() {
+    maybe_start_logging();
+
     let TestStateLRUAndRefresh {
         mut backend,
         refresh_duration_provider,
@@ -226,13 +231,16 @@ async fn test_refresh_can_trigger_lru_eviction() {
     backend.set(1, String::from("a"));
     backend.set(2, String::from("c"));
     backend.set(3, String::from("d"));
-    assert_eq!(backend.get(&1), Some(String::from("a")));
+    pool.wait_converged().await;
     assert_eq!(backend.get(&2), Some(String::from("c")));
     assert_eq!(backend.get(&3), Some(String::from("d")));
+    time_provider.inc(Duration::from_millis(1));
+    assert_eq!(backend.get(&1), Some(String::from("a")));
 
     // refresh
-    time_provider.inc(Duration::from_secs(1));
+    time_provider.inc(Duration::from_secs(10));
     notify_idle.notified_with_timeout().await;
+    pool.wait_converged().await;
 
     // needed to evict 2->"c"
     assert_eq!(backend.get(&1), Some(String::from("b")));
@@ -287,6 +295,7 @@ async fn test_remove_if_check_does_not_extend_lifetime() {
         size_estimator,
         time_provider,
         remove_if_handle,
+        pool,
         ..
     } = TestStateLruAndRemoveIf::new().await;
 
@@ -295,15 +304,18 @@ async fn test_remove_if_check_does_not_extend_lifetime() {
     size_estimator.mock_size(3, String::from("c"), TestSize(4));
 
     backend.set(1, String::from("a"));
+    pool.wait_converged().await;
     time_provider.inc(Duration::from_secs(1));
 
     backend.set(2, String::from("b"));
+    pool.wait_converged().await;
     time_provider.inc(Duration::from_secs(1));
 
     // Checking remove_if should not count as a "use" of 1
     // for the "least recently used" calculation
     remove_if_handle.remove_if(&1, |_| false);
     backend.set(3, String::from("c"));
+    pool.wait_converged().await;
 
     // adding "c" totals 12 size, but backend has room for only 10
     // so "least recently used" (in this case 1, not 2) should be removed
@@ -317,7 +329,7 @@ struct TestStateTtlAndRefresh {
     ttl_provider: Arc<TestTtlProvider>,
     refresh_duration_provider: Arc<TestRefreshDurationProvider>,
     time_provider: Arc<MockProvider>,
-    loader: Arc<TestLoader>,
+    loader: Arc<TestLoader<u8, (), String>>,
     notify_idle: Arc<Notify>,
 }
 
@@ -367,7 +379,7 @@ struct TestStateLRUAndRefresh {
     size_estimator: Arc<TestSizeEstimator>,
     refresh_duration_provider: Arc<TestRefreshDurationProvider>,
     time_provider: Arc<MockProvider>,
-    loader: Arc<TestLoader>,
+    loader: Arc<TestLoader<u8, (), String>>,
     pool: Arc<ResourcePool<TestSize>>,
     notify_idle: Arc<Notify>,
 }
@@ -399,6 +411,7 @@ impl TestStateLRUAndRefresh {
             "my_pool",
             TestSize(10),
             Arc::clone(&metric_registry),
+            &Handle::current(),
         ));
         backend.add_policy(LruPolicy::new(
             Arc::clone(&pool),
@@ -444,6 +457,7 @@ impl TestStateTtlAndLRU {
             "my_pool",
             TestSize(10),
             Arc::clone(&metric_registry),
+            &Handle::current(),
         ));
         backend.add_policy(LruPolicy::new(
             Arc::clone(&pool),
@@ -467,6 +481,7 @@ struct TestStateLruAndRemoveIf {
     time_provider: Arc<MockProvider>,
     size_estimator: Arc<TestSizeEstimator>,
     remove_if_handle: RemoveIfHandle<u8, String>,
+    pool: Arc<ResourcePool<TestSize>>,
 }
 
 impl TestStateLruAndRemoveIf {
@@ -481,6 +496,7 @@ impl TestStateLruAndRemoveIf {
             "my_pool",
             TestSize(10),
             Arc::clone(&metric_registry),
+            &Handle::current(),
         ));
         backend.add_policy(LruPolicy::new(
             Arc::clone(&pool),
@@ -497,6 +513,7 @@ impl TestStateLruAndRemoveIf {
             time_provider,
             size_estimator,
             remove_if_handle,
+            pool,
         }
     }
 }
@@ -507,8 +524,9 @@ struct TestStateLruAndRefresh {
     size_estimator: Arc<TestSizeEstimator>,
     refresh_duration_provider: Arc<TestRefreshDurationProvider>,
     time_provider: Arc<MockProvider>,
-    loader: Arc<TestLoader>,
+    loader: Arc<TestLoader<u8, (), String>>,
     notify_idle: Arc<Notify>,
+    pool: Arc<ResourcePool<TestSize>>,
 }
 
 impl TestStateLruAndRefresh {
@@ -539,6 +557,7 @@ impl TestStateLruAndRefresh {
             "my_pool",
             TestSize(10),
             Arc::clone(&metric_registry),
+            &Handle::current(),
         ));
         backend.add_policy(LruPolicy::new(
             Arc::clone(&pool),
@@ -553,6 +572,7 @@ impl TestStateLruAndRefresh {
             time_provider,
             loader,
             notify_idle,
+            pool,
         }
     }
 }

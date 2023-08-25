@@ -9,6 +9,7 @@ members = [
     "client_util",
     "compactor_test_utils",
     "compactor",
+    "compactor_scheduler",
     "data_types",
     "datafusion_util",
     "dml",
@@ -16,6 +17,7 @@ members = [
     "flightsql",
     "garbage_collector",
     "generated_types",
+    "gossip",
     "grpc-binary-logger-proto",
     "grpc-binary-logger-test-proto",
     "grpc-binary-logger",
@@ -28,9 +30,9 @@ members = [
     "influxdb_tsm",
     "influxdb2_client",
     "influxrpc_parser",
+    "ingester_query_grpc",
     "ingester_test_ctx",
     "ingester",
-    "ingester_query_grpc",
     "iox_catalog",
     "iox_data_generator",
     "iox_query_influxql",
@@ -69,18 +71,20 @@ members = [
     "service_grpc_namespace",
     "service_grpc_object_store",
     "service_grpc_schema",
+    "service_grpc_table",
     "service_grpc_testing",
     "sharder",
     "sqlx-hotswap-pool",
     "test_helpers_end_to_end",
     "test_helpers",
+    "tokio_metrics_bridge",
     "trace_exporters",
     "trace_http",
     "trace",
     "tracker",
     "trogging",
-    "wal",
     "wal_inspect",
+    "wal",
     "workspace-hack",
 ]
 default-members = ["influxdb_iox"]
@@ -115,12 +119,14 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-arrow = { version = "39.0.0" }
-arrow-flight = { version = "39.0.0" }
-datafusion = { git = "https://github.com/apache/arrow-datafusion.git", rev="19b03240920ad63cac916b42951754c0337bdac8", default-features = false }
-datafusion-proto = { git = "https://github.com/apache/arrow-datafusion.git", rev="19b03240920ad63cac916b42951754c0337bdac8" }
-hashbrown = { version = "0.13.2" }
-parquet = { version = "39.0.0" }
+arrow = { version = "45.0.0" }
+arrow-flight = { version = "45.0.0" }
+datafusion = { git = "https://github.com/apache/arrow-datafusion.git", rev = "f2c0100a5a10bf3ea166a1a590d94b8c9b6cf673", default-features = false }
+datafusion-proto = { git = "https://github.com/apache/arrow-datafusion.git", rev = "f2c0100a5a10bf3ea166a1a590d94b8c9b6cf673" }
+
+hashbrown = { version = "0.14.0" }
+object_store = { version = "0.6.0" }
+parquet = { version = "45.0.0" }
 tonic = { version = "0.9.2", features = ["tls", "tls-webpki-roots"] }
 tonic-build = { version = "0.9.2" }
 tonic-health = { version = "0.9.2" }

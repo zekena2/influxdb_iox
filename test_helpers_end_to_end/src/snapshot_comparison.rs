@@ -59,11 +59,11 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Match the parquet directory names
 /// For example, given
-/// `51/216/13452/1d325760-2b20-48de-ab48-2267b034133d.parquet`
+/// `51/216/1a3f45021a3f45021a3f45021a3f45021a3f45021a3f45021a3f45021a3f4502/1d325760-2b20-48de-ab48-2267b034133d.parquet`
 ///
-/// matches `51/216/13452`
+/// matches `51/216/1a3f45021a3f45021a3f45021a3f45021a3f45021a3f45021a3f45021a3f4502`
 pub static REGEX_DIRS: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"([0-9])+/([0-9])+/([0-9])+"#).expect("directory regex"));
+    Lazy::new(|| Regex::new(r#"([0-9]+)/([0-9]+)/([0-9a-f]{64})"#).expect("directory regex"));
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Language {
@@ -114,15 +114,10 @@ impl Language {
                             .to_string()
                         });
 
-                        let s = REGEX_DIRS.replace_all(&s, |c: &Captures<'_>| {
-                            // this ensures 15/232/5 is replaced with a string of the same width
-                            //              11/111/1
-                            [
-                                "1".repeat(c.get(1).unwrap().range().len()),
-                                "1".repeat(c.get(2).unwrap().range().len()),
-                                "1".repeat(c.get(3).unwrap().range().len()),
-                            ]
-                            .join("/")
+                        let s = REGEX_DIRS.replace_all(&s, |_c: &Captures<'_>| {
+                            // this ensures 15/232/5 is replaced with a string of a known width
+                            //              1/1/1
+                            ["1", "1", "1"].join("/")
                         });
 
                         // Need to remove trailing spaces when using no_borders
@@ -306,6 +301,7 @@ async fn run_query(cluster: &MiniCluster, query: &Query) -> Result<Vec<String>> 
                 cluster.namespace(),
                 cluster.querier().querier_grpc_connection(),
                 None,
+                true,
             )
             .await
         }
@@ -330,7 +326,7 @@ async fn run_query(cluster: &MiniCluster, query: &Query) -> Result<Vec<String>> 
         {
             return Ok(status.message().lines().map(str::to_string).collect())
         }
-        Err(e) => panic!("error running query: {e}"),
+        Err(e) => panic!("error running query '{query_text}': {e}"),
     };
 
     Ok(query.normalize_results(batches, language))

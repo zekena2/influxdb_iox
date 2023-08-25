@@ -2,9 +2,11 @@
 
 use async_trait::async_trait;
 use data_types::{
+    partition_template::{NamespacePartitionTemplateOverride, TablePartitionTemplateOverride},
     Column, ColumnType, ColumnsByName, CompactionLevel, Namespace, NamespaceId, NamespaceName,
-    NamespaceSchema, ParquetFile, ParquetFileId, ParquetFileParams, Partition, PartitionId,
-    PartitionKey, SkippedCompaction, Table, TableId, TableSchema, Timestamp,
+    NamespaceSchema, NamespaceServiceProtectionLimitsOverride, ParquetFile, ParquetFileId,
+    ParquetFileParams, Partition, PartitionHashId, PartitionId, PartitionKey, SkippedCompaction,
+    SortedColumnSet, Table, TableId, TableSchema, Timestamp, TransitionPartitionId,
 };
 use iox_time::TimeProvider;
 use snafu::{OptionExt, Snafu};
@@ -15,9 +17,10 @@ use std::{
 };
 use uuid::Uuid;
 
-/// Maximum number of files deleted by [`ParquetFileRepo::delete_old_ids_only`] and
-/// [`ParquetFileRepo::flag_for_delete_by_retention`] at a time.
-pub const MAX_PARQUET_FILES_SELECTED_ONCE: i64 = 1_000;
+/// Maximum number of files touched by [`ParquetFileRepo::flag_for_delete_by_retention`] at a time.
+pub const MAX_PARQUET_FILES_SELECTED_ONCE_FOR_RETENTION: i64 = 1_000;
+/// Maximum number of files touched by [`ParquetFileRepo::delete_old_ids_only`] at a time.
+pub const MAX_PARQUET_FILES_SELECTED_ONCE_FOR_DELETE: i64 = 10_000;
 
 /// An error wrapper detailing the reason for a compare-and-swap failure.
 #[derive(Debug)]
@@ -40,6 +43,12 @@ pub enum Error {
 
     #[snafu(display("name {} already exists", name))]
     NameExists { name: String },
+
+    #[snafu(display("A table named {name} already exists in namespace {namespace_id}"))]
+    TableNameExists {
+        name: String,
+        namespace_id: NamespaceId,
+    },
 
     #[snafu(display("unhandled sqlx error: {}", source))]
     SqlxError { source: sqlx::Error },
@@ -71,7 +80,7 @@ pub enum Error {
     TableNotFound { id: TableId },
 
     #[snafu(display("partition {} not found", id))]
-    PartitionNotFound { id: PartitionId },
+    PartitionNotFound { id: TransitionPartitionId },
 
     #[snafu(display(
         "couldn't create column {} in table {}; limit reached on namespace",
@@ -200,7 +209,8 @@ pub trait Catalog: Send + Sync + Debug + Display {
     /// Accesses the repositories without a transaction scope.
     async fn repositories(&self) -> Box<dyn RepoCollection>;
 
-    /// Gets metric registry associated with this catalog.
+    /// Gets metric registry associated with this catalog for testing purposes.
+    #[cfg(test)]
     fn metrics(&self) -> Arc<metric::Registry>;
 
     /// Gets the time provider associated with this catalog.
@@ -245,8 +255,10 @@ pub trait NamespaceRepo: Send + Sync {
     /// Specify `None` for `retention_period_ns` to get infinite retention.
     async fn create(
         &mut self,
-        name: &NamespaceName,
+        name: &NamespaceName<'_>,
+        partition_template: Option<NamespacePartitionTemplateOverride>,
         retention_period_ns: Option<i64>,
+        service_protection_limits: Option<NamespaceServiceProtectionLimitsOverride>,
     ) -> Result<Namespace>;
 
     /// Update retention period for a namespace
@@ -286,8 +298,14 @@ pub trait NamespaceRepo: Send + Sync {
 /// Functions for working with tables in the catalog
 #[async_trait]
 pub trait TableRepo: Send + Sync {
-    /// Creates the table in the catalog or get the existing record by name.
-    async fn create_or_get(&mut self, name: &str, namespace_id: NamespaceId) -> Result<Table>;
+    /// Creates the table in the catalog. If one in the same namespace with the same name already
+    /// exists, an error is returned.
+    async fn create(
+        &mut self,
+        name: &str,
+        partition_template: TablePartitionTemplateOverride,
+        namespace_id: NamespaceId,
+    ) -> Result<Table>;
 
     /// get table by ID
     async fn get_by_id(&mut self, table_id: TableId) -> Result<Option<Table>>;
@@ -354,6 +372,25 @@ pub trait PartitionRepo: Send + Sync {
     /// get partition by ID
     async fn get_by_id(&mut self, partition_id: PartitionId) -> Result<Option<Partition>>;
 
+    /// get multiple partitions by ID.
+    ///
+    /// the output order is undefined, non-existing partitions are not part of the output.
+    async fn get_by_id_batch(&mut self, partition_ids: Vec<PartitionId>) -> Result<Vec<Partition>>;
+
+    /// get partition by deterministic hash ID
+    async fn get_by_hash_id(
+        &mut self,
+        partition_hash_id: &PartitionHashId,
+    ) -> Result<Option<Partition>>;
+
+    /// get partition by deterministic hash ID
+    ///
+    /// the output order is undefined, non-existing partitions are not part of the output.
+    async fn get_by_hash_id_batch(
+        &mut self,
+        partition_hash_ids: &[&PartitionHashId],
+    ) -> Result<Vec<Partition>>;
+
     /// return the partitions by table id
     async fn list_by_table_id(&mut self, table_id: TableId) -> Result<Vec<Partition>>;
 
@@ -371,11 +408,15 @@ pub trait PartitionRepo: Send + Sync {
     /// Implementations are allowed to spuriously return
     /// [`CasFailure::ValueMismatch`] for performance reasons in the presence of
     /// concurrent writers.
+    // TODO: After the sort_key_ids field is converetd into NOT NULL, the implementation of this function
+    // must be changed to compare old_sort_key_ids with the existing sort_key_ids instead of
+    // comparing old_sort_key with existing sort_key
     async fn cas_sort_key(
         &mut self,
-        partition_id: PartitionId,
+        partition_id: &TransitionPartitionId,
         old_sort_key: Option<Vec<String>>,
         new_sort_key: &[&str],
+        new_sort_key_ids: &SortedColumnSet,
     ) -> Result<Partition, CasFailure<Vec<String>>>;
 
     /// Record an instance of a partition being selected for compaction but compaction was not
@@ -392,11 +433,11 @@ pub trait PartitionRepo: Send + Sync {
         limit_bytes: u64,
     ) -> Result<()>;
 
-    /// Get the record of a partition being skipped.
-    async fn get_in_skipped_compaction(
+    /// Get the record of partitions being skipped.
+    async fn get_in_skipped_compactions(
         &mut self,
-        partition_id: PartitionId,
-    ) -> Result<Option<SkippedCompaction>>;
+        partition_id: &[PartitionId],
+    ) -> Result<Vec<SkippedCompaction>>;
 
     /// List the records of compacting a partition being skipped. This is mostly useful for testing.
     async fn list_skipped_compactions(&mut self) -> Result<Vec<SkippedCompaction>>;
@@ -418,6 +459,12 @@ pub trait PartitionRepo: Send + Sync {
         minimum_time: Timestamp,
         maximum_time: Option<Timestamp>,
     ) -> Result<Vec<PartitionId>>;
+
+    /// Return all partitions that do not have deterministic hash IDs in the catalog. Used in
+    /// the ingester's `OldPartitionBloomFilter` to determine whether a catalog query is necessary.
+    /// Can be removed when all partitions have hash IDs and support for old-style partitions is no
+    /// longer needed.
+    async fn list_old_style(&mut self) -> Result<Vec<Partition>>;
 }
 
 /// Functions for working with parquet file pointers in the catalog
@@ -426,8 +473,12 @@ pub trait ParquetFileRepo: Send + Sync {
     /// create the parquet file
     async fn create(&mut self, parquet_file_params: ParquetFileParams) -> Result<ParquetFile>;
 
-    /// Flag the parquet file for deletion
-    async fn flag_for_delete(&mut self, id: ParquetFileId) -> Result<()>;
+    /// List all parquet files in implementation-defined, non-deterministic order.
+    ///
+    /// This includes files that were marked for deletion.
+    ///
+    /// This is mostly useful for testing and will likely not succeed in production.
+    async fn list_all(&mut self) -> Result<Vec<ParquetFile>>;
 
     /// Flag all parquet files for deletion that are older than their namespace's retention period.
     async fn flag_for_delete_by_retention(&mut self) -> Result<Vec<ParquetFileId>>;
@@ -443,10 +494,6 @@ pub trait ParquetFileRepo: Send + Sync {
     /// [`to_delete`](ParquetFile::to_delete).
     async fn list_by_table_not_to_delete(&mut self, table_id: TableId) -> Result<Vec<ParquetFile>>;
 
-    /// List all parquet files within a given table including those marked as [`to_delete`](ParquetFile::to_delete).
-    /// This is for debug purpose
-    async fn list_by_table(&mut self, table_id: TableId) -> Result<Vec<ParquetFile>>;
-
     /// Delete parquet files that were marked to be deleted earlier than the specified time.
     ///
     /// Returns the deleted IDs only.
@@ -459,36 +506,29 @@ pub trait ParquetFileRepo: Send + Sync {
     /// [`to_delete`](ParquetFile::to_delete).
     async fn list_by_partition_not_to_delete(
         &mut self,
-        partition_id: PartitionId,
+        partition_id: &TransitionPartitionId,
     ) -> Result<Vec<ParquetFile>>;
 
-    /// Update the compaction level of the specified parquet files to
-    /// the specified [`CompactionLevel`].
-    /// Returns the IDs of the files that were successfully updated.
-    async fn update_compaction_level(
-        &mut self,
-        parquet_file_ids: &[ParquetFileId],
-        compaction_level: CompactionLevel,
-    ) -> Result<Vec<ParquetFileId>>;
-
-    /// Verify if the parquet file exists by selecting its id
-    async fn exist(&mut self, id: ParquetFileId) -> Result<bool>;
-
-    /// Return count
-    async fn count(&mut self) -> Result<i64>;
-
     /// Return the parquet file with the given object store id
+    // used heavily in tests for verification of catalog state.
     async fn get_by_object_store_id(
         &mut self,
         object_store_id: Uuid,
     ) -> Result<Option<ParquetFile>>;
 
+    /// Test a batch of parquet files exist by object store ids
+    async fn exists_by_object_store_id_batch(
+        &mut self,
+        object_store_ids: Vec<Uuid>,
+    ) -> Result<Vec<Uuid>>;
+
     /// Commit deletions, upgrades and creations in a single transaction.
+    ///
+    /// Returns IDs of created files.
     async fn create_upgrade_delete(
         &mut self,
-        _partition_id: PartitionId,
-        delete: &[ParquetFile],
-        upgrade: &[ParquetFile],
+        delete: &[ParquetFileId],
+        upgrade: &[ParquetFileId],
         create: &[ParquetFileParams],
         target_level: CompactionLevel,
     ) -> Result<Vec<ParquetFileId>>;
@@ -677,17 +717,30 @@ pub async fn list_schemas(
     Ok(iter)
 }
 
+/// panic if sort_key and sort_key_ids have different lengths
+pub(crate) fn verify_sort_key_length(sort_key: &[&str], sort_key_ids: &SortedColumnSet) {
+    assert_eq!(
+        sort_key.len(),
+        sort_key_ids.len(),
+        "sort_key {:?} and sort_key_ids {:?} are not the same length",
+        sort_key,
+        sort_key_ids
+    );
+}
+
 #[cfg(test)]
 pub(crate) mod test_helpers {
     use crate::{
-        test_helpers::{arbitrary_namespace, arbitrary_table},
+        test_helpers::{arbitrary_namespace, arbitrary_parquet_file_params, arbitrary_table},
         validate_or_insert_schema, DEFAULT_MAX_COLUMNS_PER_TABLE, DEFAULT_MAX_TABLES,
     };
 
     use super::*;
+    use ::test_helpers::assert_error;
     use assert_matches::assert_matches;
-    use data_types::{ColumnId, ColumnSet, CompactionLevel};
+    use data_types::{ColumnId, CompactionLevel};
     use futures::Future;
+    use generated_types::influxdata::iox::partition_template::v1 as proto;
     use metric::{Attributes, DurationHistogram, Metric};
     use std::{collections::BTreeSet, ops::DerefMut, sync::Arc, time::Duration};
 
@@ -715,7 +768,7 @@ pub(crate) mod test_helpers {
 
         let catalog = clean_state().await;
         test_table(Arc::clone(&catalog)).await;
-        assert_metric_hit(&catalog.metrics(), "table_create_or_get");
+        assert_metric_hit(&catalog.metrics(), "table_create");
 
         let catalog = clean_state().await;
         test_column(Arc::clone(&catalog)).await;
@@ -740,11 +793,22 @@ pub(crate) mod test_helpers {
         let namespace_name = NamespaceName::new("test_namespace").unwrap();
         let namespace = repos
             .namespaces()
-            .create(&namespace_name, None)
+            .create(&namespace_name, None, None, None)
             .await
             .unwrap();
         assert!(namespace.id > NamespaceId::new(0));
         assert_eq!(namespace.name, namespace_name.as_str());
+        assert_eq!(
+            namespace.partition_template,
+            NamespacePartitionTemplateOverride::default()
+        );
+        let lookup_namespace = repos
+            .namespaces()
+            .get_by_name(&namespace_name, SoftDeletedRows::ExcludeDeleted)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(namespace, lookup_namespace);
 
         // Assert default values for service protection limits.
         assert_eq!(namespace.max_tables, DEFAULT_MAX_TABLES);
@@ -753,7 +817,10 @@ pub(crate) mod test_helpers {
             DEFAULT_MAX_COLUMNS_PER_TABLE
         );
 
-        let conflict = repos.namespaces().create(&namespace_name, None).await;
+        let conflict = repos
+            .namespaces()
+            .create(&namespace_name, None, None, None)
+            .await;
         assert!(matches!(
             conflict.unwrap_err(),
             Error::NameExists { name: _ }
@@ -840,7 +907,7 @@ pub(crate) mod test_helpers {
         let namespace4_name = NamespaceName::new("test_namespace4").unwrap();
         let namespace4 = repos
             .namespaces()
-            .create(&namespace4_name, Some(NEW_RETENTION_PERIOD_NS))
+            .create(&namespace4_name, None, Some(NEW_RETENTION_PERIOD_NS), None)
             .await
             .expect("namespace with 5-hour retention should be created");
         assert_eq!(
@@ -853,6 +920,34 @@ pub(crate) mod test_helpers {
             .update_retention_period(&namespace4_name, None)
             .await
             .expect("namespace should be updateable");
+
+        // create a namespace with a PartitionTemplate other than the default
+        let tag_partition_template =
+            NamespacePartitionTemplateOverride::try_from(proto::PartitionTemplate {
+                parts: vec![proto::TemplatePart {
+                    part: Some(proto::template_part::Part::TagValue("tag1".into())),
+                }],
+            })
+            .unwrap();
+        let namespace5_name = NamespaceName::new("test_namespace5").unwrap();
+        let namespace5 = repos
+            .namespaces()
+            .create(
+                &namespace5_name,
+                Some(tag_partition_template.clone()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(namespace5.partition_template, tag_partition_template);
+        let lookup_namespace5 = repos
+            .namespaces()
+            .get_by_name(&namespace5_name, SoftDeletedRows::ExcludeDeleted)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(namespace5, lookup_namespace5);
 
         // remove namespace to avoid it from affecting later tests
         repos
@@ -1044,11 +1139,33 @@ pub(crate) mod test_helpers {
         let mut repos = catalog.repositories().await;
         let namespace = arbitrary_namespace(&mut *repos, "namespace_table_test").await;
 
-        // test we can create or get a table
+        // test we can create a table
         let t = arbitrary_table(&mut *repos, "test_table", &namespace).await;
-        let tt = arbitrary_table(&mut *repos, "test_table", &namespace).await;
         assert!(t.id > TableId::new(0));
-        assert_eq!(t, tt);
+        assert_eq!(
+            t.partition_template,
+            TablePartitionTemplateOverride::default()
+        );
+
+        // The default template doesn't use any tag values, so no columns need to be created.
+        let table_columns = repos.columns().list_by_table_id(t.id).await.unwrap();
+        assert!(table_columns.is_empty());
+
+        // test we get an error if we try to create it again
+        let err = repos
+            .tables()
+            .create(
+                "test_table",
+                TablePartitionTemplateOverride::try_new(None, &namespace.partition_template)
+                    .unwrap(),
+                namespace.id,
+            )
+            .await;
+        assert_error!(
+            err,
+            Error::TableNameExists { ref name, namespace_id }
+                if name == "test_table" && namespace_id == namespace.id
+        );
 
         // get by id
         assert_eq!(t, repos.tables().get_by_id(t.id).await.unwrap().unwrap());
@@ -1070,7 +1187,7 @@ pub(crate) mod test_helpers {
         let namespace2 = arbitrary_namespace(&mut *repos, "two").await;
         assert_ne!(namespace, namespace2);
         let test_table = arbitrary_table(&mut *repos, "test_table", &namespace2).await;
-        assert_ne!(tt, test_table);
+        assert_ne!(t.id, test_table.id);
         assert_eq!(test_table.namespace_id, namespace2.id);
 
         // test get by namespace and name
@@ -1119,8 +1236,11 @@ pub(crate) mod test_helpers {
         );
 
         // All tables should be returned by list(), regardless of namespace
-        let list = repos.tables().list().await.unwrap();
-        assert_eq!(list.as_slice(), [tt, test_table, foo_table]);
+        let mut list = repos.tables().list().await.unwrap();
+        list.sort_by_key(|t| t.id);
+        let mut expected = [t, test_table, foo_table];
+        expected.sort_by_key(|t| t.id);
+        assert_eq!(&list, &expected);
 
         // test per-namespace table limits
         let latest = repos
@@ -1130,7 +1250,11 @@ pub(crate) mod test_helpers {
             .expect("namespace should be updateable");
         let err = repos
             .tables()
-            .create_or_get("definitely_unique", latest.id)
+            .create(
+                "definitely_unique",
+                TablePartitionTemplateOverride::try_new(None, &latest.partition_template).unwrap(),
+                latest.id,
+            )
             .await
             .expect_err("should error with table create limit error");
         assert!(matches!(
@@ -1140,6 +1264,112 @@ pub(crate) mod test_helpers {
                 namespace_id: _
             }
         ));
+
+        // Create a table with a partition template other than the default
+        let custom_table_template = TablePartitionTemplateOverride::try_new(
+            Some(proto::PartitionTemplate {
+                parts: vec![
+                    proto::TemplatePart {
+                        part: Some(proto::template_part::Part::TagValue("tag1".into())),
+                    },
+                    proto::TemplatePart {
+                        part: Some(proto::template_part::Part::TimeFormat("year-%Y".into())),
+                    },
+                    proto::TemplatePart {
+                        part: Some(proto::template_part::Part::TagValue("tag2".into())),
+                    },
+                ],
+            }),
+            &namespace2.partition_template,
+        )
+        .unwrap();
+        let templated = repos
+            .tables()
+            .create(
+                "use_a_template",
+                custom_table_template.clone(),
+                namespace2.id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(templated.partition_template, custom_table_template);
+
+        // Tag columns should be created for tags used in the template
+        let table_columns = repos
+            .columns()
+            .list_by_table_id(templated.id)
+            .await
+            .unwrap();
+        assert_eq!(table_columns.len(), 2);
+        assert!(table_columns.iter().all(|c| c.is_tag()));
+        let mut column_names: Vec<_> = table_columns.iter().map(|c| &c.name).collect();
+        column_names.sort();
+        assert_eq!(column_names, &["tag1", "tag2"]);
+
+        let lookup_templated = repos
+            .tables()
+            .get_by_namespace_and_name(namespace2.id, "use_a_template")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(templated, lookup_templated);
+
+        // Create a namespace with a partition template other than the default
+        let custom_namespace_template =
+            NamespacePartitionTemplateOverride::try_from(proto::PartitionTemplate {
+                parts: vec![
+                    proto::TemplatePart {
+                        part: Some(proto::template_part::Part::TagValue("zzz".into())),
+                    },
+                    proto::TemplatePart {
+                        part: Some(proto::template_part::Part::TagValue("aaa".into())),
+                    },
+                    proto::TemplatePart {
+                        part: Some(proto::template_part::Part::TimeFormat("year-%Y".into())),
+                    },
+                ],
+            })
+            .unwrap();
+        let custom_namespace_name = NamespaceName::new("custom_namespace").unwrap();
+        let custom_namespace = repos
+            .namespaces()
+            .create(
+                &custom_namespace_name,
+                Some(custom_namespace_template.clone()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        // Create a table without specifying the partition template
+        let custom_table_template =
+            TablePartitionTemplateOverride::try_new(None, &custom_namespace.partition_template)
+                .unwrap();
+        let table_templated_by_namespace = repos
+            .tables()
+            .create(
+                "use_namespace_template",
+                custom_table_template,
+                custom_namespace.id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            table_templated_by_namespace.partition_template,
+            TablePartitionTemplateOverride::try_new(None, &custom_namespace_template).unwrap()
+        );
+
+        // Tag columns should be created for tags used in the template
+        let table_columns = repos
+            .columns()
+            .list_by_table_id(table_templated_by_namespace.id)
+            .await
+            .unwrap();
+        assert_eq!(table_columns.len(), 2);
+        assert!(table_columns.iter().all(|c| c.is_tag()));
+        let mut column_names: Vec<_> = table_columns.iter().map(|c| &c.name).collect();
+        column_names.sort();
+        assert_eq!(column_names, &["aaa", "zzz"]);
 
         repos
             .namespaces()
@@ -1276,36 +1506,103 @@ pub(crate) mod test_helpers {
         let table = arbitrary_table(&mut *repos, "test_table", &namespace).await;
 
         let mut created = BTreeMap::new();
-        for key in ["foo", "bar"] {
-            let partition = repos
-                .partitions()
-                .create_or_get(key.into(), table.id)
-                .await
-                .expect("failed to create partition");
-            created.insert(partition.id, partition);
-        }
-        let other_partition = repos
+        // partition to use
+        let partition = repos
+            .partitions()
+            .create_or_get("foo".into(), table.id)
+            .await
+            .expect("failed to create partition");
+        // Test: sort_key_ids from create_or_get
+        assert!(partition.sort_key_ids().unwrap().is_empty());
+        created.insert(partition.id, partition.clone());
+        // partition to use
+        let partition_bar = repos
+            .partitions()
+            .create_or_get("bar".into(), table.id)
+            .await
+            .expect("failed to create partition");
+        created.insert(partition_bar.id, partition_bar);
+        // partition to be skipped later
+        let to_skip_partition = repos
             .partitions()
             .create_or_get("asdf".into(), table.id)
             .await
             .unwrap();
+        created.insert(to_skip_partition.id, to_skip_partition.clone());
+        // partition to be skipped later
+        let to_skip_partition_too = repos
+            .partitions()
+            .create_or_get("asdf too".into(), table.id)
+            .await
+            .unwrap();
+        created.insert(to_skip_partition_too.id, to_skip_partition_too.clone());
 
         // partitions can be retrieved easily
+        let mut created_sorted = created.values().cloned().collect::<Vec<_>>();
+        created_sorted.sort_by_key(|p| p.id);
         assert_eq!(
-            other_partition,
+            to_skip_partition,
             repos
                 .partitions()
-                .get_by_id(other_partition.id)
+                .get_by_id(to_skip_partition.id)
                 .await
                 .unwrap()
                 .unwrap()
         );
+        assert_eq!(
+            to_skip_partition,
+            repos
+                .partitions()
+                .get_by_hash_id(to_skip_partition.hash_id().unwrap())
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        let non_existing_partition_id = PartitionId::new(i64::MAX);
+        let non_existing_partition_hash_id =
+            PartitionHashId::new(TableId::new(i64::MAX), &PartitionKey::from("arbitrary"));
         assert!(repos
             .partitions()
-            .get_by_id(PartitionId::new(i64::MAX))
+            .get_by_id(non_existing_partition_id)
             .await
             .unwrap()
             .is_none());
+        assert!(repos
+            .partitions()
+            .get_by_hash_id(&non_existing_partition_hash_id)
+            .await
+            .unwrap()
+            .is_none());
+        let mut batch = repos
+            .partitions()
+            .get_by_id_batch(
+                created
+                    .keys()
+                    .cloned()
+                    .chain([non_existing_partition_id])
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        batch.sort_by_key(|p| p.id);
+        assert_eq!(created_sorted, batch);
+        // Test: sort_key_ids from get_by_id_batch
+        assert!(batch.iter().all(|p| p.sort_key_ids().unwrap().is_empty()));
+        let mut batch = repos
+            .partitions()
+            .get_by_hash_id_batch(
+                &created
+                    .values()
+                    .map(|p| p.hash_id().unwrap())
+                    .chain([&non_existing_partition_hash_id])
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+        batch.sort_by_key(|p| p.id);
+        // Test: sort_key_ids from get_by_hash_id_batch
+        assert!(batch.iter().all(|p| p.sort_key_ids().unwrap().is_empty()));
+        assert_eq!(created_sorted, batch);
 
         let listed = repos
             .partitions()
@@ -1315,8 +1612,11 @@ pub(crate) mod test_helpers {
             .into_iter()
             .map(|v| (v.id, v))
             .collect::<BTreeMap<_, _>>();
+        // Test: sort_key_ids from list_by_table_id
+        assert!(listed
+            .values()
+            .all(|p| p.sort_key_ids().unwrap().is_empty()));
 
-        created.insert(other_partition.id, other_partition.clone());
         assert_eq!(created, listed);
 
         let listed = repos
@@ -1329,23 +1629,45 @@ pub(crate) mod test_helpers {
 
         assert_eq!(created.keys().copied().collect::<BTreeSet<_>>(), listed);
 
+        // The code no longer supports creating old-style partitions, so this list is always empty
+        // in these tests. See each catalog implementation for tests that insert old-style
+        // partitions directly and verify they're returned.
+        let old_style = repos.partitions().list_old_style().await.unwrap();
+        assert!(
+            old_style.is_empty(),
+            "Expected no old-style partitions, got {old_style:?}"
+        );
+
         // sort_key should be empty on creation
-        assert!(other_partition.sort_key.is_empty());
+        assert!(to_skip_partition.sort_key.is_empty());
 
         // test update_sort_key from None to Some
-        repos
+        let updated_partition = repos
             .partitions()
-            .cas_sort_key(other_partition.id, None, &["tag2", "tag1", "time"])
+            .cas_sort_key(
+                &to_skip_partition.transition_partition_id(),
+                None,
+                &["tag2", "tag1", "time"],
+                &SortedColumnSet::from([2, 1, 3]),
+            )
             .await
             .unwrap();
+
+        // verify sort key and sort key ids  are updated
+        assert_eq!(updated_partition.sort_key, &["tag2", "tag1", "time"]);
+        assert_eq!(
+            updated_partition.sort_key_ids,
+            Some(SortedColumnSet::from([2, 1, 3]))
+        );
 
         // test sort key CAS with an incorrect value
         let err = repos
             .partitions()
             .cas_sort_key(
-                other_partition.id,
+                &to_skip_partition.transition_partition_id(),
                 Some(["bananas".to_string()].to_vec()),
                 &["tag2", "tag1", "tag3 , with comma", "time"],
+                &SortedColumnSet::from([1, 2, 3, 4]),
             )
             .await
             .expect_err("CAS with incorrect value should fail");
@@ -1356,7 +1678,23 @@ pub(crate) mod test_helpers {
         // test getting the new sort key
         let updated_other_partition = repos
             .partitions()
-            .get_by_id(other_partition.id)
+            .get_by_id(to_skip_partition.id)
+            .await
+            .unwrap()
+            .unwrap();
+        // still has the old sort key
+        assert_eq!(
+            updated_other_partition.sort_key,
+            vec!["tag2", "tag1", "time"]
+        );
+        assert_eq!(
+            updated_other_partition.sort_key_ids,
+            Some(SortedColumnSet::from([2, 1, 3]))
+        );
+
+        let updated_other_partition = repos
+            .partitions()
+            .get_by_hash_id(to_skip_partition.hash_id().unwrap())
             .await
             .unwrap()
             .unwrap();
@@ -1364,14 +1702,20 @@ pub(crate) mod test_helpers {
             updated_other_partition.sort_key,
             vec!["tag2", "tag1", "time"]
         );
+        // Test: sort_key_ids from get_by_hash_id
+        assert_eq!(
+            updated_other_partition.sort_key_ids,
+            Some(SortedColumnSet::from([2, 1, 3]))
+        );
 
         // test sort key CAS with no value
         let err = repos
             .partitions()
             .cas_sort_key(
-                other_partition.id,
+                &to_skip_partition.transition_partition_id(),
                 None,
                 &["tag2", "tag1", "tag3 , with comma", "time"],
+                &SortedColumnSet::from([1, 2, 3, 4]),
             )
             .await
             .expect_err("CAS with incorrect value should fail");
@@ -1383,9 +1727,10 @@ pub(crate) mod test_helpers {
         let err = repos
             .partitions()
             .cas_sort_key(
-                other_partition.id,
+                &to_skip_partition.transition_partition_id(),
                 Some(["bananas".to_string()].to_vec()),
                 &["tag2", "tag1", "tag3 , with comma", "time"],
+                &SortedColumnSet::from([1, 2, 3, 4]),
             )
             .await
             .expect_err("CAS with incorrect value should fail");
@@ -1394,10 +1739,10 @@ pub(crate) mod test_helpers {
         });
 
         // test update_sort_key from Some value to Some other value
-        repos
+        let updated_partition = repos
             .partitions()
             .cas_sort_key(
-                other_partition.id,
+                &to_skip_partition.transition_partition_id(),
                 Some(
                     ["tag2", "tag1", "time"]
                         .into_iter()
@@ -1405,20 +1750,48 @@ pub(crate) mod test_helpers {
                         .collect(),
                 ),
                 &["tag2", "tag1", "tag3 , with comma", "time"],
+                &SortedColumnSet::from([2, 1, 4, 3]),
             )
             .await
             .unwrap();
+        assert_eq!(
+            updated_partition.sort_key,
+            vec!["tag2", "tag1", "tag3 , with comma", "time"]
+        );
+        assert_eq!(
+            updated_partition.sort_key_ids,
+            Some(SortedColumnSet::from([2, 1, 4, 3]))
+        );
 
         // test getting the new sort key
-        let updated_other_partition = repos
+        let updated_partition = repos
             .partitions()
-            .get_by_id(other_partition.id)
+            .get_by_id(to_skip_partition.id)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(
-            updated_other_partition.sort_key,
+            updated_partition.sort_key,
             vec!["tag2", "tag1", "tag3 , with comma", "time"]
+        );
+        assert_eq!(
+            updated_partition.sort_key_ids,
+            Some(SortedColumnSet::from([2, 1, 4, 3]))
+        );
+
+        let updated_partition = repos
+            .partitions()
+            .get_by_hash_id(to_skip_partition.hash_id().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            updated_partition.sort_key,
+            vec!["tag2", "tag1", "tag3 , with comma", "time"]
+        );
+        assert_eq!(
+            updated_partition.sort_key_ids,
+            Some(SortedColumnSet::from([2, 1, 4, 3]))
         );
 
         // The compactor can log why compaction was skipped
@@ -1429,78 +1802,158 @@ pub(crate) mod test_helpers {
         );
         repos
             .partitions()
-            .record_skipped_compaction(other_partition.id, "I am le tired", 1, 2, 4, 10, 20)
+            .record_skipped_compaction(to_skip_partition.id, "I am le tired", 1, 2, 4, 10, 20)
             .await
             .unwrap();
         let skipped_compactions = repos.partitions().list_skipped_compactions().await.unwrap();
         assert_eq!(skipped_compactions.len(), 1);
-        assert_eq!(skipped_compactions[0].partition_id, other_partition.id);
+        assert_eq!(skipped_compactions[0].partition_id, to_skip_partition.id);
         assert_eq!(skipped_compactions[0].reason, "I am le tired");
         assert_eq!(skipped_compactions[0].num_files, 1);
         assert_eq!(skipped_compactions[0].limit_num_files, 2);
         assert_eq!(skipped_compactions[0].estimated_bytes, 10);
         assert_eq!(skipped_compactions[0].limit_bytes, 20);
         //
-        let skipped_partition_record = repos
+        let skipped_partition_records = repos
             .partitions()
-            .get_in_skipped_compaction(other_partition.id)
+            .get_in_skipped_compactions(&[to_skip_partition.id])
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(skipped_partition_record.partition_id, other_partition.id);
-        assert_eq!(skipped_partition_record.reason, "I am le tired");
+        assert_eq!(
+            skipped_partition_records[0].partition_id,
+            to_skip_partition.id
+        );
+        assert_eq!(skipped_partition_records[0].reason, "I am le tired");
 
         // Only save the last reason that any particular partition was skipped (really if the
         // partition appears in the skipped compactions, it shouldn't become a compaction candidate
         // again, but race conditions and all that)
         repos
             .partitions()
-            .record_skipped_compaction(other_partition.id, "I'm on fire", 11, 12, 24, 110, 120)
+            .record_skipped_compaction(to_skip_partition.id, "I'm on fire", 11, 12, 24, 110, 120)
             .await
             .unwrap();
         let skipped_compactions = repos.partitions().list_skipped_compactions().await.unwrap();
         assert_eq!(skipped_compactions.len(), 1);
-        assert_eq!(skipped_compactions[0].partition_id, other_partition.id);
+        assert_eq!(skipped_compactions[0].partition_id, to_skip_partition.id);
         assert_eq!(skipped_compactions[0].reason, "I'm on fire");
         assert_eq!(skipped_compactions[0].num_files, 11);
         assert_eq!(skipped_compactions[0].limit_num_files, 12);
         assert_eq!(skipped_compactions[0].estimated_bytes, 110);
         assert_eq!(skipped_compactions[0].limit_bytes, 120);
         //
-        let skipped_partition_record = repos
+        let skipped_partition_records = repos
             .partitions()
-            .get_in_skipped_compaction(other_partition.id)
+            .get_in_skipped_compactions(&[to_skip_partition.id])
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(skipped_partition_record.partition_id, other_partition.id);
-        assert_eq!(skipped_partition_record.reason, "I'm on fire");
+        assert_eq!(
+            skipped_partition_records[0].partition_id,
+            to_skip_partition.id
+        );
+        assert_eq!(skipped_partition_records[0].reason, "I'm on fire");
 
-        // Delete the skipped compaction
+        // Can receive multiple skipped compactions for different partitions
+        repos
+            .partitions()
+            .record_skipped_compaction(
+                to_skip_partition_too.id,
+                "I am le tired too",
+                1,
+                2,
+                4,
+                10,
+                20,
+            )
+            .await
+            .unwrap();
+        let skipped_compactions = repos.partitions().list_skipped_compactions().await.unwrap();
+        assert_eq!(skipped_compactions.len(), 2);
+        assert_eq!(skipped_compactions[0].partition_id, to_skip_partition.id);
+        assert_eq!(
+            skipped_compactions[1].partition_id,
+            to_skip_partition_too.id
+        );
+        // confirm can fetch subset of skipped compactions (a.k.a. have two, only fetch 1)
+        let skipped_partition_records = repos
+            .partitions()
+            .get_in_skipped_compactions(&[to_skip_partition.id])
+            .await
+            .unwrap();
+        assert_eq!(skipped_partition_records.len(), 1);
+        assert_eq!(skipped_compactions[0].partition_id, to_skip_partition.id);
+        let skipped_partition_records = repos
+            .partitions()
+            .get_in_skipped_compactions(&[to_skip_partition_too.id])
+            .await
+            .unwrap();
+        assert_eq!(skipped_partition_records.len(), 1);
+        assert_eq!(
+            skipped_partition_records[0].partition_id,
+            to_skip_partition_too.id
+        );
+        // confirm can fetch both skipped compactions, and not the unskipped one
+        // also confirm will not error on non-existing partition
+        let non_existing_partition_id = PartitionId::new(9999);
+        let skipped_partition_records = repos
+            .partitions()
+            .get_in_skipped_compactions(&[
+                partition.id,
+                to_skip_partition.id,
+                to_skip_partition_too.id,
+                non_existing_partition_id,
+            ])
+            .await
+            .unwrap();
+        assert_eq!(skipped_partition_records.len(), 2);
+        assert_eq!(
+            skipped_partition_records[0].partition_id,
+            to_skip_partition.id
+        );
+        assert_eq!(
+            skipped_partition_records[1].partition_id,
+            to_skip_partition_too.id
+        );
+
+        // Delete the skipped compactions
         let deleted_skipped_compaction = repos
             .partitions()
-            .delete_skipped_compactions(other_partition.id)
+            .delete_skipped_compactions(to_skip_partition.id)
             .await
             .unwrap()
             .expect("The skipped compaction should have been returned");
-
-        assert_eq!(deleted_skipped_compaction.partition_id, other_partition.id);
+        assert_eq!(
+            deleted_skipped_compaction.partition_id,
+            to_skip_partition.id
+        );
         assert_eq!(deleted_skipped_compaction.reason, "I'm on fire");
         assert_eq!(deleted_skipped_compaction.num_files, 11);
         assert_eq!(deleted_skipped_compaction.limit_num_files, 12);
         assert_eq!(deleted_skipped_compaction.estimated_bytes, 110);
         assert_eq!(deleted_skipped_compaction.limit_bytes, 120);
         //
-        let skipped_partition_record = repos
+        let deleted_skipped_compaction = repos
             .partitions()
-            .get_in_skipped_compaction(other_partition.id)
+            .delete_skipped_compactions(to_skip_partition_too.id)
+            .await
+            .unwrap()
+            .expect("The skipped compaction should have been returned");
+        assert_eq!(
+            deleted_skipped_compaction.partition_id,
+            to_skip_partition_too.id
+        );
+        assert_eq!(deleted_skipped_compaction.reason, "I am le tired too");
+        //
+        let skipped_partition_records = repos
+            .partitions()
+            .get_in_skipped_compactions(&[to_skip_partition.id])
             .await
             .unwrap();
-        assert!(skipped_partition_record.is_none());
+        assert!(skipped_partition_records.is_empty());
 
         let not_deleted_skipped_compaction = repos
             .partitions()
-            .delete_skipped_compactions(other_partition.id)
+            .delete_skipped_compactions(to_skip_partition.id)
             .await
             .unwrap();
 
@@ -1520,14 +1973,40 @@ pub(crate) mod test_helpers {
             .most_recent_n(10)
             .await
             .expect("should list most recent");
-        assert_eq!(recent.len(), 3);
+        assert_eq!(recent.len(), 4);
+
+        // Test: sort_key_ids from most_recent_n
+        // Only the second one has vallues, the other 3 are empty
+        let empty_vec_string: Vec<String> = vec![];
+        assert_eq!(recent[0].sort_key, empty_vec_string);
+        assert_eq!(recent[0].sort_key_ids, Some(SortedColumnSet::from(vec![])));
+
+        assert_eq!(
+            recent[1].sort_key,
+            vec![
+                "tag2".to_string(),
+                "tag1".to_string(),
+                "tag3 , with comma".to_string(),
+                "time".to_string()
+            ]
+        );
+        assert_eq!(
+            recent[1].sort_key_ids,
+            Some(SortedColumnSet::from(vec![2, 1, 4, 3]))
+        );
+
+        assert_eq!(recent[2].sort_key, empty_vec_string);
+        assert_eq!(recent[2].sort_key_ids, Some(SortedColumnSet::from(vec![])));
+
+        assert_eq!(recent[3].sort_key, empty_vec_string);
+        assert_eq!(recent[3].sort_key_ids, Some(SortedColumnSet::from(vec![])));
 
         let recent = repos
             .partitions()
-            .most_recent_n(3)
+            .most_recent_n(4)
             .await
             .expect("should list most recent");
-        assert_eq!(recent.len(), 3);
+        assert_eq!(recent.len(), 4); // no off by one error
 
         let recent = repos
             .partitions()
@@ -1543,7 +2022,8 @@ pub(crate) mod test_helpers {
             .expect("delete namespace should succeed");
     }
 
-    /// tests many interactions with the catalog and parquet files. See the individual conditions herein
+    /// tests many interactions with the catalog and parquet files. See the individual conditions
+    /// herein
     async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
         let mut repos = catalog.repositories().await;
         let namespace = arbitrary_namespace(&mut *repos, "namespace_parquet_file_test").await;
@@ -1560,20 +2040,7 @@ pub(crate) mod test_helpers {
             .await
             .unwrap();
 
-        let parquet_file_params = ParquetFileParams {
-            namespace_id: namespace.id,
-            table_id: partition.table_id,
-            partition_id: partition.id,
-            object_store_id: Uuid::new_v4(),
-            min_time: Timestamp::new(1),
-            max_time: Timestamp::new(10),
-            file_size_bytes: 1337,
-            row_count: 0,
-            compaction_level: CompactionLevel::Initial,
-            created_at: Timestamp::new(1),
-            column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
-            max_l0_created_at: Timestamp::new(1),
-        };
+        let parquet_file_params = arbitrary_parquet_file_params(&namespace, &table, &partition);
         let parquet_file = repos
             .parquet_files()
             .create(parquet_file_params.clone())
@@ -1598,7 +2065,7 @@ pub(crate) mod test_helpers {
 
         let other_params = ParquetFileParams {
             table_id: other_partition.table_id,
-            partition_id: other_partition.id,
+            partition_id: other_partition.transition_partition_id(),
             object_store_id: Uuid::new_v4(),
             min_time: Timestamp::new(50),
             max_time: Timestamp::new(60),
@@ -1610,8 +2077,6 @@ pub(crate) mod test_helpers {
         let non_exist_id = ParquetFileId::new(other_file.id.get() + 10);
         // make sure exists_id != non_exist_id
         assert_ne!(exist_id, non_exist_id);
-        assert!(repos.parquet_files().exist(exist_id).await.unwrap());
-        assert!(!repos.parquet_files().exist(non_exist_id).await.unwrap());
 
         // verify that to_delete is initially set to null and the file does not get deleted
         assert!(parquet_file.to_delete.is_none());
@@ -1624,34 +2089,28 @@ pub(crate) mod test_helpers {
             .await
             .unwrap();
         assert!(deleted.is_empty());
-        assert!(repos.parquet_files().exist(parquet_file.id).await.unwrap());
 
-        // test list_by_table that includes soft-deleted file
+        // test list_all that includes soft-deleted file
         // at this time the file is not soft-deleted yet and will be included in the returned list
-        let files = repos
-            .parquet_files()
-            .list_by_table(parquet_file.table_id)
-            .await
-            .unwrap();
-        assert_eq!(files.len(), 1);
+        let files = repos.parquet_files().list_all().await.unwrap();
+        assert_eq!(files.len(), 2);
 
         // verify to_delete can be updated to a timestamp
         repos
             .parquet_files()
-            .flag_for_delete(parquet_file.id)
+            .create_upgrade_delete(&[parquet_file.id], &[], &[], CompactionLevel::Initial)
             .await
             .unwrap();
 
-        // test list_by_table that includes soft-deleted file
+        // test list_all that includes soft-deleted file
         // at this time the file is soft-deleted and will be included in the returned list
-        let files = repos
-            .parquet_files()
-            .list_by_table(parquet_file.table_id)
-            .await
+        let files = repos.parquet_files().list_all().await.unwrap();
+        assert_eq!(files.len(), 2);
+        let marked_deleted = files
+            .iter()
+            .find(|f| f.to_delete.is_some())
+            .cloned()
             .unwrap();
-        assert_eq!(files.len(), 1);
-        let marked_deleted = files.first().unwrap();
-        assert!(marked_deleted.to_delete.is_some());
 
         // File is not deleted if it was marked to be deleted after the specified time
         let before_deleted = Timestamp::new(
@@ -1663,17 +2122,12 @@ pub(crate) mod test_helpers {
             .await
             .unwrap();
         assert!(deleted.is_empty());
-        assert!(repos.parquet_files().exist(parquet_file.id).await.unwrap());
 
-        // test list_by_table that includes soft-deleted file
+        // test list_all that includes soft-deleted file
         // at this time the file is not actually hard deleted yet and stay as soft deleted
         // and will be returned in the list
-        let files = repos
-            .parquet_files()
-            .list_by_table(parquet_file.table_id)
-            .await
-            .unwrap();
-        assert_eq!(files.len(), 1);
+        let files = repos.parquet_files().list_all().await.unwrap();
+        assert_eq!(files.len(), 2);
 
         // File is deleted if it was marked to be deleted before the specified time
         let deleted = repos
@@ -1683,16 +2137,11 @@ pub(crate) mod test_helpers {
             .unwrap();
         assert_eq!(deleted.len(), 1);
         assert_eq!(marked_deleted.id, deleted[0]);
-        assert!(!repos.parquet_files().exist(parquet_file.id).await.unwrap());
 
-        // test list_by_table that includes soft-deleted file
+        // test list_all that includes soft-deleted file
         // at this time the file is hard deleted -> the returned list is empty
-        let files = repos
-            .parquet_files()
-            .list_by_table(parquet_file.table_id)
-            .await
-            .unwrap();
-        assert_eq!(files.len(), 0);
+        let files = repos.parquet_files().list_all().await.unwrap();
+        assert_eq!(files.len(), 1);
 
         // test list_by_table_not_to_delete
         let files = repos
@@ -1708,15 +2157,9 @@ pub(crate) mod test_helpers {
             .unwrap();
         assert_eq!(files, vec![other_file.clone()]);
 
-        // test list_by_table
-        println!("parquet_file.table_id = {}", parquet_file.table_id);
-        let files = repos
-            .parquet_files()
-            // .list_by_table(parquet_file.table_id) // todo: tables of deleted files
-            .list_by_table(other_file.table_id)
-            .await
-            .unwrap();
-        assert_eq!(files.len(), 1);
+        // test list_all
+        let files = repos.parquet_files().list_all().await.unwrap();
+        assert_eq!(vec![other_file.clone()], files);
 
         // test list_by_namespace_not_to_delete
         let namespace2 = arbitrary_namespace(&mut *repos, "namespace_parquet_file_test1").await;
@@ -1735,7 +2178,7 @@ pub(crate) mod test_helpers {
 
         let f1_params = ParquetFileParams {
             table_id: partition2.table_id,
-            partition_id: partition2.id,
+            partition_id: partition2.transition_partition_id(),
             object_store_id: Uuid::new_v4(),
             min_time: Timestamp::new(1),
             max_time: Timestamp::new(10),
@@ -1783,7 +2226,11 @@ pub(crate) mod test_helpers {
             .unwrap();
         assert_eq!(vec![f1.clone(), f2.clone(), f3.clone()], files);
 
-        repos.parquet_files().flag_for_delete(f2.id).await.unwrap();
+        repos
+            .parquet_files()
+            .create_upgrade_delete(&[f2.id], &[], &[], CompactionLevel::Initial)
+            .await
+            .unwrap();
         let files = repos
             .parquet_files()
             .list_by_namespace_not_to_delete(namespace2.id)
@@ -1941,9 +2388,8 @@ pub(crate) mod test_helpers {
         let cud = repos
             .parquet_files()
             .create_upgrade_delete(
-                f4.partition_id,
-                &[f5.clone()],
-                &[f1.clone()],
+                &[f5.id],
+                &[f1.id],
                 &[f6_params.clone()],
                 CompactionLevel::Final,
             )
@@ -1980,9 +2426,8 @@ pub(crate) mod test_helpers {
         let cud = repos
             .parquet_files()
             .create_upgrade_delete(
-                f4.partition_id,
-                &[f5],
-                &[f2],
+                &[f5.id],
+                &[f2.id],
                 &[f6_params.clone()],
                 CompactionLevel::Final,
             )
@@ -2002,6 +2447,19 @@ pub(crate) mod test_helpers {
             .unwrap()
             .unwrap();
         assert_matches!(f6_not_delete.to_delete, None);
+
+        // test exists_by_object_store_id_batch returns parquet files by object store id
+        let does_not_exist = Uuid::new_v4();
+        let mut present = repos
+            .parquet_files()
+            .exists_by_object_store_id_batch(vec![f6_uuid, f1_uuid, does_not_exist])
+            .await
+            .unwrap();
+        assert_eq!(present.len(), 2);
+        let mut expected = vec![f6_uuid, f1_uuid];
+        present.sort();
+        expected.sort();
+        assert_eq!(present, expected);
     }
 
     async fn test_parquet_file_delete_broken(catalog: Arc<dyn Catalog>) {
@@ -2009,7 +2467,12 @@ pub(crate) mod test_helpers {
         let namespace_1 = arbitrary_namespace(&mut *repos, "retention_broken_1").await;
         let namespace_2 = repos
             .namespaces()
-            .create(&NamespaceName::new("retention_broken_2").unwrap(), Some(1))
+            .create(
+                &NamespaceName::new("retention_broken_2").unwrap(),
+                None,
+                Some(1),
+                None,
+            )
             .await
             .unwrap();
         let table_1 = arbitrary_table(&mut *repos, "test_table", &namespace_1).await;
@@ -2025,42 +2488,18 @@ pub(crate) mod test_helpers {
             .await
             .unwrap();
 
-        let parquet_file_params_1 = ParquetFileParams {
-            namespace_id: namespace_1.id,
-            table_id: table_1.id,
-            partition_id: partition_1.id,
-            object_store_id: Uuid::new_v4(),
-            min_time: Timestamp::new(1),
-            max_time: Timestamp::new(10),
-            file_size_bytes: 1337,
-            row_count: 0,
-            compaction_level: CompactionLevel::Initial,
-            created_at: Timestamp::new(1),
-            column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
-            max_l0_created_at: Timestamp::new(1),
-        };
-        let parquet_file_params_2 = ParquetFileParams {
-            namespace_id: namespace_2.id,
-            table_id: table_2.id,
-            partition_id: partition_2.id,
-            object_store_id: Uuid::new_v4(),
-            min_time: Timestamp::new(1),
-            max_time: Timestamp::new(10),
-            file_size_bytes: 1337,
-            row_count: 0,
-            compaction_level: CompactionLevel::Initial,
-            created_at: Timestamp::new(1),
-            column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
-            max_l0_created_at: Timestamp::new(1),
-        };
+        let parquet_file_params_1 =
+            arbitrary_parquet_file_params(&namespace_1, &table_1, &partition_1);
+        let parquet_file_params_2 =
+            arbitrary_parquet_file_params(&namespace_2, &table_2, &partition_2);
         let _parquet_file_1 = repos
             .parquet_files()
-            .create(parquet_file_params_1.clone())
+            .create(parquet_file_params_1)
             .await
             .unwrap();
         let parquet_file_2 = repos
             .parquet_files()
-            .create(parquet_file_params_2.clone())
+            .create(parquet_file_params_2)
             .await
             .unwrap();
 
@@ -2110,20 +2549,7 @@ pub(crate) mod test_helpers {
         assert!(partitions.is_empty());
 
         // create files for partition one
-        let parquet_file_params = ParquetFileParams {
-            namespace_id: namespace.id,
-            table_id: partition1.table_id,
-            partition_id: partition1.id,
-            object_store_id: Uuid::new_v4(),
-            min_time: Timestamp::new(1),
-            max_time: Timestamp::new(10),
-            file_size_bytes: 1337,
-            row_count: 0,
-            compaction_level: CompactionLevel::Initial,
-            created_at: time_three_hour_ago,
-            column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
-            max_l0_created_at: time_now,
-        };
+        let parquet_file_params = arbitrary_parquet_file_params(&namespace, &table, &partition1);
 
         // create a deleted L0 file that was created 3 hours ago
         let delete_l0_file = repos
@@ -2133,7 +2559,7 @@ pub(crate) mod test_helpers {
             .unwrap();
         repos
             .parquet_files()
-            .flag_for_delete(delete_l0_file.id)
+            .create_upgrade_delete(&[delete_l0_file.id], &[], &[], CompactionLevel::Initial)
             .await
             .unwrap();
         let partitions = repos
@@ -2223,7 +2649,7 @@ pub(crate) mod test_helpers {
         let l0_five_hour_ago_file_params = ParquetFileParams {
             object_store_id: Uuid::new_v4(),
             created_at: time_five_hour_ago,
-            partition_id: partition2.id,
+            partition_id: partition2.transition_partition_id(),
             ..parquet_file_params.clone()
         };
         repos
@@ -2266,7 +2692,7 @@ pub(crate) mod test_helpers {
         let l1_file_params = ParquetFileParams {
             object_store_id: Uuid::new_v4(),
             created_at: time_now,
-            partition_id: partition2.id,
+            partition_id: partition2.transition_partition_id(),
             compaction_level: CompactionLevel::FileNonOverlapped,
             ..parquet_file_params.clone()
         };
@@ -2349,11 +2775,10 @@ pub(crate) mod test_helpers {
         assert!(partitions.is_empty());
 
         // Add an L2 file created just now for partition three
-        // Since the file is L2, the partition won't get updated
         let l2_file_params = ParquetFileParams {
             object_store_id: Uuid::new_v4(),
             created_at: time_now,
-            partition_id: partition3.id,
+            partition_id: partition3.transition_partition_id(),
             compaction_level: CompactionLevel::Final,
             ..parquet_file_params.clone()
         };
@@ -2362,16 +2787,17 @@ pub(crate) mod test_helpers {
             .create(l2_file_params.clone())
             .await
             .unwrap();
-        // still should return partition one and two only
+        // now should return partition one two and three
         let mut partitions = repos
             .partitions()
             .partitions_new_file_between(time_two_hour_ago, None)
             .await
             .unwrap();
-        assert_eq!(partitions.len(), 2);
+        assert_eq!(partitions.len(), 3);
         partitions.sort();
         assert_eq!(partitions[0], partition1.id);
         assert_eq!(partitions[1], partition2.id);
+        assert_eq!(partitions[2], partition3.id);
         // Only return partition1: the creation time must be strictly less than the maximum time,
         // not equal
         let partitions = repos
@@ -2393,7 +2819,7 @@ pub(crate) mod test_helpers {
         let l0_one_hour_ago_file_params = ParquetFileParams {
             object_store_id: Uuid::new_v4(),
             created_at: time_one_hour_ago,
-            partition_id: partition3.id,
+            partition_id: partition3.transition_partition_id(),
             ..parquet_file_params.clone()
         };
         repos
@@ -2451,23 +2877,7 @@ pub(crate) mod test_helpers {
             .await
             .unwrap();
 
-        let min_time = Timestamp::new(1);
-        let max_time = Timestamp::new(10);
-
-        let parquet_file_params = ParquetFileParams {
-            namespace_id: namespace.id,
-            table_id: partition.table_id,
-            partition_id: partition.id,
-            object_store_id: Uuid::new_v4(),
-            min_time,
-            max_time,
-            file_size_bytes: 1337,
-            row_count: 0,
-            compaction_level: CompactionLevel::Initial,
-            created_at: Timestamp::new(1),
-            column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
-            max_l0_created_at: Timestamp::new(1),
-        };
+        let parquet_file_params = arbitrary_parquet_file_params(&namespace, &table, &partition);
 
         let parquet_file = repos
             .parquet_files()
@@ -2485,7 +2895,7 @@ pub(crate) mod test_helpers {
             .unwrap();
         repos
             .parquet_files()
-            .flag_for_delete(delete_file.id)
+            .create_upgrade_delete(&[delete_file.id], &[], &[], CompactionLevel::Initial)
             .await
             .unwrap();
         let level1_file_params = ParquetFileParams {
@@ -2499,13 +2909,18 @@ pub(crate) mod test_helpers {
             .unwrap();
         repos
             .parquet_files()
-            .update_compaction_level(&[level1_file.id], CompactionLevel::FileNonOverlapped)
+            .create_upgrade_delete(
+                &[],
+                &[level1_file.id],
+                &[],
+                CompactionLevel::FileNonOverlapped,
+            )
             .await
             .unwrap();
         level1_file.compaction_level = CompactionLevel::FileNonOverlapped;
 
         let other_partition_params = ParquetFileParams {
-            partition_id: partition2.id,
+            partition_id: partition2.transition_partition_id(),
             object_store_id: Uuid::new_v4(),
             ..parquet_file_params.clone()
         };
@@ -2517,21 +2932,31 @@ pub(crate) mod test_helpers {
 
         let files = repos
             .parquet_files()
-            .list_by_partition_not_to_delete(partition.id)
+            .list_by_partition_not_to_delete(&partition.transition_partition_id())
             .await
             .unwrap();
-        // not asserting against a vector literal to guard against flakiness due to uncertain
-        // ordering of SQL query in postgres impl
         assert_eq!(files.len(), 2);
-        assert_matches!(files.iter().find(|f| f.id == parquet_file.id), Some(_));
-        assert_matches!(files.iter().find(|f| f.id == level1_file.id), Some(_));
 
-        // remove namespace to avoid it from affecting later tests
-        repos
-            .namespaces()
-            .soft_delete("namespace_parquet_file_test_list_by_partiton_not_to_delete")
+        let mut file_ids: Vec<_> = files.into_iter().map(|f| f.id).collect();
+        file_ids.sort();
+        let mut expected_ids = vec![parquet_file.id, level1_file.id];
+        expected_ids.sort();
+        assert_eq!(file_ids, expected_ids);
+
+        // Using the catalog partition ID should return the same files, even if the Parquet file
+        // records don't have the partition ID on them (which is the default now)
+        let files = repos
+            .parquet_files()
+            .list_by_partition_not_to_delete(&TransitionPartitionId::Deprecated(partition.id))
             .await
-            .expect("delete namespace should succeed");
+            .unwrap();
+        assert_eq!(files.len(), 2);
+
+        let mut file_ids: Vec<_> = files.into_iter().map(|f| f.id).collect();
+        file_ids.sort();
+        let mut expected_ids = vec![parquet_file.id, level1_file.id];
+        expected_ids.sort();
+        assert_eq!(file_ids, expected_ids);
     }
 
     async fn test_update_to_compaction_level_1(catalog: Arc<dyn Catalog>) {
@@ -2550,20 +2975,9 @@ pub(crate) mod test_helpers {
         let query_max_time = Timestamp::new(10);
 
         // Create a file with times entirely within the window
-        let parquet_file_params = ParquetFileParams {
-            namespace_id: namespace.id,
-            table_id: partition.table_id,
-            partition_id: partition.id,
-            object_store_id: Uuid::new_v4(),
-            min_time: query_min_time + 1,
-            max_time: query_max_time - 1,
-            file_size_bytes: 1337,
-            row_count: 0,
-            compaction_level: CompactionLevel::Initial,
-            created_at: Timestamp::new(1),
-            column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
-            max_l0_created_at: Timestamp::new(1),
-        };
+        let mut parquet_file_params = arbitrary_parquet_file_params(&namespace, &table, &partition);
+        parquet_file_params.min_time = query_min_time + 1;
+        parquet_file_params.max_time = query_max_time - 1;
         let parquet_file = repos
             .parquet_files()
             .create(parquet_file_params.clone())
@@ -2582,15 +2996,17 @@ pub(crate) mod test_helpers {
 
         // Make parquet_file compaction level 1, attempt to mark the nonexistent file; operation
         // should succeed
-        let updated = repos
+        let created = repos
             .parquet_files()
-            .update_compaction_level(
+            .create_upgrade_delete(
+                &[],
                 &[parquet_file.id, nonexistent_parquet_file_id],
+                &[],
                 CompactionLevel::FileNonOverlapped,
             )
             .await
             .unwrap();
-        assert_eq!(updated, vec![parquet_file.id]);
+        assert_eq!(created, vec![]);
 
         // remove namespace to avoid it from affecting later tests
         repos
@@ -2630,21 +3046,9 @@ pub(crate) mod test_helpers {
             .unwrap();
 
         // parquet files
-        let parquet_file_params = ParquetFileParams {
-            namespace_id: namespace_1.id,
-            table_id: partition_1.table_id,
-            partition_id: partition_1.id,
-            object_store_id: Uuid::new_v4(),
-            min_time: Timestamp::new(100),
-            max_time: Timestamp::new(250),
-            file_size_bytes: 1337,
-            row_count: 0,
-            compaction_level: CompactionLevel::Initial,
-            created_at: Timestamp::new(1),
-            column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
-            max_l0_created_at: Timestamp::new(1),
-        };
-        let p1_n1 = repos
+        let parquet_file_params =
+            arbitrary_parquet_file_params(&namespace_1, &table_1, &partition_1);
+        repos
             .parquet_files()
             .create(parquet_file_params.clone())
             .await
@@ -2655,7 +3059,7 @@ pub(crate) mod test_helpers {
             max_time: Timestamp::new(300),
             ..parquet_file_params
         };
-        let p2_n1 = repos
+        repos
             .parquet_files()
             .create(parquet_file_params_2.clone())
             .await
@@ -2678,21 +3082,9 @@ pub(crate) mod test_helpers {
             .unwrap();
 
         // parquet files
-        let parquet_file_params = ParquetFileParams {
-            namespace_id: namespace_2.id,
-            table_id: partition_2.table_id,
-            partition_id: partition_2.id,
-            object_store_id: Uuid::new_v4(),
-            min_time: Timestamp::new(100),
-            max_time: Timestamp::new(250),
-            file_size_bytes: 1337,
-            row_count: 0,
-            compaction_level: CompactionLevel::Initial,
-            created_at: Timestamp::new(1),
-            column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
-            max_l0_created_at: Timestamp::new(1),
-        };
-        let p1_n2 = repos
+        let parquet_file_params =
+            arbitrary_parquet_file_params(&namespace_2, &table_2, &partition_2);
+        repos
             .parquet_files()
             .create(parquet_file_params.clone())
             .await
@@ -2703,7 +3095,7 @@ pub(crate) mod test_helpers {
             max_time: Timestamp::new(300),
             ..parquet_file_params
         };
-        let p2_n2 = repos
+        repos
             .parquet_files()
             .create(parquet_file_params_2.clone())
             .await
@@ -2767,22 +3159,14 @@ pub(crate) mod test_helpers {
                 .len(),
             1
         );
-        assert!(repos
+
+        // partition's get_by_id should succeed
+        repos
             .partitions()
             .get_by_id(partition_1.id)
             .await
-            .expect("fetching partition by id should succeed")
-            .is_some());
-        assert!(repos
-            .parquet_files()
-            .exist(p1_n1.id)
-            .await
-            .expect("parquet file exists check should succeed"));
-        assert!(repos
-            .parquet_files()
-            .exist(p2_n1.id)
-            .await
-            .expect("parquet file exists check should succeed"));
+            .unwrap()
+            .unwrap();
 
         // assert that the namespace, table, column, and parquet files for namespace_2 are still
         // there
@@ -2792,6 +3176,7 @@ pub(crate) mod test_helpers {
             .await
             .expect("get namespace should succeed")
             .is_some());
+
         assert!(repos
             .tables()
             .get_by_id(table_2.id)
@@ -2816,22 +3201,14 @@ pub(crate) mod test_helpers {
                 .len(),
             1
         );
-        assert!(repos
+
+        // partition's get_by_id should succeed
+        repos
             .partitions()
             .get_by_id(partition_2.id)
             .await
-            .expect("fetching partition by id should succeed")
-            .is_some());
-        assert!(repos
-            .parquet_files()
-            .exist(p1_n2.id)
-            .await
-            .expect("parquet file exists check should succeed"));
-        assert!(repos
-            .parquet_files()
-            .exist(p2_n2.id)
-            .await
-            .expect("parquet file exists check should succeed"));
+            .unwrap()
+            .unwrap();
     }
 
     /// Upsert a namespace called `namespace_name` and write `lines` to it.
@@ -2845,7 +3222,12 @@ pub(crate) mod test_helpers {
     {
         let namespace = repos
             .namespaces()
-            .create(&NamespaceName::new(namespace_name).unwrap(), None)
+            .create(
+                &NamespaceName::new(namespace_name).unwrap(),
+                None,
+                None,
+                None,
+            )
             .await;
 
         let namespace = match namespace {

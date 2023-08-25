@@ -1,6 +1,7 @@
 //! CLI config for the router using the RPC write path
 
 use crate::{
+    gossip::GossipConfig,
     ingester_address::IngesterAddress,
     single_tenant::{
         CONFIG_AUTHZ_ENV_NAME, CONFIG_AUTHZ_FLAG, CONFIG_CST_ENV_NAME, CONFIG_CST_FLAG,
@@ -15,6 +16,10 @@ use std::{
 #[derive(Debug, Clone, clap::Parser)]
 #[allow(missing_copy_implementations)]
 pub struct RouterConfig {
+    /// Gossip config.
+    #[clap(flatten)]
+    pub gossip_config: GossipConfig,
+
     /// Addr for connection to authz
     #[clap(
         long = CONFIG_AUTHZ_FLAG,
@@ -111,16 +116,31 @@ pub struct RouterConfig {
     )]
     pub rpc_write_max_outgoing_bytes: usize,
 
-    /// Specify the optional replication factor for each RPC write.
+    /// Enable optional replication for each RPC write.
     ///
-    /// The total number of copies of data after replication will be this value,
-    /// plus 1.
+    /// This value specifies the total number of copies of data after
+    /// replication, defaulting to 1.
     ///
     /// If the desired replication level is not achieved, a partial write error
     /// will be returned to the user. The write MAY be queryable after a partial
     /// write failure.
-    #[clap(long = "rpc-write-replicas", env = "INFLUXDB_IOX_RPC_WRITE_REPLICAS")]
-    pub rpc_write_replicas: Option<NonZeroUsize>,
+    #[clap(
+        long = "rpc-write-replicas",
+        env = "INFLUXDB_IOX_RPC_WRITE_REPLICAS",
+        default_value = "1"
+    )]
+    pub rpc_write_replicas: NonZeroUsize,
+
+    /// Specify the maximum number of probe requests to be sent per second.
+    ///
+    /// At least 20% of these requests must succeed within a second for the
+    /// endpoint to be considered healthy.
+    #[clap(
+        long = "rpc-write-health-num-probes",
+        env = "INFLUXDB_IOX_RPC_WRITE_HEALTH_NUM_PROBES",
+        default_value = "10"
+    )]
+    pub rpc_write_health_num_probes: u64,
 }
 
 /// Map a string containing an integer number of seconds into a [`Duration`].

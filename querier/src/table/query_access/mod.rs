@@ -13,10 +13,9 @@ use datafusion::{
 use iox_query::{
     exec::SessionContextIOxExt,
     provider::{ChunkPruner, Error as ProviderError, ProviderBuilder},
-    pruning::{prune_chunks, NotPrunedReason, PruningObserver},
+    pruning::{prune_chunks, retention_expr, NotPrunedReason, PruningObserver},
     QueryChunk,
 };
-use predicate::Predicate;
 use schema::Schema;
 
 use crate::{ingester::IngesterChunk, parquet::QuerierParquetChunk};
@@ -54,17 +53,27 @@ impl TableProvider for QuerierTable {
         let mut builder =
             ProviderBuilder::new(Arc::clone(self.table_name()), self.schema().clone());
 
-        let pruning_predicate = filters
-            .iter()
-            .cloned()
-            .fold(Predicate::default(), Predicate::with_expr);
+        let filters = match self.namespace_retention_period {
+            Some(d) => {
+                let ts = self
+                    .chunk_adapter
+                    .catalog_cache()
+                    .time_provider()
+                    .now()
+                    .timestamp_nanos()
+                    - d.as_nanos() as i64;
+
+                filters
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(retention_expr(ts)))
+                    .collect::<Vec<_>>()
+            }
+            None => filters.to_vec(),
+        };
 
         let chunks = self
-            .chunks(
-                &pruning_predicate,
-                ctx.child_span("QuerierTable chunks"),
-                projection,
-            )
+            .chunks(&filters, ctx.child_span("QuerierTable chunks"), projection)
             .await?;
 
         for chunk in chunks {
@@ -76,7 +85,7 @@ impl TableProvider for QuerierTable {
             Err(e) => panic!("unexpected error: {e:?}"),
         };
 
-        provider.scan(ctx, projection, filters, limit).await
+        provider.scan(ctx, projection, &filters, limit).await
     }
 
     fn supports_filter_pushdown(
@@ -104,11 +113,11 @@ impl ChunkPruner for QuerierTableChunkPruner {
         _table_name: &str,
         table_schema: &Schema,
         chunks: Vec<Arc<dyn QueryChunk>>,
-        predicate: &Predicate,
+        filters: &[Expr],
     ) -> Result<Vec<Arc<dyn QueryChunk>>, ProviderError> {
         let observer = &MetricPruningObserver::new(Arc::clone(&self.metrics));
 
-        let chunks = match prune_chunks(table_schema, &chunks, predicate) {
+        let chunks = match prune_chunks(table_schema, &chunks, filters) {
             Ok(keeps) => {
                 assert_eq!(chunks.len(), keeps.len());
                 chunks
@@ -144,16 +153,6 @@ pub(crate) struct MetricPruningObserver {
 impl MetricPruningObserver {
     pub(crate) fn new(metrics: Arc<PruneMetrics>) -> Self {
         Self { metrics }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new_unregistered() -> Self {
-        Self::new(Arc::new(PruneMetrics::new_unregistered()))
-    }
-
-    /// Called when pruning a chunk before fully creating the chunk structure
-    pub(crate) fn was_pruned_early(&self, row_count: u64, size_estimate: u64) {
-        self.metrics.pruned_early.inc(1, row_count, size_estimate);
     }
 }
 

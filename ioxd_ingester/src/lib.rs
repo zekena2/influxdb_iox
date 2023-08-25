@@ -1,3 +1,19 @@
+#![deny(rustdoc::broken_intra_doc_links, rust_2018_idioms)]
+#![warn(
+    clippy::clone_on_ref_ptr,
+    clippy::dbg_macro,
+    clippy::explicit_iter_loop,
+    // See https://github.com/influxdata/influxdb_iox/pull/1671
+    clippy::future_not_send,
+    clippy::todo,
+    clippy::use_self,
+    missing_debug_implementations,
+    unused_crate_dependencies
+)]
+
+// Workaround for "unused crate" lint false positives.
+use workspace_hack as _;
+
 use arrow_flight::flight_service_server::FlightServiceServer;
 use async_trait::async_trait;
 use clap_blocks::ingester::IngesterConfig;
@@ -9,7 +25,7 @@ use generated_types::influxdata::iox::{
     },
 };
 use hyper::{Body, Request, Response};
-use ingester::{IngesterGuard, IngesterRpcInterface};
+use ingester::{GossipConfig, IngesterGuard, IngesterRpcInterface};
 use iox_catalog::interface::Catalog;
 use iox_query::exec::Executor;
 use ioxd_common::{
@@ -162,7 +178,7 @@ pub enum IoxHttpError {
 impl IoxHttpError {
     fn status_code(&self) -> HttpApiErrorCode {
         match self {
-            IoxHttpError::NotFound => HttpApiErrorCode::NotFound,
+            Self::NotFound => HttpApiErrorCode::NotFound,
         }
     }
 }
@@ -194,6 +210,14 @@ pub async fn create_ingester_server_type(
 ) -> Result<Arc<dyn ServerType>> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
+    let gossip = match ingester_config.gossip_config.gossip_bind_address {
+        None => GossipConfig::Disabled,
+        Some(v) => GossipConfig::Enabled {
+            bind_addr: v.into(),
+            peers: ingester_config.gossip_config.seed_list.clone(),
+        },
+    };
+
     let grpc = ingester::new(
         catalog,
         Arc::clone(&metrics),
@@ -205,6 +229,7 @@ pub async fn create_ingester_server_type(
         ingester_config.persist_queue_depth,
         ingester_config.persist_hot_partition_cost,
         object_store,
+        gossip,
         shutdown_rx.map(|v| v.expect("shutdown sender dropped without calling shutdown")),
     )
     .await?;

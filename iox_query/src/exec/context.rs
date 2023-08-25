@@ -33,7 +33,11 @@ use crate::{
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::{
-    catalog::catalog::CatalogProvider,
+    catalog::CatalogProvider,
+    common::{
+        plan_err,
+        tree_node::{TreeNode, TreeNodeVisitor, VisitRecursion},
+    },
     execution::{
         context::{QueryPlanner, SessionState, TaskContext},
         memory_pool::MemoryPool,
@@ -41,13 +45,10 @@ use datafusion::{
     },
     logical_expr::{LogicalPlan, UserDefinedLogicalNode},
     physical_plan::{
-        coalesce_partitions::CoalescePartitionsExec,
-        displayable,
-        planner::{DefaultPhysicalPlanner, ExtensionPlanner},
-        stream::RecordBatchStreamAdapter,
-        EmptyRecordBatchStream, ExecutionPlan, PhysicalPlanner, RecordBatchStream,
-        SendableRecordBatchStream,
+        coalesce_partitions::CoalescePartitionsExec, displayable, stream::RecordBatchStreamAdapter,
+        EmptyRecordBatchStream, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
     },
+    physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner},
     prelude::*,
 };
 use datafusion_util::config::{iox_session_config, DEFAULT_CATALOG};
@@ -62,7 +63,7 @@ use trace::{
 };
 
 // Reuse DataFusion error and Result types for this module
-pub use datafusion::error::{DataFusionError as Error, Result};
+pub use datafusion::error::{DataFusionError, Result};
 
 /// This structure implements the DataFusion notion of "query planner"
 /// and is needed to create plans with the IOx extension nodes.
@@ -346,7 +347,10 @@ impl IOxSessionContext {
         let ctx = self.child_ctx("sql_to_logical_plan");
         debug!(text=%sql, "planning SQL query");
         // NOTE can not use ctx.inner.sql() here as it also interprets DDL
-        ctx.inner.state().create_logical_plan(sql).await
+        let plan = ctx.inner.state().create_logical_plan(sql).await?;
+        // TODO use better API: https://github.com/apache/arrow-datafusion/issues/7328
+        verify_plan(&plan)?;
+        Ok(plan)
     }
 
     /// Create a logical plan that reads a single [`RecordBatch`]. Use
@@ -376,7 +380,7 @@ impl IOxSessionContext {
         let physical_plan = ctx.inner.state().create_physical_plan(logical_plan).await?;
 
         ctx.recorder.event("physical plan");
-        debug!(text=%displayable(physical_plan.as_ref()).indent(), "create_physical_plan: plan to run");
+        debug!(text=%displayable(physical_plan.as_ref()).indent(false), "create_physical_plan: plan to run");
         Ok(physical_plan)
     }
 
@@ -385,7 +389,7 @@ impl IOxSessionContext {
     pub async fn collect(&self, physical_plan: Arc<dyn ExecutionPlan>) -> Result<Vec<RecordBatch>> {
         debug!(
             "Running plan, physical:\n{}",
-            displayable(physical_plan.as_ref()).indent()
+            displayable(physical_plan.as_ref()).indent(false)
         );
         let ctx = self.child_ctx("collect");
         let stream = ctx.execute_stream(physical_plan).await?;
@@ -503,7 +507,7 @@ impl IOxSessionContext {
                     })
                     .await?;
 
-                    Ok::<_, Error>(CrossRtStream::new_with_df_error_stream(stream, exec))
+                    Ok::<_, DataFusionError>(CrossRtStream::new_with_df_error_stream(stream, exec))
                 }
             })
             .try_flatten()
@@ -518,9 +522,10 @@ impl IOxSessionContext {
                     return Ok(None);
                 }
 
-                let series: Vec<Series> = series_set
-                    .try_into_series(points_per_batch)
-                    .map_err(|e| Error::Execution(format!("Error converting to series: {e}")))?;
+                let series: Vec<Series> =
+                    series_set.try_into_series(points_per_batch).map_err(|e| {
+                        DataFusionError::Execution(format!("Error converting to series: {e}"))
+                    })?;
                 Ok(Some(futures::stream::iter(series).map(Ok)))
             })
             .try_flatten();
@@ -556,9 +561,9 @@ impl IOxSessionContext {
                             .await?
                             .into_fieldlist()
                             .map_err(|e| {
-                                Error::Context(
+                                DataFusionError::Context(
                                     "Error converting to field list".to_string(),
-                                    Box::new(Error::External(Box::new(e))),
+                                    Box::new(DataFusionError::External(Box::new(e))),
                                 )
                             })?;
 
@@ -583,9 +588,9 @@ impl IOxSessionContext {
 
         // TODO: Stream this
         results.into_fieldlist().map_err(|e| {
-            Error::Context(
+            DataFusionError::Context(
                 "Error converting to field list".to_string(),
-                Box::new(Error::External(Box::new(e))),
+                Box::new(DataFusionError::External(Box::new(e))),
             )
         })
     }
@@ -601,9 +606,9 @@ impl IOxSessionContext {
                 .await?
                 .into_stringset()
                 .map_err(|e| {
-                    Error::Context(
+                    DataFusionError::Context(
                         "Error converting to stringset".to_string(),
-                        Box::new(Error::External(Box::new(e))),
+                        Box::new(DataFusionError::External(Box::new(e))),
                     )
                 }),
         }
@@ -649,9 +654,9 @@ impl IOxSessionContext {
         T: Send + 'static,
     {
         exec.spawn(fut).await.unwrap_or_else(|e| {
-            Err(Error::Context(
+            Err(DataFusionError::Context(
                 "Join Error".to_string(),
-                Box::new(Error::External(e.into())),
+                Box::new(DataFusionError::External(Box::new(e))),
             ))
         })
     }
@@ -688,6 +693,32 @@ impl IOxSessionContext {
     /// Number of currently active tasks.
     pub fn tasks(&self) -> usize {
         self.exec.tasks()
+    }
+}
+
+/// Returns an error if this plan contains any unsupported statements:
+///
+/// * DDL (`CREATE TABLE`) - creates state in a context that is dropped at the end of the request
+/// * Statements (`SET VARIABLE`) - can cause denial of service by using more memory or cput
+/// * DML (`INSERT`, `COPY`) - can write local files so is a security risk on servers
+fn verify_plan(plan: &LogicalPlan) -> Result<()> {
+    plan.visit(&mut BadPlanVisitor {})?;
+    Ok(())
+}
+
+struct BadPlanVisitor {}
+
+impl TreeNodeVisitor for BadPlanVisitor {
+    type N = LogicalPlan;
+
+    fn pre_visit(&mut self, node: &Self::N) -> Result<VisitRecursion> {
+        match node {
+            LogicalPlan::Ddl(ddl) => plan_err!("DDL not supported: {}", ddl.name()),
+            LogicalPlan::Dml(dml) => plan_err!("DML not supported: {}", dml.op),
+            LogicalPlan::Copy(_) => plan_err!("DML not supported: COPY"),
+            LogicalPlan::Statement(stmt) => plan_err!("Statement not supported: {}", stmt.name()),
+            _ => Ok(VisitRecursion::Continue),
+        }
     }
 }
 

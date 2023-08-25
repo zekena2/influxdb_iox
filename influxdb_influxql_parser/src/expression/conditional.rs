@@ -105,6 +105,46 @@ impl ConditionalExpression {
             None
         }
     }
+
+    /// Return `self == other`
+    pub fn eq(self, other: Self) -> Self {
+        binary_cond(self, ConditionalOperator::Eq, other)
+    }
+
+    /// Return `self != other`
+    pub fn not_eq(self, other: Self) -> Self {
+        binary_cond(self, ConditionalOperator::NotEq, other)
+    }
+
+    /// Return `self > other`
+    pub fn gt(self, other: Self) -> Self {
+        binary_cond(self, ConditionalOperator::Gt, other)
+    }
+
+    /// Return `self >= other`
+    pub fn gt_eq(self, other: Self) -> Self {
+        binary_cond(self, ConditionalOperator::GtEq, other)
+    }
+
+    /// Return `self < other`
+    pub fn lt(self, other: Self) -> Self {
+        binary_cond(self, ConditionalOperator::Lt, other)
+    }
+
+    /// Return `self <= other`
+    pub fn lt_eq(self, other: Self) -> Self {
+        binary_cond(self, ConditionalOperator::LtEq, other)
+    }
+
+    /// Return `self AND other`
+    pub fn and(self, other: Self) -> Self {
+        binary_cond(self, ConditionalOperator::And, other)
+    }
+
+    /// Return `self OR other`
+    pub fn or(self, other: Self) -> Self {
+        binary_cond(self, ConditionalOperator::Or, other)
+    }
 }
 
 impl Display for ConditionalExpression {
@@ -220,10 +260,7 @@ pub fn parse_conditional_expression(input: &str) -> Result<ConditionalExpression
     let mut i: &str = input;
 
     // Consume whitespace from the input
-    i = match ws0(i) {
-        Ok((i1, _)) => i1,
-        _ => unreachable!("ws0 is infallible"),
-    };
+    (i, _) = ws0(i).expect("ws0 is infallible");
 
     if i.is_empty() {
         return Err(ParseError {
@@ -253,10 +290,7 @@ pub fn parse_conditional_expression(input: &str) -> Result<ConditionalExpression
     };
 
     // Consume remaining whitespace from the input
-    i = match ws0(i) {
-        Ok((i1, _)) => i1,
-        _ => unreachable!("ws0 is infallible"),
-    };
+    (i, _) = ws0(i).expect("ws0 is infallible");
 
     if !i.is_empty() {
         return Err(ParseError {
@@ -328,6 +362,19 @@ impl ArithmeticParsers for ConditionalExpression {
 /// Parse an arithmetic expression used by conditional expressions.
 pub(crate) fn arithmetic_expression(i: &str) -> ParseResult<&str, Expr> {
     arithmetic::<ConditionalExpression>(i)
+}
+
+/// Return a new conditional expression, `lhs op rhs`.
+pub fn binary_cond(
+    lhs: ConditionalExpression,
+    op: ConditionalOperator,
+    rhs: ConditionalExpression,
+) -> ConditionalExpression {
+    ConditionalExpression::Binary(ConditionalBinary {
+        lhs: Box::new(lhs),
+        op,
+        rhs: Box::new(rhs),
+    })
 }
 
 #[cfg(test)]

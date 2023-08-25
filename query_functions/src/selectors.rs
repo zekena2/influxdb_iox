@@ -97,26 +97,19 @@
 //! [selector functions]: https://docs.influxdata.com/influxdb/v1.8/query_language/functions/#selectors
 use std::{fmt::Debug, sync::Arc};
 
-use arrow::{
-    array::ArrayRef,
-    datatypes::{DataType, Field, Fields},
-};
+use arrow::datatypes::DataType;
 use datafusion::{
-    error::{DataFusionError, Result as DataFusionResult},
-    logical_expr::{AccumulatorFunctionImplementation, Signature, TypeSignature, Volatility},
+    error::Result as DataFusionResult,
+    logical_expr::{AccumulatorFactoryFunction, Signature, Volatility},
     physical_plan::{udaf::AggregateUDF, Accumulator},
     prelude::SessionContext,
-    scalar::ScalarValue,
 };
 
-/// Internal implementations of the selector functions
 mod internal;
-use internal::{
-    BooleanMaxSelector, BooleanMinSelector, F64MaxSelector, F64MinSelector, FirstSelector,
-    I64MaxSelector, I64MinSelector, LastSelector, U64MaxSelector, U64MinSelector, Utf8MaxSelector,
-    Utf8MinSelector,
-};
-use schema::TIME_DATA_TYPE;
+use internal::{Comparison, Selector, Target};
+
+mod type_handling;
+use type_handling::AggType;
 
 /// registers selector functions so they can be invoked via SQL
 pub fn register_selector_aggregates(ctx: &SessionContext) {
@@ -210,116 +203,57 @@ enum SelectorType {
 #[derive(Debug)]
 struct FactoryBuilder {
     selector_type: SelectorType,
-
-    /// If the selector output is "time" we can't determine the
-    /// accumuator type from the return type, so hold we pass the data type explicitly
-    value_type: Option<DataType>,
 }
 
 impl FactoryBuilder {
     fn new(selector_type: SelectorType) -> Self {
-        Self {
-            selector_type,
-            value_type: None,
-        }
+        Self { selector_type }
     }
 
     fn build_state_type_factory(&self) -> StateTypeFactory {
-        let value_type = self.value_type.clone();
-
         Arc::new(move |return_type| {
-            let value_type = match &value_type {
-                Some(t) => t,
-                None => value_data_type_from_return_data_type(return_type),
-            };
-
-            let state_types = make_state_datatypes(value_type.clone());
-            Ok(Arc::new(state_types))
+            let agg_type = AggType::try_from_return_type(return_type)?;
+            Ok(Arc::new(agg_type.state_datatypes()))
         })
     }
 
     /// Returns a function that instantiates the accumulator, consuming self
-    fn build_accumulator_factory(self) -> AccumulatorFunctionImplementation {
-        let Self {
-            selector_type,
-            value_type,
-        } = self;
+    fn build_accumulator_factory(self) -> AccumulatorFactoryFunction {
+        let Self { selector_type } = self;
 
         Arc::new(move |return_type| {
-            let value_type = match &value_type {
-                Some(t) => t,
-                None => value_data_type_from_return_data_type(return_type),
-            };
+            let agg_type = AggType::try_from_return_type(return_type)?;
+            let value_type = agg_type.value_type;
+            let other_types = agg_type.other_types;
 
-            let accumulator: Box<dyn Accumulator> = match (selector_type, value_type) {
-                // First
-                (SelectorType::First, value_type) => {
-                    Box::new(SelectorAccumulator::new(FirstSelector::new(value_type)?))
-                }
-
-                // Last
-                (SelectorType::Last, data_type) => Box::new(SelectorAccumulator::new(LastSelector::new(data_type)?)),
-
-                // Min
-                (SelectorType::Min, DataType::Float64) => Box::new(SelectorAccumulator::new(F64MinSelector::default())),
-                (SelectorType::Min, DataType::Int64) => Box::new(SelectorAccumulator::new(I64MinSelector::default())),
-                (SelectorType::Min, DataType::UInt64) => Box::new(SelectorAccumulator::new(U64MinSelector::default())),
-                (SelectorType::Min, DataType::Utf8) => Box::new(SelectorAccumulator::new(Utf8MinSelector::default())),
-                (SelectorType::Min, DataType::Boolean) => {
-                    Box::new(SelectorAccumulator::<>::new(BooleanMinSelector::default()))
-                },
-
-                // Max
-                (SelectorType::Max, DataType::Float64) => Box::new(SelectorAccumulator::new(F64MaxSelector::default())),
-                (SelectorType::Max, DataType::Int64) => Box::new(SelectorAccumulator::new(I64MaxSelector::default())),
-                (SelectorType::Max, DataType::UInt64) => Box::new(SelectorAccumulator::new(U64MaxSelector::default())),
-                (SelectorType::Max, DataType::Utf8) => Box::new(SelectorAccumulator::new(Utf8MaxSelector::default())),
-                (SelectorType::Max, DataType::Boolean) => {
-                    Box::new(SelectorAccumulator::new(BooleanMaxSelector::default()))
-                },
-                // Catch
-                (selector_type, value_type) => return Err(DataFusionError::Internal(format!(
-                    "Unhandled selector type. Expected value type of f64/i64/u64/string/bool, got {selector_type:?} for {value_type:?}",
-                ))),
+            let accumulator: Box<dyn Accumulator> = match selector_type {
+                SelectorType::First => Box::new(Selector::new(
+                    Comparison::Min,
+                    Target::Time,
+                    value_type,
+                    other_types.iter().cloned(),
+                )?),
+                SelectorType::Last => Box::new(Selector::new(
+                    Comparison::Max,
+                    Target::Time,
+                    value_type,
+                    other_types.iter().cloned(),
+                )?),
+                SelectorType::Min => Box::new(Selector::new(
+                    Comparison::Min,
+                    Target::Value,
+                    value_type,
+                    other_types.iter().cloned(),
+                )?),
+                SelectorType::Max => Box::new(Selector::new(
+                    Comparison::Max,
+                    Target::Value,
+                    value_type,
+                    other_types.iter().cloned(),
+                )?),
             };
             Ok(accumulator)
         })
-    }
-}
-
-/// Implements the logic of the specific selector function (this is a
-/// cutdown version of the Accumulator DataFusion trait, to allow
-/// sharing between implementations)
-trait Selector: Debug + Send + Sync {
-    /// return state in a form that DataFusion can store during execution
-    fn datafusion_state(&self) -> DataFusionResult<Vec<ScalarValue>>;
-
-    /// produces the final value of this selector for the specified output type
-    fn evaluate(&self) -> DataFusionResult<ScalarValue>;
-
-    /// Update this selector's state based on values in value_arr and time_arr
-    fn update_batch(&mut self, value_arr: &ArrayRef, time_arr: &ArrayRef) -> DataFusionResult<()>;
-
-    /// Allocated size required for this selector, in bytes,
-    /// including `Self`.  Allocated means that for internal
-    /// containers such as `Vec`, the `capacity` should be used not
-    /// the `len`
-    fn size(&self) -> usize;
-}
-
-/// Create the struct fields for a selector with DataType `value_type`
-fn make_struct_fields(value_type: DataType) -> Fields {
-    Fields::from(vec![
-        Field::new("value", value_type, true),
-        Field::new("time", TIME_DATA_TYPE(), true),
-    ])
-}
-
-/// Return the value type given the (struct) output data type
-fn value_data_type_from_return_data_type(output_type: &DataType) -> &DataType {
-    match output_type {
-        DataType::Struct(fields) => fields[0].data_type(),
-        t => t,
     }
 }
 
@@ -330,16 +264,7 @@ type StateTypeFactory =
 /// Create a User Defined Aggregate Function (UDAF) for datafusion.
 fn make_uda(name: &str, factory_builder: FactoryBuilder) -> AggregateUDF {
     // All selectors support the same input types / signatures
-    let input_signature = Signature::one_of(
-        vec![
-            TypeSignature::Exact(vec![DataType::Float64, TIME_DATA_TYPE()]),
-            TypeSignature::Exact(vec![DataType::Int64, TIME_DATA_TYPE()]),
-            TypeSignature::Exact(vec![DataType::UInt64, TIME_DATA_TYPE()]),
-            TypeSignature::Exact(vec![DataType::Utf8, TIME_DATA_TYPE()]),
-            TypeSignature::Exact(vec![DataType::Boolean, TIME_DATA_TYPE()]),
-        ],
-        Volatility::Stable,
-    );
+    let input_signature = Signature::variadic_any(Volatility::Stable);
 
     // return type of the selector is based on the input arguments.
     //
@@ -347,24 +272,8 @@ fn make_uda(name: &str, factory_builder: FactoryBuilder) -> AggregateUDF {
     // 'value' and 'time' field of the same time.
     let captured_name = name.to_string();
     let return_type_func: ReturnTypeFunction = Arc::new(move |arg_types| {
-        if arg_types.len() != 2 {
-            return Err(DataFusionError::Plan(format!(
-                "{} requires exactly 2 arguments, got {}",
-                captured_name,
-                arg_types.len()
-            )));
-        }
-
-        let input_type = &arg_types[0];
-        let time_type = &arg_types[1];
-        if time_type != &TIME_DATA_TYPE() {
-            return Err(DataFusionError::Plan(format!(
-                "{captured_name} second argument must be a timestamp, but got {time_type}"
-            )));
-        }
-        let return_type = DataType::Struct(make_struct_fields(input_type.clone()));
-
-        Ok(Arc::new(return_type))
+        let agg_type = AggType::try_from_arg_types(arg_types, &captured_name)?;
+        Ok(Arc::new(agg_type.return_type()))
     });
 
     // state type given the return type
@@ -377,83 +286,6 @@ fn make_uda(name: &str, factory_builder: FactoryBuilder) -> AggregateUDF {
         &factory_builder.build_accumulator_factory(),
         &state_type_factory,
     )
-}
-
-/// Return the state in which the arguments are stored
-fn make_state_datatypes(value_type: DataType) -> Vec<DataType> {
-    vec![value_type, TIME_DATA_TYPE()]
-}
-
-/// Structure that implements the Accumulator trait for DataFusion
-/// and processes (value, timestamp) pair and computes values
-#[derive(Debug)]
-struct SelectorAccumulator<SELECTOR>
-where
-    SELECTOR: Selector,
-{
-    // The underlying implementation for the selector
-    selector: SELECTOR,
-}
-
-impl<SELECTOR> SelectorAccumulator<SELECTOR>
-where
-    SELECTOR: Selector,
-{
-    pub fn new(selector: SELECTOR) -> Self {
-        Self { selector }
-    }
-}
-
-impl<SELECTOR> Accumulator for SelectorAccumulator<SELECTOR>
-where
-    SELECTOR: Selector + 'static,
-{
-    // this function serializes our state to a vector of
-    // `ScalarValue`s, which DataFusion uses to pass this state
-    // between execution stages.
-    fn state(&self) -> DataFusionResult<Vec<ScalarValue>> {
-        self.selector.datafusion_state()
-    }
-
-    /// Allocated size required for this accumulator, in bytes,
-    /// including `Self`.  Allocated means that for internal
-    /// containers such as `Vec`, the `capacity` should be used not
-    /// the `len`
-    fn size(&self) -> usize {
-        std::mem::size_of_val(self) - std::mem::size_of_val(&self.selector) + self.selector.size()
-    }
-
-    // Return the final value of this aggregator.
-    fn evaluate(&self) -> DataFusionResult<ScalarValue> {
-        self.selector.evaluate()
-    }
-
-    // This function receives one entry per argument of this
-    // accumulator and updates the selector state function appropriately
-    fn update_batch(&mut self, values: &[ArrayRef]) -> DataFusionResult<()> {
-        if values.is_empty() {
-            return Ok(());
-        }
-
-        if values.len() != 2 {
-            return Err(DataFusionError::Internal(format!(
-                "Internal error: Expected 2 arguments passed to selector function but got {}",
-                values.len()
-            )));
-        }
-
-        // invoke the actual worker function.
-        self.selector.update_batch(&values[0], &values[1])?;
-        Ok(())
-    }
-
-    // The input values and accumulator state are the same types for
-    // selectors, and thus we can merge intermediate states with the
-    // same function as inputs
-    fn merge_batch(&mut self, states: &[ArrayRef]) -> DataFusionResult<()> {
-        // merge is the same operation as update for these selectors
-        self.update_batch(states)
-    }
 }
 
 #[cfg(test)]
@@ -470,7 +302,7 @@ mod test {
     use datafusion::{datasource::MemTable, prelude::*};
 
     use super::*;
-    use utils::run_case;
+    use utils::{run_case, run_cases_err};
 
     mod first {
         use super::*;
@@ -485,6 +317,66 @@ mod test {
                     "+------------------------------------------------+",
                     "| {value: 2.0, time: 1970-01-01T00:00:00.000001} |",
                     "+------------------------------------------------+",
+                ],
+            )
+            .await;
+
+            run_case(
+                selector_first().call(vec![col("f64_not_normal_1_value"), col("time")]),
+                vec![
+                    "+-------------------------------------------------+",
+                    "| selector_first(t.f64_not_normal_1_value,t.time) |",
+                    "+-------------------------------------------------+",
+                    "| {value: NaN, time: 1970-01-01T00:00:00.000001}  |",
+                    "+-------------------------------------------------+",
+                ],
+            )
+            .await;
+
+            run_case(
+                selector_first().call(vec![col("f64_not_normal_2_value"), col("time")]),
+                vec![
+                    "+-------------------------------------------------+",
+                    "| selector_first(t.f64_not_normal_2_value,t.time) |",
+                    "+-------------------------------------------------+",
+                    "| {value: -inf, time: 1970-01-01T00:00:00.000001} |",
+                    "+-------------------------------------------------+",
+                ],
+            )
+            .await;
+
+            run_case(
+                selector_first().call(vec![col("f64_not_normal_3_value"), col("time")]),
+                vec![
+                    "+-------------------------------------------------+",
+                    "| selector_first(t.f64_not_normal_3_value,t.time) |",
+                    "+-------------------------------------------------+",
+                    "| {value: NaN, time: 1970-01-01T00:00:00.000001}  |",
+                    "+-------------------------------------------------+",
+                ],
+            )
+            .await;
+
+            run_case(
+                selector_first().call(vec![col("f64_not_normal_4_value"), col("time")]),
+                vec![
+                    "+-------------------------------------------------+",
+                    "| selector_first(t.f64_not_normal_4_value,t.time) |",
+                    "+-------------------------------------------------+",
+                    "| {value: 1.0, time: 1970-01-01T00:00:00.000001}  |",
+                    "+-------------------------------------------------+",
+                ],
+            )
+            .await;
+
+            run_case(
+                selector_first().call(vec![col("f64_not_normal_5_value"), col("time")]),
+                vec![
+                    "+-------------------------------------------------+",
+                    "| selector_first(t.f64_not_normal_5_value,t.time) |",
+                    "+-------------------------------------------------+",
+                    "| {value: 2.0, time: 1970-01-01T00:00:00.000001}  |",
+                    "+-------------------------------------------------+",
                 ],
             )
             .await;
@@ -549,6 +441,53 @@ mod test {
             )
             .await;
         }
+
+        #[tokio::test]
+        async fn test_with_other() {
+            run_case(
+                selector_first().call(vec![col("f64_value"), col("time"), col("bool_value"), col("f64_not_normal_1_value"), col("i64_2_value")]),
+                vec![
+                    "+----------------------------------------------------------------------------------------+",
+                    "| selector_first(t.f64_value,t.time,t.bool_value,t.f64_not_normal_1_value,t.i64_2_value) |",
+                    "+----------------------------------------------------------------------------------------+",
+                    "| {value: 2.0, time: 1970-01-01T00:00:00.000001, other_1: true, other_2: NaN, other_3: } |",
+                    "+----------------------------------------------------------------------------------------+",
+                ],
+            )
+            .await;
+
+            run_case(
+                selector_first().call(vec![col("i64_2_value"), col("time"), col("bool_value"), col("f64_not_normal_1_value"), col("i64_2_value")]),
+                vec![
+                    "+------------------------------------------------------------------------------------------+",
+                    "| selector_first(t.i64_2_value,t.time,t.bool_value,t.f64_not_normal_1_value,t.i64_2_value) |",
+                    "+------------------------------------------------------------------------------------------+",
+                    "| {value: 50, time: 1970-01-01T00:00:00.000005, other_1: false, other_2: inf, other_3: 50} |",
+                    "+------------------------------------------------------------------------------------------+",
+                ],
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn test_time_tie_breaker() {
+            run_case(
+                selector_first().call(vec![col("f64_value"), col("time_dup")]),
+                vec![
+                    "+------------------------------------------------+",
+                    "| selector_first(t.f64_value,t.time_dup)         |",
+                    "+------------------------------------------------+",
+                    "| {value: 2.0, time: 1970-01-01T00:00:00.000001} |",
+                    "+------------------------------------------------+",
+                ],
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn test_err() {
+            run_cases_err(selector_first(), "selector_first").await;
+        }
     }
 
     mod last {
@@ -563,6 +502,66 @@ mod test {
                     "| selector_last(t.f64_value,t.time)              |",
                     "+------------------------------------------------+",
                     "| {value: 3.0, time: 1970-01-01T00:00:00.000006} |",
+                    "+------------------------------------------------+",
+                ],
+            )
+            .await;
+
+            run_case(
+                selector_last().call(vec![col("f64_not_normal_1_value"), col("time")]),
+                vec![
+                    "+-------------------------------------------------+",
+                    "| selector_last(t.f64_not_normal_1_value,t.time)  |",
+                    "+-------------------------------------------------+",
+                    "| {value: -inf, time: 1970-01-01T00:00:00.000006} |",
+                    "+-------------------------------------------------+",
+                ],
+            )
+            .await;
+
+            run_case(
+                selector_last().call(vec![col("f64_not_normal_2_value"), col("time")]),
+                vec![
+                    "+------------------------------------------------+",
+                    "| selector_last(t.f64_not_normal_2_value,t.time) |",
+                    "+------------------------------------------------+",
+                    "| {value: inf, time: 1970-01-01T00:00:00.000006} |",
+                    "+------------------------------------------------+",
+                ],
+            )
+            .await;
+
+            run_case(
+                selector_last().call(vec![col("f64_not_normal_3_value"), col("time")]),
+                vec![
+                    "+------------------------------------------------+",
+                    "| selector_last(t.f64_not_normal_3_value,t.time) |",
+                    "+------------------------------------------------+",
+                    "| {value: NaN, time: 1970-01-01T00:00:00.000006} |",
+                    "+------------------------------------------------+",
+                ],
+            )
+            .await;
+
+            run_case(
+                selector_last().call(vec![col("f64_not_normal_4_value"), col("time")]),
+                vec![
+                    "+------------------------------------------------+",
+                    "| selector_last(t.f64_not_normal_4_value,t.time) |",
+                    "+------------------------------------------------+",
+                    "| {value: 3.0, time: 1970-01-01T00:00:00.000006} |",
+                    "+------------------------------------------------+",
+                ],
+            )
+            .await;
+
+            run_case(
+                selector_last().call(vec![col("f64_not_normal_5_value"), col("time")]),
+                vec![
+                    "+------------------------------------------------+",
+                    "| selector_last(t.f64_not_normal_5_value,t.time) |",
+                    "+------------------------------------------------+",
+                    "| {value: 4.0, time: 1970-01-01T00:00:00.000006} |",
                     "+------------------------------------------------+",
                 ],
             )
@@ -628,6 +627,53 @@ mod test {
             )
             .await;
         }
+
+        #[tokio::test]
+        async fn test_with_other() {
+            run_case(
+                selector_last().call(vec![col("f64_value"), col("time"), col("bool_value"), col("f64_not_normal_3_value"), col("i64_2_value")]),
+                vec![
+                    "+-------------------------------------------------------------------------------------------+",
+                    "| selector_last(t.f64_value,t.time,t.bool_value,t.f64_not_normal_3_value,t.i64_2_value)     |",
+                    "+-------------------------------------------------------------------------------------------+",
+                    "| {value: 3.0, time: 1970-01-01T00:00:00.000006, other_1: false, other_2: NaN, other_3: 30} |",
+                    "+-------------------------------------------------------------------------------------------+",
+                ],
+            )
+            .await;
+
+            run_case(
+                selector_last().call(vec![col("u64_2_value"), col("time"), col("bool_value"), col("f64_not_normal_4_value"), col("i64_2_value")]),
+                vec![
+                    "+------------------------------------------------------------------------------------------+",
+                    "| selector_last(t.u64_2_value,t.time,t.bool_value,t.f64_not_normal_4_value,t.i64_2_value)  |",
+                    "+------------------------------------------------------------------------------------------+",
+                    "| {value: 50, time: 1970-01-01T00:00:00.000005, other_1: false, other_2: inf, other_3: 50} |",
+                    "+------------------------------------------------------------------------------------------+",
+                ],
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn test_time_tie_breaker() {
+            run_case(
+                selector_last().call(vec![col("f64_value"), col("time_dup")]),
+                vec![
+                    "+------------------------------------------------+",
+                    "| selector_last(t.f64_value,t.time_dup)          |",
+                    "+------------------------------------------------+",
+                    "| {value: 5.0, time: 1970-01-01T00:00:00.000003} |",
+                    "+------------------------------------------------+",
+                ],
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn test_err() {
+            run_cases_err(selector_last(), "selector_last").await;
+        }
     }
 
     mod min {
@@ -646,6 +692,42 @@ mod test {
                 ],
             )
             .await;
+
+            run_case(
+                selector_min().call(vec![col("f64_not_normal_1_value"), col("time")]),
+                vec![
+                    "+-------------------------------------------------+",
+                    "| selector_min(t.f64_not_normal_1_value,t.time)   |",
+                    "+-------------------------------------------------+",
+                    "| {value: -inf, time: 1970-01-01T00:00:00.000003} |",
+                    "+-------------------------------------------------+",
+                ],
+            )
+            .await;
+
+            run_case(
+                selector_min().call(vec![col("f64_not_normal_2_value"), col("time")]),
+                vec![
+                    "+-------------------------------------------------+",
+                    "| selector_min(t.f64_not_normal_2_value,t.time)   |",
+                    "+-------------------------------------------------+",
+                    "| {value: -inf, time: 1970-01-01T00:00:00.000001} |",
+                    "+-------------------------------------------------+",
+                ],
+            )
+            .await;
+
+            run_case(
+                selector_min().call(vec![col("f64_not_normal_3_value"), col("time")]),
+                vec![
+                    "+------------------------------------------------+",
+                    "| selector_min(t.f64_not_normal_3_value,t.time)  |",
+                    "+------------------------------------------------+",
+                    "| {value: NaN, time: 1970-01-01T00:00:00.000001} |",
+                    "+------------------------------------------------+",
+                ],
+            )
+            .await;
         }
 
         #[tokio::test]
@@ -657,6 +739,18 @@ mod test {
                     "| selector_min(t.i64_value,t.time)              |",
                     "+-----------------------------------------------+",
                     "| {value: 10, time: 1970-01-01T00:00:00.000004} |",
+                    "+-----------------------------------------------+",
+                ],
+            )
+            .await;
+
+            run_case(
+                selector_min().call(vec![col("i64_2_value"), col("time")]),
+                vec![
+                    "+-----------------------------------------------+",
+                    "| selector_min(t.i64_2_value,t.time)            |",
+                    "+-----------------------------------------------+",
+                    "| {value: 30, time: 1970-01-01T00:00:00.000006} |",
                     "+-----------------------------------------------+",
                 ],
             )
@@ -707,6 +801,53 @@ mod test {
             )
             .await;
         }
+
+        #[tokio::test]
+        async fn test_with_other() {
+            run_case(
+                selector_min().call(vec![col("u64_value"), col("time"), col("bool_value"), col("f64_not_normal_1_value"), col("i64_2_value")]),
+                vec![
+                    "+---------------------------------------------------------------------------------------+",
+                    "| selector_min(t.u64_value,t.time,t.bool_value,t.f64_not_normal_1_value,t.i64_2_value)  |",
+                    "+---------------------------------------------------------------------------------------+",
+                    "| {value: 10, time: 1970-01-01T00:00:00.000004, other_1: true, other_2: NaN, other_3: } |",
+                    "+---------------------------------------------------------------------------------------+",
+                ],
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn test_time_tie_breaker() {
+            run_case(
+                selector_min().call(vec![col("f64_not_normal_2_value"), col("time_dup")]),
+                vec![
+                    "+---------------------------------------------------+",
+                    "| selector_min(t.f64_not_normal_2_value,t.time_dup) |",
+                    "+---------------------------------------------------+",
+                    "| {value: -inf, time: 1970-01-01T00:00:00.000001}   |",
+                    "+---------------------------------------------------+",
+                ],
+            )
+            .await;
+
+            run_case(
+                selector_min().call(vec![col("bool_const"), col("time_dup")]),
+                vec![
+                    "+-------------------------------------------------+",
+                    "| selector_min(t.bool_const,t.time_dup)           |",
+                    "+-------------------------------------------------+",
+                    "| {value: true, time: 1970-01-01T00:00:00.000001} |",
+                    "+-------------------------------------------------+",
+                ],
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn test_err() {
+            run_cases_err(selector_min(), "selector_min").await;
+        }
     }
 
     mod max {
@@ -725,6 +866,42 @@ mod test {
                 ],
             )
             .await;
+
+            run_case(
+                selector_max().call(vec![col("f64_not_normal_1_value"), col("time")]),
+                vec![
+                    "+------------------------------------------------+",
+                    "| selector_max(t.f64_not_normal_1_value,t.time)  |",
+                    "+------------------------------------------------+",
+                    "| {value: NaN, time: 1970-01-01T00:00:00.000001} |",
+                    "+------------------------------------------------+",
+                ],
+            )
+            .await;
+
+            run_case(
+                selector_max().call(vec![col("f64_not_normal_2_value"), col("time")]),
+                vec![
+                    "+------------------------------------------------+",
+                    "| selector_max(t.f64_not_normal_2_value,t.time)  |",
+                    "+------------------------------------------------+",
+                    "| {value: inf, time: 1970-01-01T00:00:00.000004} |",
+                    "+------------------------------------------------+",
+                ],
+            )
+            .await;
+
+            run_case(
+                selector_max().call(vec![col("f64_not_normal_3_value"), col("time")]),
+                vec![
+                    "+------------------------------------------------+",
+                    "| selector_max(t.f64_not_normal_3_value,t.time)  |",
+                    "+------------------------------------------------+",
+                    "| {value: NaN, time: 1970-01-01T00:00:00.000001} |",
+                    "+------------------------------------------------+",
+                ],
+            )
+            .await;
         }
 
         #[tokio::test]
@@ -734,6 +911,18 @@ mod test {
                 vec![
                     "+-----------------------------------------------+",
                     "| selector_max(t.i64_value,t.time)              |",
+                    "+-----------------------------------------------+",
+                    "| {value: 50, time: 1970-01-01T00:00:00.000005} |",
+                    "+-----------------------------------------------+",
+                ],
+            )
+            .await;
+
+            run_case(
+                selector_max().call(vec![col("i64_2_value"), col("time")]),
+                vec![
+                    "+-----------------------------------------------+",
+                    "| selector_max(t.i64_2_value,t.time)            |",
                     "+-----------------------------------------------+",
                     "| {value: 50, time: 1970-01-01T00:00:00.000005} |",
                     "+-----------------------------------------------+",
@@ -786,9 +975,70 @@ mod test {
             )
             .await;
         }
+
+        #[tokio::test]
+        async fn test_with_other() {
+            run_case(
+                selector_max().call(vec![col("u64_value"), col("time"), col("bool_value"), col("f64_not_normal_1_value"), col("i64_2_value")]),
+                vec![
+                    "+------------------------------------------------------------------------------------------+",
+                    "| selector_max(t.u64_value,t.time,t.bool_value,t.f64_not_normal_1_value,t.i64_2_value)     |",
+                    "+------------------------------------------------------------------------------------------+",
+                    "| {value: 50, time: 1970-01-01T00:00:00.000005, other_1: false, other_2: inf, other_3: 50} |",
+                    "+------------------------------------------------------------------------------------------+",
+                ],
+            )
+            .await;
+
+            run_case(
+                selector_max().call(vec![col("bool_const"), col("time"), col("bool_value"), col("f64_not_normal_1_value"), col("i64_value")]),
+                vec![
+                    "+-------------------------------------------------------------------------------------------+",
+                    "| selector_max(t.bool_const,t.time,t.bool_value,t.f64_not_normal_1_value,t.i64_value)       |",
+                    "+-------------------------------------------------------------------------------------------+",
+                    "| {value: true, time: 1970-01-01T00:00:00.000001, other_1: true, other_2: NaN, other_3: 20} |",
+                    "+-------------------------------------------------------------------------------------------+",
+                ],
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn test_time_tie_breaker() {
+            run_case(
+                selector_max().call(vec![col("f64_not_normal_2_value"), col("time_dup")]),
+                vec![
+                    "+---------------------------------------------------+",
+                    "| selector_max(t.f64_not_normal_2_value,t.time_dup) |",
+                    "+---------------------------------------------------+",
+                    "| {value: inf, time: 1970-01-01T00:00:00.000002}    |",
+                    "+---------------------------------------------------+",
+                ],
+            )
+            .await;
+
+            run_case(
+                selector_max().call(vec![col("bool_const"), col("time_dup")]),
+                vec![
+                    "+-------------------------------------------------+",
+                    "| selector_max(t.bool_const,t.time_dup)           |",
+                    "+-------------------------------------------------+",
+                    "| {value: true, time: 1970-01-01T00:00:00.000001} |",
+                    "+-------------------------------------------------+",
+                ],
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn test_err() {
+            run_cases_err(selector_max(), "selector_max").await;
+        }
     }
 
     mod utils {
+        use schema::TIME_DATA_TYPE;
+
         use super::*;
 
         /// Runs the expr using `run_plan` and compares the result to `expected`
@@ -801,6 +1051,197 @@ mod test {
                 expected, actual,
                 "\n\nexpr: {expr}\n\nEXPECTED:\n{expected:#?}\nACTUAL:\n{actual:#?}\n"
             );
+        }
+
+        pub async fn run_case_err(expr: Expr, expected: &str) {
+            println!("Running error case for {expr}");
+
+            let (schema, input) = input();
+            let actual = run_with_inputs(Arc::clone(&schema), vec![expr.clone()], input.clone())
+                .await
+                .unwrap_err()
+                .to_string();
+
+            assert_eq!(
+                expected, actual,
+                "\n\nexpr: {expr}\n\nEXPECTED:\n{expected:#?}\nACTUAL:\n{actual:#?}\n"
+            );
+        }
+
+        pub async fn run_cases_err(selector: AggregateUDF, name: &str) {
+            run_case_err(
+                selector.call(vec![]),
+                &format!("Error during planning: {name} requires at least 2 arguments, got 0"),
+            )
+            .await;
+
+            run_case_err(
+                selector.call(vec![col("f64_value")]),
+                &format!("Error during planning: {name} requires at least 2 arguments, got 1"),
+            )
+            .await;
+
+            run_case_err(
+                selector.call(vec![col("time"), col("f64_value")]),
+                &format!("Error during planning: {name} second argument must be a timestamp, but got Float64"),
+            )
+            .await;
+
+            run_case_err(
+                selector.call(vec![col("time"), col("f64_value"), col("bool_value")]),
+                &format!("Error during planning: {name} second argument must be a timestamp, but got Float64"),
+            )
+            .await;
+
+            run_case_err(
+                selector.call(vec![col("f64_value"), col("bool_value"), col("time")]),
+                &format!("Error during planning: {name} second argument must be a timestamp, but got Boolean"),
+            )
+            .await;
+        }
+
+        fn input() -> (SchemaRef, Vec<RecordBatch>) {
+            // define a schema for input
+            // (value) and timestamp
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("f64_value", DataType::Float64, true),
+                Field::new("f64_not_normal_1_value", DataType::Float64, true),
+                Field::new("f64_not_normal_2_value", DataType::Float64, true),
+                Field::new("f64_not_normal_3_value", DataType::Float64, true),
+                Field::new("f64_not_normal_4_value", DataType::Float64, true),
+                Field::new("f64_not_normal_5_value", DataType::Float64, true),
+                Field::new("i64_value", DataType::Int64, true),
+                Field::new("i64_2_value", DataType::Int64, true),
+                Field::new("u64_value", DataType::UInt64, true),
+                Field::new("u64_2_value", DataType::UInt64, true),
+                Field::new("string_value", DataType::Utf8, true),
+                Field::new("bool_value", DataType::Boolean, true),
+                Field::new("bool_const", DataType::Boolean, true),
+                Field::new("time", TIME_DATA_TYPE(), true),
+                Field::new("time_dup", TIME_DATA_TYPE(), true),
+            ]));
+
+            // define data in two partitions
+            let batch1 = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Float64Array::from(vec![Some(2.0), Some(4.0), None])),
+                    Arc::new(Float64Array::from(vec![
+                        Some(f64::NAN),
+                        Some(f64::INFINITY),
+                        Some(f64::NEG_INFINITY),
+                    ])),
+                    Arc::new(Float64Array::from(vec![
+                        Some(f64::NEG_INFINITY),
+                        Some(f64::NEG_INFINITY),
+                        Some(f64::NEG_INFINITY),
+                    ])),
+                    Arc::new(Float64Array::from(vec![
+                        Some(f64::NAN),
+                        Some(f64::NAN),
+                        Some(f64::NAN),
+                    ])),
+                    Arc::new(Float64Array::from(vec![
+                        Some(1.0),
+                        Some(f64::NEG_INFINITY),
+                        Some(f64::NEG_INFINITY),
+                    ])),
+                    Arc::new(Float64Array::from(vec![
+                        Some(2.0),
+                        Some(f64::NAN),
+                        Some(f64::NAN),
+                    ])),
+                    Arc::new(Int64Array::from(vec![Some(20), Some(40), None])),
+                    Arc::new(Int64Array::from(vec![None, None, None])),
+                    Arc::new(UInt64Array::from(vec![Some(20), Some(40), None])),
+                    Arc::new(UInt64Array::from(vec![Some(20), Some(40), None])),
+                    Arc::new(StringArray::from(vec![Some("two"), Some("four"), None])),
+                    Arc::new(BooleanArray::from(vec![Some(true), Some(false), None])),
+                    Arc::new(BooleanArray::from(vec![Some(true), Some(true), Some(true)])),
+                    Arc::new(TimestampNanosecondArray::from(vec![1000, 2000, 3000])),
+                    Arc::new(TimestampNanosecondArray::from(vec![1000, 1000, 2000])),
+                ],
+            )
+            .unwrap();
+
+            // No values in this batch
+            let batch2 = match RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Float64Array::from(vec![] as Vec<Option<f64>>)),
+                    Arc::new(Float64Array::from(vec![] as Vec<Option<f64>>)),
+                    Arc::new(Float64Array::from(vec![] as Vec<Option<f64>>)),
+                    Arc::new(Float64Array::from(vec![] as Vec<Option<f64>>)),
+                    Arc::new(Float64Array::from(vec![] as Vec<Option<f64>>)),
+                    Arc::new(Float64Array::from(vec![] as Vec<Option<f64>>)),
+                    Arc::new(Int64Array::from(vec![] as Vec<Option<i64>>)),
+                    Arc::new(Int64Array::from(vec![] as Vec<Option<i64>>)),
+                    Arc::new(UInt64Array::from(vec![] as Vec<Option<u64>>)),
+                    Arc::new(UInt64Array::from(vec![] as Vec<Option<u64>>)),
+                    Arc::new(StringArray::from(vec![] as Vec<Option<&str>>)),
+                    Arc::new(BooleanArray::from(vec![] as Vec<Option<bool>>)),
+                    Arc::new(BooleanArray::from(vec![] as Vec<Option<bool>>)),
+                    Arc::new(TimestampNanosecondArray::from(vec![] as Vec<i64>)),
+                    Arc::new(TimestampNanosecondArray::from(vec![] as Vec<i64>)),
+                ],
+            ) {
+                Ok(a) => a,
+                _ => unreachable!(),
+            };
+
+            let batch3 = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Float64Array::from(vec![Some(1.0), Some(5.0), Some(3.0)])),
+                    Arc::new(Float64Array::from(vec![
+                        Some(f64::NAN),
+                        Some(f64::INFINITY),
+                        Some(f64::NEG_INFINITY),
+                    ])),
+                    Arc::new(Float64Array::from(vec![
+                        Some(f64::INFINITY),
+                        Some(f64::INFINITY),
+                        Some(f64::INFINITY),
+                    ])),
+                    Arc::new(Float64Array::from(vec![
+                        Some(f64::NAN),
+                        Some(f64::NAN),
+                        Some(f64::NAN),
+                    ])),
+                    Arc::new(Float64Array::from(vec![
+                        Some(f64::INFINITY),
+                        Some(f64::INFINITY),
+                        Some(3.0),
+                    ])),
+                    Arc::new(Float64Array::from(vec![
+                        Some(f64::NAN),
+                        Some(f64::NAN),
+                        Some(4.0),
+                    ])),
+                    Arc::new(Int64Array::from(vec![Some(10), Some(50), Some(30)])),
+                    Arc::new(Int64Array::from(vec![None, Some(50), Some(30)])),
+                    Arc::new(UInt64Array::from(vec![Some(10), Some(50), Some(30)])),
+                    Arc::new(UInt64Array::from(vec![Some(10), Some(50), None])),
+                    Arc::new(StringArray::from(vec![
+                        Some("a_one"),
+                        Some("z_five"),
+                        Some("three"),
+                    ])),
+                    Arc::new(BooleanArray::from(vec![
+                        Some(true),
+                        Some(false),
+                        Some(false),
+                    ])),
+                    Arc::new(BooleanArray::from(vec![Some(true), Some(true), Some(true)])),
+                    Arc::new(TimestampNanosecondArray::from(vec![4000, 5000, 6000])),
+                    Arc::new(TimestampNanosecondArray::from(vec![2000, 3000, 3000])),
+                ],
+            )
+            .unwrap();
+
+            let input = vec![batch1, batch2, batch3];
+
+            (schema, input)
         }
 
         /// Run a plan against the following input table as "t"
@@ -818,79 +1259,22 @@ mod test {
         /// +-----------+-----------+--------------+------------+----------------------------+,
         /// ```
         async fn run_plan(aggs: Vec<Expr>) -> Vec<String> {
-            // define a schema for input
-            // (value) and timestamp
-            let schema = Arc::new(Schema::new(vec![
-                Field::new("f64_value", DataType::Float64, true),
-                Field::new("i64_value", DataType::Int64, true),
-                Field::new("u64_value", DataType::UInt64, true),
-                Field::new("string_value", DataType::Utf8, true),
-                Field::new("bool_value", DataType::Boolean, true),
-                Field::new("time", TIME_DATA_TYPE(), true),
-            ]));
-
-            // define data in two partitions
-            let batch1 = RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(Float64Array::from(vec![Some(2.0), Some(4.0), None])),
-                    Arc::new(Int64Array::from(vec![Some(20), Some(40), None])),
-                    Arc::new(UInt64Array::from(vec![Some(20), Some(40), None])),
-                    Arc::new(StringArray::from(vec![Some("two"), Some("four"), None])),
-                    Arc::new(BooleanArray::from(vec![Some(true), Some(false), None])),
-                    Arc::new(TimestampNanosecondArray::from(vec![1000, 2000, 3000])),
-                ],
-            )
-            .unwrap();
-
-            // No values in this batch
-            let batch2 = match RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(Float64Array::from(vec![] as Vec<Option<f64>>)),
-                    Arc::new(Int64Array::from(vec![] as Vec<Option<i64>>)),
-                    Arc::new(UInt64Array::from(vec![] as Vec<Option<u64>>)),
-                    Arc::new(StringArray::from(vec![] as Vec<Option<&str>>)),
-                    Arc::new(BooleanArray::from(vec![] as Vec<Option<bool>>)),
-                    Arc::new(TimestampNanosecondArray::from(vec![] as Vec<i64>)),
-                ],
-            ) {
-                Ok(a) => a,
-                _ => unreachable!(),
-            };
-
-            let batch3 = RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(Float64Array::from(vec![Some(1.0), Some(5.0), Some(3.0)])),
-                    Arc::new(Int64Array::from(vec![Some(10), Some(50), Some(30)])),
-                    Arc::new(UInt64Array::from(vec![Some(10), Some(50), Some(30)])),
-                    Arc::new(StringArray::from(vec![
-                        Some("a_one"),
-                        Some("z_five"),
-                        Some("three"),
-                    ])),
-                    Arc::new(BooleanArray::from(vec![
-                        Some(true),
-                        Some(false),
-                        Some(false),
-                    ])),
-                    Arc::new(TimestampNanosecondArray::from(vec![4000, 5000, 6000])),
-                ],
-            )
-            .unwrap();
+            let (schema, input) = input();
 
             // Ensure the answer is the same regardless of the order of inputs
-            let input = vec![batch1, batch2, batch3];
             let input_string = pretty_format_batches(&input).unwrap();
-            let results = run_with_inputs(Arc::clone(&schema), aggs.clone(), input.clone()).await;
+            let results = run_with_inputs(Arc::clone(&schema), aggs.clone(), input.clone())
+                .await
+                .unwrap();
 
             use itertools::Itertools;
             // Get all permutations of the input
             for p in input.iter().permutations(3) {
                 let p_batches = p.into_iter().cloned().collect::<Vec<_>>();
                 let p_input_string = pretty_format_batches(&p_batches).unwrap();
-                let p_results = run_with_inputs(Arc::clone(&schema), aggs.clone(), p_batches).await;
+                let p_results = run_with_inputs(Arc::clone(&schema), aggs.clone(), p_batches)
+                    .await
+                    .unwrap();
                 assert_eq!(
                     results, p_results,
                     "Mismatch with permutation.\n\
@@ -912,23 +1296,22 @@ mod test {
             schema: SchemaRef,
             aggs: Vec<Expr>,
             inputs: Vec<RecordBatch>,
-        ) -> Vec<String> {
-            let provider = MemTable::try_new(Arc::clone(&schema), vec![inputs]).unwrap();
+        ) -> DataFusionResult<Vec<String>> {
+            let provider = MemTable::try_new(Arc::clone(&schema), vec![inputs])?;
             let ctx = SessionContext::new();
-            ctx.register_table("t", Arc::new(provider)).unwrap();
+            ctx.register_table("t", Arc::new(provider))?;
 
-            let df = ctx.table("t").await.unwrap();
-            let df = df.aggregate(vec![], aggs).unwrap();
+            let df = ctx.table("t").await?;
+            let df = df.aggregate(vec![], aggs)?;
 
             // execute the query
-            let record_batches = df.collect().await.unwrap();
+            let record_batches = df.collect().await?;
 
-            pretty_format_batches(&record_batches)
-                .unwrap()
+            Ok(pretty_format_batches(&record_batches)?
                 .to_string()
                 .split('\n')
                 .map(|s| s.to_owned())
-                .collect()
+                .collect())
         }
     }
 }

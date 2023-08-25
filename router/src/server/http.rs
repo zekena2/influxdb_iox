@@ -149,10 +149,19 @@ impl From<&DmlError> for StatusCode {
 
             DmlError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             DmlError::Partition(PartitionError::BatchWrite(_)) => StatusCode::INTERNAL_SERVER_ERROR,
-            DmlError::Retention(RetentionError::OutsideRetention(_)) => StatusCode::FORBIDDEN,
+            DmlError::Partition(PartitionError::Partitioner(_)) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+            DmlError::Retention(RetentionError::OutsideRetention { .. }) => StatusCode::FORBIDDEN,
             DmlError::RpcWrite(RpcWriteError::Client(RpcWriteClientError::Upstream(_))) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
+            DmlError::RpcWrite(RpcWriteError::Client(
+                RpcWriteClientError::MisconfiguredMetadataKey(_),
+            )) => StatusCode::INTERNAL_SERVER_ERROR,
+            DmlError::RpcWrite(RpcWriteError::Client(
+                RpcWriteClientError::MisconfiguredMetadataValue(_),
+            )) => StatusCode::INTERNAL_SERVER_ERROR,
             DmlError::RpcWrite(RpcWriteError::Client(
                 RpcWriteClientError::UpstreamNotConnected(_),
             )) => StatusCode::SERVICE_UNAVAILABLE,

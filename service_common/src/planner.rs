@@ -2,7 +2,9 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use datafusion::{error::DataFusionError, physical_plan::ExecutionPlan};
+use datafusion::{
+    arrow::datatypes::SchemaRef, error::DataFusionError, physical_plan::ExecutionPlan,
+};
 use flightsql::{FlightSQLCommand, FlightSQLPlanner};
 use iox_query::{
     exec::IOxSessionContext,
@@ -18,10 +20,10 @@ use predicate::rpc_predicate::InfluxRpcPredicate;
 
 /// Query planner that plans queries on a separate threadpool.
 ///
-/// Query planning was, at time of writing, a single threaded
-/// affair. In order to avoid tying up the tokio executor that is
-/// handling API requests, IOx plan queries using a separate thread
-/// pool.
+/// Query planning was, at time of writing, a single threaded affair. In order
+/// to avoid tying up the tokio executor that is handling API requests, IOx plan
+/// queries using a separate thread pool.
+#[derive(Debug)]
 pub struct Planner {
     /// Executors (whose threadpool to use)
     ctx: IOxSessionContext,
@@ -62,12 +64,11 @@ impl Planner {
             .await
     }
 
-    /// Creates a plan for a `DoGet` FlightSQL message,
-    /// as described on [`FlightSQLPlanner::do_get`], on a
-    /// separate threadpool
+    /// Creates a plan for a `DoGet` FlightSQL message, as described on
+    /// [`FlightSQLPlanner::do_get`], on a separate threadpool
     pub async fn flight_sql_do_get<N>(
         &self,
-        namespace_name: impl Into<String>,
+        namespace_name: impl Into<String> + Send,
         namespace: Arc<N>,
         cmd: FlightSQLCommand,
     ) -> Result<Arc<dyn ExecutionPlan>>
@@ -86,12 +87,11 @@ impl Planner {
             .await
     }
 
-    /// Creates a plan for a `DoAction` FlightSQL message,
-    /// as described on [`FlightSQLPlanner::do_action`], on a
-    /// separate threadpool
+    /// Creates a plan for a `DoAction` FlightSQL message, as described on
+    /// [`FlightSQLPlanner::do_action`], on a separate threadpool
     pub async fn flight_sql_do_action<N>(
         &self,
-        namespace_name: impl Into<String>,
+        namespace_name: impl Into<String> + Send,
         namespace: Arc<N>,
         cmd: FlightSQLCommand,
     ) -> Result<Bytes>
@@ -110,28 +110,28 @@ impl Planner {
             .await
     }
 
-    /// Creates the response for a `GetFlightInfo`  FlightSQL  message
-    /// as described on [`FlightSQLPlanner::get_flight_info`], on a
-    /// separate threadpool.
-    pub async fn flight_sql_get_flight_info(
+    /// Returns the [`SchemaRef`] to be included in the response to a
+    /// `GetFlightInfo` FlightSQL message as described on
+    /// [`FlightSQLPlanner::get_schema`], on a separate threadpool.
+    pub async fn flight_sql_get_flight_info_schema(
         &self,
-        namespace_name: impl Into<String>,
+        namespace_name: impl Into<String> + Send,
         cmd: FlightSQLCommand,
-    ) -> Result<Bytes> {
+    ) -> Result<SchemaRef> {
         let namespace_name = namespace_name.into();
         let ctx = self.ctx.child_ctx("planner flight_sql_get_flight_info");
 
         self.ctx
             .run(async move {
-                FlightSQLPlanner::get_flight_info(namespace_name, cmd, &ctx)
+                FlightSQLPlanner::get_schema(namespace_name, cmd, &ctx)
                     .await
                     .map_err(DataFusionError::from)
             })
             .await
     }
 
-    /// Creates a plan as described on
-    /// [`InfluxRpcPlanner::table_names`], on a separate threadpool
+    /// Creates a plan as described on [`InfluxRpcPlanner::table_names`], on a
+    /// separate threadpool
     pub async fn table_names<N>(
         &self,
         namespace: Arc<N>,
@@ -140,7 +140,7 @@ impl Planner {
     where
         N: QueryNamespace + 'static,
     {
-        let planner = InfluxRpcPlanner::new(self.ctx.child_ctx("planner table_names"));
+        let planner = InfluxRpcPlanner::new(self.ctx.child_ctx("planner table_names")).await;
 
         self.ctx
             .run(async move {
@@ -152,8 +152,8 @@ impl Planner {
             .await
     }
 
-    /// Creates a plan as described on
-    /// [`InfluxRpcPlanner::tag_keys`], on a separate threadpool
+    /// Creates a plan as described on [`InfluxRpcPlanner::tag_keys`], on a
+    /// separate threadpool
     pub async fn tag_keys<N>(
         &self,
         namespace: Arc<N>,
@@ -162,7 +162,7 @@ impl Planner {
     where
         N: QueryNamespace + 'static,
     {
-        let planner = InfluxRpcPlanner::new(self.ctx.child_ctx("planner tag_keys"));
+        let planner = InfluxRpcPlanner::new(self.ctx.child_ctx("planner tag_keys")).await;
 
         self.ctx
             .run(async move {
@@ -174,8 +174,8 @@ impl Planner {
             .await
     }
 
-    /// Creates a plan as described on
-    /// [`InfluxRpcPlanner::tag_values`], on a separate threadpool
+    /// Creates a plan as described on [`InfluxRpcPlanner::tag_values`], on a
+    /// separate threadpool
     pub async fn tag_values<N>(
         &self,
         namespace: Arc<N>,
@@ -186,7 +186,7 @@ impl Planner {
         N: QueryNamespace + 'static,
     {
         let tag_name = tag_name.into();
-        let planner = InfluxRpcPlanner::new(self.ctx.child_ctx("planner tag_values"));
+        let planner = InfluxRpcPlanner::new(self.ctx.child_ctx("planner tag_values")).await;
 
         self.ctx
             .run(async move {
@@ -198,8 +198,8 @@ impl Planner {
             .await
     }
 
-    /// Creates a plan as described on
-    /// [`InfluxRpcPlanner::field_columns`], on a separate threadpool
+    /// Creates a plan as described on [`InfluxRpcPlanner::field_columns`], on a
+    /// separate threadpool
     pub async fn field_columns<N>(
         &self,
         namespace: Arc<N>,
@@ -208,7 +208,7 @@ impl Planner {
     where
         N: QueryNamespace + 'static,
     {
-        let planner = InfluxRpcPlanner::new(self.ctx.child_ctx("planner field_columns"));
+        let planner = InfluxRpcPlanner::new(self.ctx.child_ctx("planner field_columns")).await;
 
         self.ctx
             .run(async move {
@@ -220,8 +220,8 @@ impl Planner {
             .await
     }
 
-    /// Creates a plan as described on
-    /// [`InfluxRpcPlanner::read_filter`], on a separate threadpool
+    /// Creates a plan as described on [`InfluxRpcPlanner::read_filter`], on a
+    /// separate threadpool
     pub async fn read_filter<N>(
         &self,
         namespace: Arc<N>,
@@ -230,7 +230,7 @@ impl Planner {
     where
         N: QueryNamespace + 'static,
     {
-        let planner = InfluxRpcPlanner::new(self.ctx.child_ctx("planner read_filter"));
+        let planner = InfluxRpcPlanner::new(self.ctx.child_ctx("planner read_filter")).await;
 
         self.ctx
             .run(async move {
@@ -242,8 +242,8 @@ impl Planner {
             .await
     }
 
-    /// Creates a plan as described on
-    /// [`InfluxRpcPlanner::read_group`], on a separate threadpool
+    /// Creates a plan as described on [`InfluxRpcPlanner::read_group`], on a
+    /// separate threadpool
     pub async fn read_group<N>(
         &self,
         namespace: Arc<N>,
@@ -254,7 +254,7 @@ impl Planner {
     where
         N: QueryNamespace + 'static,
     {
-        let planner = InfluxRpcPlanner::new(self.ctx.child_ctx("planner read_group"));
+        let planner = InfluxRpcPlanner::new(self.ctx.child_ctx("planner read_group")).await;
 
         self.ctx
             .run(async move {
@@ -279,7 +279,8 @@ impl Planner {
     where
         N: QueryNamespace + 'static,
     {
-        let planner = InfluxRpcPlanner::new(self.ctx.child_ctx("planner read_window_aggregate"));
+        let planner =
+            InfluxRpcPlanner::new(self.ctx.child_ctx("planner read_window_aggregate")).await;
 
         self.ctx
             .run(async move {

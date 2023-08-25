@@ -1,6 +1,6 @@
 #syntax=docker/dockerfile:1.2
-ARG RUST_VERSION=1.57
-FROM rust:${RUST_VERSION}-slim-bullseye as build
+ARG RUST_VERSION=1.71
+FROM rust:${RUST_VERSION}-slim-bookworm as build
 
 # cache mounts below may already exist and owned by root
 USER root
@@ -14,15 +14,15 @@ COPY . /influxdb_iox
 WORKDIR /influxdb_iox
 
 ARG CARGO_INCREMENTAL=yes
+ARG CARGO_NET_GIT_FETCH_WITH_CLI=false
 ARG PROFILE=release
 ARG FEATURES=aws,gcp,azure,jemalloc_replacing_malloc
 ARG PACKAGE=influxdb_iox
-ARG RUSTFLAGS=""
 ENV CARGO_INCREMENTAL=$CARGO_INCREMENTAL \
+    CARGO_NET_GIT_FETCH_WITH_CLI=$CARGO_NET_GIT_FETCH_WITH_CLI \
     PROFILE=$PROFILE \
     FEATURES=$FEATURES \
-    PACKAGE=$PACKAGE \
-    RUSTFLAGS=$RUSTFLAGS
+    PACKAGE=$PACKAGE
 
 RUN \
   --mount=type=cache,id=influxdb_iox_rustup,sharing=locked,target=/usr/local/rustup \
@@ -36,10 +36,10 @@ RUN \
     du -cshx /usr/local/rustup /usr/local/cargo/registry /usr/local/cargo/git /influxdb_iox/target
 
 
-FROM debian:bullseye-slim
+FROM debian:bookworm-slim
 
 RUN apt update \
-    && apt install --yes ca-certificates gettext-base libssl1.1 --no-install-recommends \
+    && apt install --yes ca-certificates gettext-base libssl3 --no-install-recommends \
     && rm -rf /var/lib/{apt,dpkg,cache,log} \
     && groupadd --gid 1500 iox \
     && useradd --uid 1500 --gid iox --shell /bin/bash --create-home iox

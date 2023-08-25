@@ -6,23 +6,25 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-async-trait = "0.1.68"
+async-trait = "0.1.73"
 backoff = { path = "../backoff" }
 futures = "0.3"
 iox_time = { path = "../iox_time" }
 metric = { path = "../metric" }
 observability_deps = { path = "../observability_deps" }
+ouroboros = "0.17"
 parking_lot = { version = "0.12", features = ["arc_lock"] }
 pdatastructs = { version = "0.7", default-features = false, features = ["fixedbitset"] }
 rand = "0.8.3"
-tokio = { version = "1.28", features = ["macros", "parking_lot", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.32", features = ["macros", "parking_lot", "rt-multi-thread", "sync", "time"] }
 tokio-util = { version = "0.7.8" }
 trace = { path = "../trace"}
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
-criterion = { version = "0.4", default-features = false, features = ["rayon"]}
+criterion = { version = "0.5", default-features = false, features = ["rayon"]}
 proptest = { version = "1", default_features = false, features = ["std"] }
+test_helpers = { path = "../test_helpers" }
 
 [lib]
 # Allow --save-baseline to work

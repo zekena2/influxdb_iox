@@ -7,6 +7,7 @@ use arrow::datatypes::SchemaRef;
 use datafusion::{
     common::tree_node::{Transformed, TreeNode},
     config::ConfigOptions,
+    datasource::physical_plan::{FileScanConfig, ParquetExec},
     error::{DataFusionError, Result},
     physical_expr::{
         utils::{collect_columns, reassign_predicate_columns},
@@ -16,7 +17,6 @@ use datafusion::{
     physical_plan::{
         empty::EmptyExec,
         expressions::Column,
-        file_format::{FileScanConfig, ParquetExec},
         filter::FilterExec,
         projection::ProjectionExec,
         sorts::{sort::SortExec, sort_preserving_merge::SortPreservingMergeExec},
@@ -97,11 +97,11 @@ impl PhysicalOptimizerRule for ProjectionPushdown {
                     let output_ordering = child_parquet
                         .base_config()
                         .output_ordering
-                        .as_ref()
+                        .iter()
                         .map(|output_ordering| {
                             project_output_ordering(output_ordering, projection_exec.schema())
                         })
-                        .transpose()?;
+                        .collect::<Result<_>>()?;
                     let base_config = FileScanConfig {
                         projection: Some(projection),
                         output_ordering,
@@ -434,7 +434,7 @@ mod tests {
         logical_expr::Operator,
         physical_plan::{
             expressions::{BinaryExpr, Literal},
-            PhysicalExpr, Statistics,
+            DisplayAs, PhysicalExpr, Statistics,
         },
         scalar::ScalarValue,
     };
@@ -457,7 +457,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         let test = OptimizationTest::new(plan, opt);
         insta::assert_yaml_snapshot!(
             test,
@@ -496,7 +496,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         let test = OptimizationTest::new(plan, opt);
         insta::assert_yaml_snapshot!(
             test,
@@ -535,7 +535,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -564,7 +564,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -593,7 +593,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -619,7 +619,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -648,7 +648,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -685,7 +685,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -729,7 +729,7 @@ mod tests {
             projection: Some(projection),
             limit: None,
             table_partition_cols: vec![],
-            output_ordering: Some(vec![
+            output_ordering: vec![vec![
                 PhysicalSortExpr {
                     expr: expr_col("tag3", &schema_projected),
                     options: Default::default(),
@@ -742,7 +742,7 @@ mod tests {
                     expr: expr_col("tag2", &schema_projected),
                     options: Default::default(),
                 },
-            ]),
+            ]],
             infinite_source: false,
         };
         let inner = ParquetExec::new(base_config, Some(expr_string_cmp("tag1", &schema)), None);
@@ -756,7 +756,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         let test = OptimizationTest::new(plan, opt);
         insta::assert_yaml_snapshot!(
             test,
@@ -800,7 +800,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -833,7 +833,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -867,7 +867,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -899,7 +899,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -939,7 +939,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -980,7 +980,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -1025,7 +1025,7 @@ mod tests {
 
         assert_unknown_partitioning(plan.output_partitioning(), 2);
 
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         let test = OptimizationTest::new(plan, opt);
         insta::assert_yaml_snapshot!(
             test,
@@ -1067,7 +1067,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -1113,7 +1113,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -1151,7 +1151,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         let test = OptimizationTest::new(plan, opt);
         insta::assert_yaml_snapshot!(
             test,
@@ -1197,7 +1197,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -1253,7 +1253,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -1289,7 +1289,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         let test = OptimizationTest::new(plan, opt);
         insta::assert_yaml_snapshot!(
             test,
@@ -1330,7 +1330,7 @@ mod tests {
             projection: None,
             limit: None,
             table_partition_cols: vec![],
-            output_ordering: None,
+            output_ordering: vec![vec![]],
             infinite_source: false,
         };
         let plan = Arc::new(ParquetExec::new(base_config, None, None));
@@ -1359,7 +1359,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = ProjectionPushdown::default();
+        let opt = ProjectionPushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -1695,16 +1695,18 @@ mod tests {
             unimplemented!()
         }
 
+        fn statistics(&self) -> datafusion::physical_plan::Statistics {
+            unimplemented!()
+        }
+    }
+
+    impl DisplayAs for TestExec {
         fn fmt_as(
             &self,
             _t: datafusion::physical_plan::DisplayFormatType,
             f: &mut std::fmt::Formatter<'_>,
         ) -> std::fmt::Result {
             write!(f, "Test")
-        }
-
-        fn statistics(&self) -> datafusion::physical_plan::Statistics {
-            unimplemented!()
         }
     }
 }

@@ -2,9 +2,9 @@
 
 use crate::{
     interface::{
-        self, CasFailure, Catalog, ColumnRepo, ColumnTypeMismatchSnafu, Error, NamespaceRepo,
-        ParquetFileRepo, PartitionRepo, RepoCollection, Result, SoftDeletedRows, TableRepo,
-        MAX_PARQUET_FILES_SELECTED_ONCE,
+        self, verify_sort_key_length, CasFailure, Catalog, ColumnRepo, ColumnTypeMismatchSnafu,
+        Error, NamespaceRepo, ParquetFileRepo, PartitionRepo, RepoCollection, Result,
+        SoftDeletedRows, TableRepo, MAX_PARQUET_FILES_SELECTED_ONCE_FOR_RETENTION,
     },
     kafkaless_transition::{
         SHARED_QUERY_POOL, SHARED_QUERY_POOL_ID, SHARED_TOPIC_ID, SHARED_TOPIC_NAME,
@@ -15,19 +15,25 @@ use crate::{
 };
 use async_trait::async_trait;
 use data_types::{
+    partition_template::{
+        NamespacePartitionTemplateOverride, TablePartitionTemplateOverride, TemplatePart,
+    },
     Column, ColumnId, ColumnSet, ColumnType, CompactionLevel, Namespace, NamespaceId,
-    NamespaceName, ParquetFile, ParquetFileId, ParquetFileParams, Partition, PartitionId,
-    PartitionKey, SkippedCompaction, Table, TableId, Timestamp,
+    NamespaceName, NamespaceServiceProtectionLimitsOverride, ParquetFile, ParquetFileId,
+    ParquetFileParams, Partition, PartitionHashId, PartitionId, PartitionKey, SkippedCompaction,
+    SortedColumnSet, Table, TableId, Timestamp, TransitionPartitionId,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::{collections::HashMap, fmt::Display};
+use std::{collections::HashSet, fmt::Write};
 
+use crate::interface::MAX_PARQUET_FILES_SELECTED_ONCE_FOR_DELETE;
 use iox_time::{SystemProvider, TimeProvider};
 use metric::Registry;
 use observability_deps::tracing::debug;
 use parking_lot::Mutex;
 use snafu::prelude::*;
+use sqlx::sqlite::SqliteRow;
 use sqlx::types::Json;
 use sqlx::{
     migrate::Migrator, sqlite::SqliteConnectOptions, types::Uuid, Executor, Pool, Row, Sqlite,
@@ -52,12 +58,6 @@ pub struct SqliteCatalog {
     pool: Pool<Sqlite>,
     time_provider: Arc<dyn TimeProvider>,
     options: SqliteConnectionOptions,
-}
-
-// struct to get return value from "select count(id) ..." query
-#[derive(sqlx::FromRow)]
-struct Count {
-    count: i64,
 }
 
 /// transaction for [`SqliteCatalog`].
@@ -229,6 +229,7 @@ DO NOTHING;
         ))
     }
 
+    #[cfg(test)]
     fn metrics(&self) -> Arc<Registry> {
         Arc::clone(&self.metrics)
     }
@@ -265,21 +266,29 @@ impl RepoCollection for SqliteTxn {
 impl NamespaceRepo for SqliteTxn {
     async fn create(
         &mut self,
-        name: &NamespaceName,
+        name: &NamespaceName<'_>,
+        partition_template: Option<NamespacePartitionTemplateOverride>,
         retention_period_ns: Option<i64>,
+        service_protection_limits: Option<NamespaceServiceProtectionLimitsOverride>,
     ) -> Result<Namespace> {
+        let max_tables = service_protection_limits.and_then(|l| l.max_tables);
+        let max_columns_per_table = service_protection_limits.and_then(|l| l.max_columns_per_table);
+
         let rec = sqlx::query_as::<_, Namespace>(
             r#"
-INSERT INTO namespace ( name, topic_id, query_pool_id, retention_period_ns, max_tables )
-VALUES ( $1, $2, $3, $4, $5 )
-RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at;
+INSERT INTO namespace ( name, topic_id, query_pool_id, retention_period_ns, max_tables, max_columns_per_table, partition_template )
+VALUES ( $1, $2, $3, $4, $5, $6, $7 )
+RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at,
+          partition_template;
             "#,
         )
         .bind(name.as_str()) // $1
         .bind(SHARED_TOPIC_ID) // $2
         .bind(SHARED_QUERY_POOL_ID) // $3
         .bind(retention_period_ns) // $4
-        .bind(DEFAULT_MAX_TABLES); // $5
+        .bind(max_tables.unwrap_or(DEFAULT_MAX_TABLES)) // $5
+        .bind(max_columns_per_table.unwrap_or(DEFAULT_MAX_COLUMNS_PER_TABLE)) // $6
+        .bind(partition_template); // $7
 
         let rec = rec.fetch_one(self.inner.get_mut()).await.map_err(|e| {
             if is_unique_violation(&e) {
@@ -293,10 +302,6 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
             }
         })?;
 
-        // Ensure the column default values match the code values.
-        debug_assert_eq!(rec.max_tables, DEFAULT_MAX_TABLES);
-        debug_assert_eq!(rec.max_columns_per_table, DEFAULT_MAX_COLUMNS_PER_TABLE);
-
         Ok(rec)
     }
 
@@ -304,7 +309,8 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
         let rec = sqlx::query_as::<_, Namespace>(
             format!(
                 r#"
-SELECT id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at
+SELECT id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at,
+       partition_template
 FROM namespace
 WHERE {v};
                 "#,
@@ -327,7 +333,8 @@ WHERE {v};
         let rec = sqlx::query_as::<_, Namespace>(
             format!(
                 r#"
-SELECT id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at
+SELECT id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at,
+       partition_template
 FROM namespace
 WHERE id=$1 AND {v};
                 "#,
@@ -356,7 +363,8 @@ WHERE id=$1 AND {v};
         let rec = sqlx::query_as::<_, Namespace>(
             format!(
                 r#"
-SELECT id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at
+SELECT id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at,
+       partition_template
 FROM namespace
 WHERE name=$1 AND {v};
                 "#,
@@ -396,7 +404,8 @@ WHERE name=$1 AND {v};
 UPDATE namespace
 SET max_tables = $1
 WHERE name = $2
-RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at;
+RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at,
+          partition_template;
         "#,
         )
         .bind(new_max)
@@ -420,7 +429,8 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
 UPDATE namespace
 SET max_columns_per_table = $1
 WHERE name = $2
-RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at;
+RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at,
+          partition_template;
         "#,
         )
         .bind(new_max)
@@ -448,7 +458,8 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
 UPDATE namespace
 SET retention_period_ns = $1
 WHERE name = $2
-RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at;
+RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at,
+          partition_template;
             "#,
         )
         .bind(retention_period_ns) // $1
@@ -467,9 +478,81 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
     }
 }
 
+/// [`TableRepo::create`] needs the ability to create some columns within the same transaction as
+/// the table creation. Column creation might also happen through [`ColumnRepo::create_or_get`],
+/// which doesn't need to be within an outer transaction. This function was extracted so that these
+/// two functions can share code but pass in either the transaction or the regular database
+/// connection as the query executor.
+async fn insert_column_with_connection<'q, E>(
+    executor: E,
+    name: &str,
+    table_id: TableId,
+    column_type: ColumnType,
+) -> Result<Column>
+where
+    E: Executor<'q, Database = Sqlite>,
+{
+    let rec = sqlx::query_as::<_, Column>(
+            r#"
+INSERT INTO column_name ( name, table_id, column_type )
+SELECT $1, table_id, $3 FROM (
+    SELECT max_columns_per_table, namespace.id, table_name.id as table_id, COUNT(column_name.id) AS count
+    FROM namespace LEFT JOIN table_name ON namespace.id = table_name.namespace_id
+                   LEFT JOIN column_name ON table_name.id = column_name.table_id
+    WHERE table_name.id = $2
+    GROUP BY namespace.max_columns_per_table, namespace.id, table_name.id
+) AS get_count WHERE count < max_columns_per_table
+ON CONFLICT (table_id, name)
+DO UPDATE SET name = column_name.name
+RETURNING *;
+        "#,
+        )
+        .bind(name) // $1
+        .bind(table_id) // $2
+        .bind(column_type) // $3
+        .fetch_one(executor)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::RowNotFound => Error::ColumnCreateLimitError {
+                column_name: name.to_string(),
+                table_id,
+            },
+            _ => {
+            if is_fk_violation(&e) {
+                Error::ForeignKeyViolation { source: e }
+            } else {
+                Error::SqlxError { source: e }
+            }
+        }})?;
+
+    ensure!(
+        rec.column_type == column_type,
+        ColumnTypeMismatchSnafu {
+            name,
+            existing: rec.column_type,
+            new: column_type,
+        }
+    );
+
+    Ok(rec)
+}
+
 #[async_trait]
 impl TableRepo for SqliteTxn {
-    async fn create_or_get(&mut self, name: &str, namespace_id: NamespaceId) -> Result<Table> {
+    async fn create(
+        &mut self,
+        name: &str,
+        partition_template: TablePartitionTemplateOverride,
+        namespace_id: NamespaceId,
+    ) -> Result<Table> {
+        let mut tx = self
+            .inner
+            .get_mut()
+            .pool
+            .begin()
+            .await
+            .map_err(|e| Error::StartTransaction { source: e })?;
+
         // A simple insert statement becomes quite complicated in order to avoid checking the table
         // limits in a select and then conditionally inserting (which would be racey).
         //
@@ -479,23 +562,22 @@ impl TableRepo for SqliteTxn {
         // By using SELECT rather than VALUES it will insert zero rows if it finds a null in the
         // subquery, i.e. if count >= max_tables. fetch_one() will return a RowNotFound error if
         // nothing was inserted. Not pretty!
-        let rec = sqlx::query_as::<_, Table>(
+        let table = sqlx::query_as::<_, Table>(
             r#"
-INSERT INTO table_name ( name, namespace_id )
-SELECT $1, id FROM (
+INSERT INTO table_name ( name, namespace_id, partition_template )
+SELECT $1, id, $2 FROM (
     SELECT namespace.id AS id, max_tables, COUNT(table_name.id) AS count
     FROM namespace LEFT JOIN table_name ON namespace.id = table_name.namespace_id
-    WHERE namespace.id = $2
+    WHERE namespace.id = $3
     GROUP BY namespace.max_tables, table_name.namespace_id, namespace.id
 ) AS get_count WHERE count < max_tables
-ON CONFLICT (namespace_id, name)
-DO UPDATE SET name = table_name.name
 RETURNING *;
         "#,
         )
         .bind(name) // $1
-        .bind(namespace_id) // $2
-        .fetch_one(self.inner.get_mut())
+        .bind(partition_template) // $2
+        .bind(namespace_id) // $3
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| match e {
             sqlx::Error::RowNotFound => Error::TableCreateLimitError {
@@ -503,7 +585,12 @@ RETURNING *;
                 namespace_id,
             },
             _ => {
-                if is_fk_violation(&e) {
+                if is_unique_violation(&e) {
+                    Error::TableNameExists {
+                        name: name.to_string(),
+                        namespace_id,
+                    }
+                } else if is_fk_violation(&e) {
                     Error::ForeignKeyViolation { source: e }
                 } else {
                     Error::SqlxError { source: e }
@@ -511,7 +598,22 @@ RETURNING *;
             }
         })?;
 
-        Ok(rec)
+        // Partitioning is only supported for tags, so create tag columns for all `TagValue`
+        // partition template parts. It's important this happens within the table creation
+        // transaction so that there isn't a possibility of a concurrent write creating these
+        // columns with an unsupported type.
+        for template_part in table.partition_template.parts() {
+            if let TemplatePart::TagValue(tag_name) = template_part {
+                insert_column_with_connection(&mut *tx, tag_name, table.id, ColumnType::Tag)
+                    .await?;
+            }
+        }
+
+        tx.commit()
+            .await
+            .map_err(|source| Error::FailedToCommit { source })?;
+
+        Ok(table)
     }
 
     async fn get_by_id(&mut self, table_id: TableId) -> Result<Option<Table>> {
@@ -595,49 +697,7 @@ impl ColumnRepo for SqliteTxn {
         table_id: TableId,
         column_type: ColumnType,
     ) -> Result<Column> {
-        let rec = sqlx::query_as::<_, Column>(
-            r#"
-INSERT INTO column_name ( name, table_id, column_type )
-SELECT $1, table_id, $3 FROM (
-    SELECT max_columns_per_table, namespace.id, table_name.id as table_id, COUNT(column_name.id) AS count
-    FROM namespace LEFT JOIN table_name ON namespace.id = table_name.namespace_id
-                   LEFT JOIN column_name ON table_name.id = column_name.table_id
-    WHERE table_name.id = $2
-    GROUP BY namespace.max_columns_per_table, namespace.id, table_name.id
-) AS get_count WHERE count < max_columns_per_table
-ON CONFLICT (table_id, name)
-DO UPDATE SET name = column_name.name
-RETURNING *;
-        "#,
-        )
-            .bind(name) // $1
-            .bind(table_id) // $2
-            .bind(column_type) // $3
-            .fetch_one(self.inner.get_mut())
-            .await
-            .map_err(|e| match e {
-                sqlx::Error::RowNotFound => Error::ColumnCreateLimitError {
-                    column_name: name.to_string(),
-                    table_id,
-                },
-                _ => {
-                    if is_fk_violation(&e) {
-                        Error::ForeignKeyViolation { source: e }
-                    } else {
-                        Error::SqlxError { source: e }
-                    }
-                }})?;
-
-        ensure!(
-            rec.column_type == column_type,
-            ColumnTypeMismatchSnafu {
-                name,
-                existing: rec.column_type,
-                new: column_type,
-            }
-        );
-
-        Ok(rec)
+        insert_column_with_connection(self.inner.get_mut(), name, table_id, column_type).await
     }
 
     async fn list_by_namespace_id(&mut self, namespace_id: NamespaceId) -> Result<Vec<Column>> {
@@ -754,21 +814,29 @@ RETURNING *;
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 struct PartitionPod {
     id: PartitionId,
+    hash_id: Option<PartitionHashId>,
     table_id: TableId,
     partition_key: PartitionKey,
     sort_key: Json<Vec<String>>,
+    sort_key_ids: Option<Json<Vec<i64>>>,
     new_file_at: Option<Timestamp>,
 }
 
 impl From<PartitionPod> for Partition {
     fn from(value: PartitionPod) -> Self {
-        Self {
-            id: value.id,
-            table_id: value.table_id,
-            partition_key: value.partition_key,
-            sort_key: value.sort_key.0,
-            new_file_at: value.new_file_at,
-        }
+        let sort_key_ids = value
+            .sort_key_ids
+            .map(|sort_key_ids| SortedColumnSet::from(sort_key_ids.0));
+
+        Self::new_with_hash_id_from_sqlite_catalog_only(
+            value.id,
+            value.hash_id,
+            value.table_id,
+            value.partition_key,
+            value.sort_key.0,
+            sort_key_ids,
+            value.new_file_at,
+        )
     }
 }
 
@@ -779,20 +847,23 @@ impl PartitionRepo for SqliteTxn {
         // array rather than NULL which sqlx will throw `UnexpectedNullError` while is is doing
         // `ColumnDecode`
 
+        let hash_id = PartitionHashId::new(table_id, &key);
+
         let v = sqlx::query_as::<_, PartitionPod>(
             r#"
 INSERT INTO partition
-    ( partition_key, shard_id, table_id, sort_key)
+    (partition_key, shard_id, table_id, hash_id, sort_key, sort_key_ids)
 VALUES
-    ( $1, $2, $3, '[]')
+    ($1, $2, $3, $4, '[]', '[]')
 ON CONFLICT (table_id, partition_key)
 DO UPDATE SET partition_key = partition.partition_key
-RETURNING id, table_id, partition_key, sort_key, new_file_at;
+RETURNING id, hash_id, table_id, partition_key, sort_key, sort_key_ids, new_file_at;
         "#,
         )
         .bind(key) // $1
         .bind(TRANSITION_SHARD_ID) // $2
         .bind(table_id) // $3
+        .bind(&hash_id) // $4
         .fetch_one(self.inner.get_mut())
         .await
         .map_err(|e| {
@@ -809,7 +880,7 @@ RETURNING id, table_id, partition_key, sort_key, new_file_at;
     async fn get_by_id(&mut self, partition_id: PartitionId) -> Result<Option<Partition>> {
         let rec = sqlx::query_as::<_, PartitionPod>(
             r#"
-SELECT id, table_id, partition_key, sort_key, new_file_at
+SELECT id, hash_id, table_id, partition_key, sort_key, sort_key_ids, new_file_at
 FROM partition
 WHERE id = $1;
             "#,
@@ -827,10 +898,84 @@ WHERE id = $1;
         Ok(Some(partition.into()))
     }
 
+    async fn get_by_id_batch(&mut self, partition_ids: Vec<PartitionId>) -> Result<Vec<Partition>> {
+        // We use a JSON-based "IS IN" check.
+        let ids: Vec<_> = partition_ids.iter().map(|p| p.get()).collect();
+
+        sqlx::query_as::<_, PartitionPod>(
+            r#"
+SELECT id, hash_id, table_id, partition_key, sort_key, sort_key_ids, new_file_at
+FROM partition
+WHERE id IN (SELECT value FROM json_each($1));
+            "#,
+        )
+        .bind(Json(&ids[..])) // $1
+        .fetch_all(self.inner.get_mut())
+        .await
+        .map(|vals| vals.into_iter().map(Partition::from).collect())
+        .map_err(|e| Error::SqlxError { source: e })
+    }
+
+    async fn get_by_hash_id(
+        &mut self,
+        partition_hash_id: &PartitionHashId,
+    ) -> Result<Option<Partition>> {
+        let rec = sqlx::query_as::<_, PartitionPod>(
+            r#"
+SELECT id, hash_id, table_id, partition_key, sort_key, sort_key_ids, new_file_at
+FROM partition
+WHERE hash_id = $1;
+            "#,
+        )
+        .bind(partition_hash_id) // $1
+        .fetch_one(self.inner.get_mut())
+        .await;
+
+        if let Err(sqlx::Error::RowNotFound) = rec {
+            return Ok(None);
+        }
+
+        let partition = rec.map_err(|e| Error::SqlxError { source: e })?;
+
+        Ok(Some(partition.into()))
+    }
+
+    async fn get_by_hash_id_batch(
+        &mut self,
+        partition_hash_ids: &[&PartitionHashId],
+    ) -> Result<Vec<Partition>> {
+        // We use a JSON-based "IS IN" check.
+        let ids: Vec<_> = partition_hash_ids
+            .iter()
+            .map(|id| {
+                // convert partiion hash ID to uppercase hex string
+                let bytes = id.as_bytes();
+                let mut s = String::with_capacity(bytes.len() * 2);
+                for b in bytes {
+                    write!(&mut s, "{:02X}", b).expect("never fails");
+                }
+                s
+            })
+            .collect();
+
+        sqlx::query_as::<_, PartitionPod>(
+            r#"
+SELECT id, hash_id, table_id, partition_key, sort_key, sort_key_ids, new_file_at
+FROM partition
+WHERE hex(hash_id) IN (SELECT value FROM json_each($1));
+            "#,
+        )
+        .bind(Json(&ids[..])) // $1
+        .fetch_all(self.inner.get_mut())
+        .await
+        .map(|vals| vals.into_iter().map(Partition::from).collect())
+        .map_err(|e| Error::SqlxError { source: e })
+    }
+
     async fn list_by_table_id(&mut self, table_id: TableId) -> Result<Vec<Partition>> {
         Ok(sqlx::query_as::<_, PartitionPod>(
             r#"
-SELECT id, table_id, partition_key, sort_key, new_file_at
+SELECT id, hash_id, table_id, partition_key, sort_key, sort_key_ids, new_file_at
 FROM partition
 WHERE table_id = $1;
             "#,
@@ -864,24 +1009,45 @@ WHERE table_id = $1;
     /// round trips to service a transaction in the happy path).
     async fn cas_sort_key(
         &mut self,
-        partition_id: PartitionId,
+        partition_id: &TransitionPartitionId,
         old_sort_key: Option<Vec<String>>,
         new_sort_key: &[&str],
+        new_sort_key_ids: &SortedColumnSet,
     ) -> Result<Partition, CasFailure<Vec<String>>> {
+        verify_sort_key_length(new_sort_key, new_sort_key_ids);
+
         let old_sort_key = old_sort_key.unwrap_or_default();
-        let res = sqlx::query_as::<_, PartitionPod>(
-            r#"
+        let raw_new_sort_key_ids: Vec<_> = new_sort_key_ids.iter().map(|cid| cid.get()).collect();
+
+        // This `match` will go away when all partitions have hash IDs in the database.
+        let query = match partition_id {
+            TransitionPartitionId::Deterministic(hash_id) => sqlx::query_as::<_, PartitionPod>(
+                r#"
 UPDATE partition
-SET sort_key = $1
-WHERE id = $2 AND sort_key = $3
-RETURNING id, table_id, partition_key, sort_key, new_file_at;
+SET sort_key = $1, sort_key_ids = $4
+WHERE hash_id = $2 AND sort_key = $3
+RETURNING id, hash_id, table_id, partition_key, sort_key, sort_key_ids, new_file_at;
         "#,
-        )
-        .bind(Json(new_sort_key)) // $1
-        .bind(partition_id) // $2
-        .bind(Json(&old_sort_key)) // $3
-        .fetch_one(self.inner.get_mut())
-        .await;
+            )
+            .bind(Json(new_sort_key)) // $1
+            .bind(hash_id) // $2
+            .bind(Json(&old_sort_key)) // $3
+            .bind(Json(&raw_new_sort_key_ids)), // $4
+            TransitionPartitionId::Deprecated(id) => sqlx::query_as::<_, PartitionPod>(
+                r#"
+UPDATE partition
+SET sort_key = $1, sort_key_ids = $4
+WHERE id = $2 AND sort_key = $3
+RETURNING id, hash_id, table_id, partition_key, sort_key, sort_key_ids, new_file_at;
+        "#,
+            )
+            .bind(Json(new_sort_key)) // $1
+            .bind(id) // $2
+            .bind(Json(&old_sort_key)) // $3
+            .bind(Json(&raw_new_sort_key_ids)), // $4
+        };
+
+        let res = query.fetch_one(self.inner.get_mut()).await;
 
         let partition = match res {
             Ok(v) => v,
@@ -898,11 +1064,11 @@ RETURNING id, table_id, partition_key, sort_key, new_file_at;
                 // NOTE: this is racy, but documented - this might return "Sort
                 // key differs! Old key: <old sort key you provided>"
                 return Err(CasFailure::ValueMismatch(
-                    PartitionRepo::get_by_id(self, partition_id)
+                    crate::partition_lookup(self, partition_id)
                         .await
                         .map_err(CasFailure::QueryError)?
                         .ok_or(CasFailure::QueryError(Error::PartitionNotFound {
-                            id: partition_id,
+                            id: partition_id.clone(),
                         }))?
                         .sort_key,
                 ));
@@ -962,24 +1128,21 @@ skipped_at = EXCLUDED.skipped_at;
         Ok(())
     }
 
-    async fn get_in_skipped_compaction(
+    async fn get_in_skipped_compactions(
         &mut self,
-        partition_id: PartitionId,
-    ) -> Result<Option<SkippedCompaction>> {
-        let rec = sqlx::query_as::<_, SkippedCompaction>(
-            r#"SELECT * FROM skipped_compactions WHERE partition_id = $1;"#,
+        partition_ids: &[PartitionId],
+    ) -> Result<Vec<SkippedCompaction>> {
+        let ids = partition_ids.iter().map(|p| p.get()).collect::<Vec<_>>();
+        let rec = sqlx::query_as::<sqlx::sqlite::Sqlite, SkippedCompaction>(
+            r#"SELECT * FROM skipped_compactions WHERE partition_id IN (SELECT value FROM json_each($1));"#,
         )
-        .bind(partition_id) // $1
-        .fetch_one(self.inner.get_mut())
+        .bind(Json(&ids[..]))
+        .fetch_all(self.inner.get_mut())
         .await;
 
-        if let Err(sqlx::Error::RowNotFound) = rec {
-            return Ok(None);
-        }
+        let skipped_partition_records = rec.map_err(|e| Error::SqlxError { source: e })?;
 
-        let skipped_partition_record = rec.map_err(|e| Error::SqlxError { source: e })?;
-
-        Ok(Some(skipped_partition_record))
+        Ok(skipped_partition_records)
     }
 
     async fn list_skipped_compactions(&mut self) -> Result<Vec<SkippedCompaction>> {
@@ -1013,7 +1176,7 @@ RETURNING *
     async fn most_recent_n(&mut self, n: usize) -> Result<Vec<Partition>> {
         Ok(sqlx::query_as::<_, PartitionPod>(
             r#"
-SELECT id, table_id, partition_key, sort_key, new_file_at
+SELECT id, hash_id, table_id, partition_key, sort_key, sort_key_ids, new_file_at
 FROM partition
 ORDER BY id DESC
 LIMIT $1;
@@ -1052,6 +1215,23 @@ LIMIT $1;
             .await
             .map_err(|e| Error::SqlxError { source: e })
     }
+
+    async fn list_old_style(&mut self) -> Result<Vec<Partition>> {
+        Ok(sqlx::query_as::<_, PartitionPod>(
+            r#"
+SELECT id, hash_id, table_id, partition_key, sort_key, sort_key_ids, new_file_at
+FROM partition
+WHERE hash_id IS NULL
+ORDER BY id DESC;
+        "#,
+        )
+        .fetch_all(self.inner.get_mut())
+        .await
+        .map_err(|e| Error::SqlxError { source: e })?
+        .into_iter()
+        .map(Into::into)
+        .collect())
+    }
 }
 
 fn from_column_set(v: &ColumnSet) -> Json<Vec<i64>> {
@@ -1067,7 +1247,8 @@ struct ParquetFilePod {
     id: ParquetFileId,
     namespace_id: NamespaceId,
     table_id: TableId,
-    partition_id: PartitionId,
+    #[sqlx(flatten)]
+    partition_id: TransitionPartitionId,
     object_store_id: Uuid,
     min_time: Timestamp,
     max_time: Timestamp,
@@ -1108,11 +1289,25 @@ impl ParquetFileRepo for SqliteTxn {
         create_parquet_file(executor, parquet_file_params).await
     }
 
-    async fn flag_for_delete(&mut self, id: ParquetFileId) -> Result<()> {
-        let marked_at = Timestamp::from(self.time_provider.now());
-        let executor = self.inner.get_mut();
-
-        flag_for_delete(executor, id, marked_at).await
+    async fn list_all(&mut self) -> Result<Vec<ParquetFile>> {
+        // Deliberately doesn't use `SELECT *` to avoid the performance hit of fetching the large
+        // `parquet_metadata` column!!
+        Ok(sqlx::query_as::<_, ParquetFilePod>(
+            r#"
+SELECT parquet_file.id, parquet_file.namespace_id, parquet_file.table_id,
+       parquet_file.partition_id, parquet_file.partition_hash_id, parquet_file.object_store_id,
+       parquet_file.min_time, parquet_file.max_time, parquet_file.to_delete,
+       parquet_file.file_size_bytes, parquet_file.row_count, parquet_file.compaction_level,
+       parquet_file.created_at, parquet_file.column_set, parquet_file.max_l0_created_at
+FROM parquet_file;
+             "#,
+        )
+        .fetch_all(self.inner.get_mut())
+        .await
+        .map_err(|e| Error::SqlxError { source: e })?
+        .into_iter()
+        .map(Into::into)
+        .collect())
     }
 
     async fn flag_for_delete_by_retention(&mut self) -> Result<Vec<ParquetFileId>> {
@@ -1136,7 +1331,7 @@ RETURNING id;
             "#,
         )
         .bind(flagged_at) // $1
-        .bind(MAX_PARQUET_FILES_SELECTED_ONCE) // $2
+        .bind(MAX_PARQUET_FILES_SELECTED_ONCE_FOR_RETENTION) // $2
         .fetch_all(self.inner.get_mut())
         .await
         .map_err(|e| Error::SqlxError { source: e })?;
@@ -1154,7 +1349,7 @@ RETURNING id;
         Ok(sqlx::query_as::<_, ParquetFilePod>(
             r#"
 SELECT parquet_file.id, parquet_file.namespace_id, parquet_file.table_id,
-       parquet_file.partition_id, parquet_file.object_store_id,
+       parquet_file.partition_id, parquet_file.partition_hash_id, parquet_file.object_store_id,
        parquet_file.min_time, parquet_file.max_time, parquet_file.to_delete,
        parquet_file.file_size_bytes, parquet_file.row_count, parquet_file.compaction_level,
        parquet_file.created_at, parquet_file.column_set, parquet_file.max_l0_created_at
@@ -1176,32 +1371,11 @@ WHERE table_name.namespace_id = $1
     async fn list_by_table_not_to_delete(&mut self, table_id: TableId) -> Result<Vec<ParquetFile>> {
         Ok(sqlx::query_as::<_, ParquetFilePod>(
             r#"
-SELECT id, namespace_id, table_id, partition_id, object_store_id,
+SELECT id, namespace_id, table_id, partition_id, partition_hash_id, object_store_id,
        min_time, max_time, to_delete, file_size_bytes,
        row_count, compaction_level, created_at, column_set, max_l0_created_at
 FROM parquet_file
 WHERE table_id = $1 AND to_delete IS NULL;
-             "#,
-        )
-        .bind(table_id) // $1
-        .fetch_all(self.inner.get_mut())
-        .await
-        .map_err(|e| Error::SqlxError { source: e })?
-        .into_iter()
-        .map(Into::into)
-        .collect())
-    }
-
-    async fn list_by_table(&mut self, table_id: TableId) -> Result<Vec<ParquetFile>> {
-        // Deliberately doesn't use `SELECT *` to avoid the performance hit of fetching the large
-        // `parquet_metadata` column!!
-        Ok(sqlx::query_as::<_, ParquetFilePod>(
-            r#"
-SELECT id, shard_id, namespace_id, table_id, partition_id, object_store_id,
-       max_sequence_number, min_time, max_time, to_delete, file_size_bytes,
-       row_count, compaction_level, created_at, column_set, max_l0_created_at
-FROM parquet_file
-WHERE table_id = $1;
              "#,
         )
         .bind(table_id) // $1
@@ -1229,7 +1403,7 @@ RETURNING id;
              "#,
         )
         .bind(older_than) // $1
-        .bind(MAX_PARQUET_FILES_SELECTED_ONCE) // $2
+        .bind(MAX_PARQUET_FILES_SELECTED_ONCE_FOR_DELETE) // $2
         .fetch_all(self.inner.get_mut())
         .await
         .map_err(|e| Error::SqlxError { source: e })?;
@@ -1240,56 +1414,45 @@ RETURNING id;
 
     async fn list_by_partition_not_to_delete(
         &mut self,
-        partition_id: PartitionId,
+        partition_id: &TransitionPartitionId,
     ) -> Result<Vec<ParquetFile>> {
-        Ok(sqlx::query_as::<_, ParquetFilePod>(
-            r#"
-SELECT id, namespace_id, table_id, partition_id, object_store_id,
-       min_time, max_time, to_delete, file_size_bytes,
-       row_count, compaction_level, created_at, column_set, max_l0_created_at
+        // This `match` will go away when all partitions have hash IDs in the database.
+        let query = match partition_id {
+            TransitionPartitionId::Deterministic(hash_id) => sqlx::query_as::<_, ParquetFilePod>(
+                r#"
+SELECT parquet_file.id, namespace_id, parquet_file.table_id, partition_id, partition_hash_id,
+       object_store_id, min_time, max_time, parquet_file.to_delete, file_size_bytes, row_count,
+       compaction_level, created_at, column_set, max_l0_created_at
 FROM parquet_file
-WHERE parquet_file.partition_id = $1
+INNER JOIN partition
+ON partition.id = parquet_file.partition_id OR partition.hash_id = parquet_file.partition_hash_id
+WHERE partition.hash_id = $1
   AND parquet_file.to_delete IS NULL;
         "#,
-        )
-        .bind(partition_id) // $1
-        .fetch_all(self.inner.get_mut())
-        .await
-        .map_err(|e| Error::SqlxError { source: e })?
-        .into_iter()
-        .map(Into::into)
-        .collect())
-    }
+            )
+            .bind(hash_id), // $1
+            TransitionPartitionId::Deprecated(id) => sqlx::query_as::<_, ParquetFilePod>(
+                r#"
+SELECT parquet_file.id, namespace_id, parquet_file.table_id, partition_id, partition_hash_id,
+       object_store_id, min_time, max_time, parquet_file.to_delete, file_size_bytes, row_count,
+       compaction_level, created_at, column_set, max_l0_created_at
+FROM parquet_file
+INNER JOIN partition
+ON partition.id = parquet_file.partition_id OR partition.hash_id = parquet_file.partition_hash_id
+WHERE partition.id = $1
+  AND parquet_file.to_delete IS NULL;
+        "#,
+            )
+            .bind(id), // $1
+        };
 
-    async fn update_compaction_level(
-        &mut self,
-        parquet_file_ids: &[ParquetFileId],
-        compaction_level: CompactionLevel,
-    ) -> Result<Vec<ParquetFileId>> {
-        let executor = self.inner.get_mut();
-        update_compaction_level(executor, parquet_file_ids, compaction_level).await
-    }
-
-    async fn exist(&mut self, id: ParquetFileId) -> Result<bool> {
-        let read_result = sqlx::query_as::<_, Count>(
-            r#"SELECT count(1) as count FROM parquet_file WHERE id = $1;"#,
-        )
-        .bind(id) // $1
-        .fetch_one(self.inner.get_mut())
-        .await
-        .map_err(|e| Error::SqlxError { source: e })?;
-
-        Ok(read_result.count > 0)
-    }
-
-    async fn count(&mut self) -> Result<i64> {
-        let read_result =
-            sqlx::query_as::<_, Count>(r#"SELECT count(1) as count FROM parquet_file;"#)
-                .fetch_one(self.inner.get_mut())
-                .await
-                .map_err(|e| Error::SqlxError { source: e })?;
-
-        Ok(read_result.count)
+        Ok(query
+            .fetch_all(self.inner.get_mut())
+            .await
+            .map_err(|e| Error::SqlxError { source: e })?
+            .into_iter()
+            .map(Into::into)
+            .collect())
     }
 
     async fn get_by_object_store_id(
@@ -1298,9 +1461,9 @@ WHERE parquet_file.partition_id = $1
     ) -> Result<Option<ParquetFile>> {
         let rec = sqlx::query_as::<_, ParquetFilePod>(
             r#"
-SELECT id, namespace_id, table_id, partition_id, object_store_id,
-       min_time, max_time, to_delete, file_size_bytes,
-       row_count, compaction_level, created_at, column_set, max_l0_created_at
+SELECT id, namespace_id, table_id, partition_id, partition_hash_id, object_store_id, min_time,
+       max_time, to_delete, file_size_bytes, row_count, compaction_level, created_at, column_set,
+       max_l0_created_at
 FROM parquet_file
 WHERE object_store_id = $1;
              "#,
@@ -1318,22 +1481,41 @@ WHERE object_store_id = $1;
         Ok(Some(parquet_file.into()))
     }
 
+    async fn exists_by_object_store_id_batch(
+        &mut self,
+        object_store_ids: Vec<Uuid>,
+    ) -> Result<Vec<Uuid>> {
+        let in_value = object_store_ids
+            .into_iter()
+            // use a sqlite blob literal
+            .map(|id| format!("X'{}'", id.simple()))
+            .collect::<Vec<String>>()
+            .join(",");
+
+        sqlx::query(&format!(
+            "
+SELECT object_store_id
+FROM parquet_file
+WHERE object_store_id IN ({v});",
+            v = in_value
+        ))
+        .map(|slr: SqliteRow| slr.get::<Uuid, _>("object_store_id"))
+        // limitation of sqlx: will not bind arrays
+        // https://github.com/launchbadge/sqlx/blob/main/FAQ.md#how-can-i-do-a-select--where-foo-in--query
+        .fetch_all(self.inner.get_mut())
+        .await
+        .map_err(|e| Error::SqlxError { source: e })
+    }
+
     async fn create_upgrade_delete(
         &mut self,
-        _partition_id: PartitionId,
-        delete: &[ParquetFile],
-        upgrade: &[ParquetFile],
+        delete: &[ParquetFileId],
+        upgrade: &[ParquetFileId],
         create: &[ParquetFileParams],
         target_level: CompactionLevel,
     ) -> Result<Vec<ParquetFileId>> {
-        let mut delete_set = HashSet::new();
-        let mut upgrade_set = HashSet::new();
-        for d in delete {
-            delete_set.insert(d.id.get());
-        }
-        for u in upgrade {
-            upgrade_set.insert(u.id.get());
-        }
+        let delete_set = delete.iter().copied().collect::<HashSet<_>>();
+        let upgrade_set = upgrade.iter().copied().collect::<HashSet<_>>();
 
         assert!(
             delete_set.is_disjoint(&upgrade_set),
@@ -1347,18 +1529,16 @@ WHERE object_store_id = $1;
             .await
             .map_err(|e| Error::StartTransaction { source: e })?;
 
-        let upgrade = upgrade.iter().map(|f| f.id).collect::<Vec<_>>();
-
-        for file in delete {
+        for id in delete {
             let marked_at = Timestamp::from(self.time_provider.now());
-            flag_for_delete(&mut tx, file.id, marked_at).await?;
+            flag_for_delete(&mut *tx, *id, marked_at).await?;
         }
 
-        update_compaction_level(&mut tx, &upgrade, target_level).await?;
+        update_compaction_level(&mut *tx, upgrade, target_level).await?;
 
         let mut ids = Vec::with_capacity(create.len());
         for file in create {
-            let res = create_parquet_file(&mut tx, file.clone()).await?;
+            let res = create_parquet_file(&mut *tx, file.clone()).await?;
             ids.push(res.id);
         }
         tx.commit()
@@ -1393,33 +1573,41 @@ where
         max_l0_created_at,
     } = parquet_file_params;
 
-    let query = sqlx::query_as::<_, ParquetFilePod>(
+    let (partition_id, partition_hash_id) = match partition_id {
+        TransitionPartitionId::Deterministic(hash_id) => (None, Some(hash_id)),
+        TransitionPartitionId::Deprecated(id) => (Some(id), None),
+    };
+    let res = sqlx::query_as::<_, ParquetFilePod>(
         r#"
 INSERT INTO parquet_file (
-    shard_id, table_id, partition_id, object_store_id,
+    shard_id, table_id, partition_id, partition_hash_id, object_store_id,
     min_time, max_time, file_size_bytes,
     row_count, compaction_level, created_at, namespace_id, column_set, max_l0_created_at )
-VALUES ( $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13 )
+VALUES ( $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14 )
 RETURNING
-    id, table_id, partition_id, object_store_id,
-    min_time, max_time, to_delete, file_size_bytes,
-    row_count, compaction_level, created_at, namespace_id, column_set, max_l0_created_at;
+    id, table_id, partition_id, partition_hash_id, object_store_id, min_time, max_time, to_delete,
+    file_size_bytes, row_count, compaction_level, created_at, namespace_id, column_set,
+    max_l0_created_at;
         "#,
     )
     .bind(TRANSITION_SHARD_ID) // $1
     .bind(table_id) // $2
     .bind(partition_id) // $3
-    .bind(object_store_id) // $4
-    .bind(min_time) // $5
-    .bind(max_time) // $6
-    .bind(file_size_bytes) // $7
-    .bind(row_count) // $8
-    .bind(compaction_level) // $9
-    .bind(created_at) // $10
-    .bind(namespace_id) // $11
-    .bind(from_column_set(&column_set)) // $12
-    .bind(max_l0_created_at); // $13
-    let rec = query.fetch_one(executor).await.map_err(|e| {
+    .bind(partition_hash_id.as_ref()) // $4
+    .bind(object_store_id) // $5
+    .bind(min_time) // $6
+    .bind(max_time) // $7
+    .bind(file_size_bytes) // $8
+    .bind(row_count) // $9
+    .bind(compaction_level) // $10
+    .bind(created_at) // $11
+    .bind(namespace_id) // $12
+    .bind(from_column_set(&column_set)) // $13
+    .bind(max_l0_created_at) // $14
+    .fetch_one(executor)
+    .await;
+
+    let rec = res.map_err(|e| {
         if is_unique_violation(&e) {
             Error::FileExists { object_store_id }
         } else if is_fk_violation(&e) {
@@ -1456,8 +1644,7 @@ async fn update_compaction_level<'q, E>(
 where
     E: Executor<'q, Database = Sqlite>,
 {
-    // If I try to do `.bind(parquet_file_ids)` directly, I get a compile error from sqlx.
-    // See https://github.com/launchbadge/sqlx/issues/1744
+    // We use a JSON-based "IS IN" check.
     let ids: Vec<_> = parquet_file_ids.iter().map(|p| p.get()).collect();
     let query = sqlx::query(
         r#"
@@ -1515,8 +1702,12 @@ fn is_unique_violation(e: &sqlx::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::{arbitrary_namespace, arbitrary_table};
+    use crate::test_helpers::{
+        arbitrary_namespace, arbitrary_parquet_file_params, arbitrary_table,
+    };
     use assert_matches::assert_matches;
+    use data_types::partition_template::TemplatePart;
+    use generated_types::influxdata::iox::partition_template::v1 as proto;
     use metric::{Attributes, DurationHistogram, Metric};
     use std::sync::Arc;
 
@@ -1563,22 +1754,116 @@ mod tests {
         let namespace = arbitrary_namespace(&mut *repos, "ns4").await;
         let table_id = arbitrary_table(&mut *repos, "table", &namespace).await.id;
 
-        let key = "bananas";
+        let key = PartitionKey::from("bananas");
+
+        let hash_id = PartitionHashId::new(table_id, &key);
 
         let a = repos
             .partitions()
-            .create_or_get(key.into(), table_id)
+            .create_or_get(key.clone(), table_id)
             .await
             .expect("should create OK");
+
+        assert_eq!(a.hash_id().unwrap(), &hash_id);
 
         // Call create_or_get for the same (key, table_id) pair, to ensure the write is idempotent.
         let b = repos
             .partitions()
-            .create_or_get(key.into(), table_id)
+            .create_or_get(key.clone(), table_id)
             .await
             .expect("idempotent write should succeed");
 
         assert_eq!(a, b);
+
+        // Check that the hash_id is saved in the database and is returned when queried.
+        let table_partitions = sqlite
+            .repositories()
+            .await
+            .partitions()
+            .list_by_table_id(table_id)
+            .await
+            .unwrap();
+        assert_eq!(table_partitions.len(), 1);
+        assert_eq!(table_partitions[0].hash_id().unwrap(), &hash_id);
+
+        // Test: sort_key_ids from partition_create_or_get_idempotent
+        assert!(table_partitions[0].sort_key_ids().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn existing_partitions_without_hash_id() {
+        let sqlite: SqliteCatalog = setup_db().await;
+        let pool = sqlite.pool.clone();
+        let sqlite: Arc<dyn Catalog> = Arc::new(sqlite);
+        let mut repos = sqlite.repositories().await;
+
+        let namespace = arbitrary_namespace(&mut *repos, "ns4").await;
+        let table = arbitrary_table(&mut *repos, "table", &namespace).await;
+        let table_id = table.id;
+        let key = PartitionKey::from("francis-scott-key-key");
+
+        // Create a partition record in the database that has `NULL` for its `hash_id`
+        // value, which is what records existing before the migration adding that column will have.
+        sqlx::query(
+            r#"
+INSERT INTO partition
+    (partition_key, shard_id, table_id, sort_key, sort_key_ids)
+VALUES
+    ($1, $2, $3, '[]', '[]')
+ON CONFLICT (table_id, partition_key)
+DO UPDATE SET partition_key = partition.partition_key
+RETURNING id, hash_id, table_id, partition_key, sort_key, sort_key_ids, new_file_at;
+        "#,
+        )
+        .bind(&key) // $1
+        .bind(TRANSITION_SHARD_ID) // $2
+        .bind(table_id) // $3
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // Check that the hash_id being null in the database doesn't break querying for partitions.
+        let table_partitions = repos.partitions().list_by_table_id(table_id).await.unwrap();
+        assert_eq!(table_partitions.len(), 1);
+        let partition = &table_partitions[0];
+
+        // Call create_or_get for the same (key, table_id) pair, to ensure the write is idempotent
+        // and that the hash_id still doesn't get set.
+        let inserted_again = repos
+            .partitions()
+            .create_or_get(key, table_id)
+            .await
+            .expect("idempotent write should succeed");
+
+        // Test: sort_key_ids from freshly insert with empty value
+        assert!(inserted_again.sort_key_ids().unwrap().is_empty());
+
+        assert_eq!(partition, &inserted_again);
+
+        // Create a Parquet file record in this partition to ensure we don't break new data
+        // ingestion for old-style partitions
+        let parquet_file_params = arbitrary_parquet_file_params(&namespace, &table, partition);
+        let parquet_file = repos
+            .parquet_files()
+            .create(parquet_file_params)
+            .await
+            .unwrap();
+        assert_matches!(
+            parquet_file.partition_id,
+            TransitionPartitionId::Deprecated(_)
+        );
+
+        // Add a partition record WITH a hash ID
+        repos
+            .partitions()
+            .create_or_get(PartitionKey::from("Something else"), table_id)
+            .await
+            .unwrap();
+
+        // Ensure we can list only the old-style partitions
+        let old_style_partitions = repos.partitions().list_old_style().await.unwrap();
+        assert_eq!(old_style_partitions.len(), 1);
+        assert_eq!(old_style_partitions[0].id, partition.id);
     }
 
     macro_rules! test_column_create_or_get_many_unchecked {
@@ -1743,44 +2028,25 @@ mod tests {
         let pool = sqlite.pool.clone();
         let sqlite: Arc<dyn Catalog> = Arc::new(sqlite);
         let mut repos = sqlite.repositories().await;
-
         let namespace = arbitrary_namespace(&mut *repos, "ns4").await;
-        let namespace_id = namespace.id;
-        let table_id = arbitrary_table(&mut *repos, "table", &namespace).await.id;
-
+        let table = arbitrary_table(&mut *repos, "table", &namespace).await;
         let key = "bananas";
-
-        let partition_id = repos
+        let partition = repos
             .partitions()
-            .create_or_get(key.into(), table_id)
+            .create_or_get(key.into(), table.id)
             .await
-            .expect("should create OK")
-            .id;
+            .unwrap();
 
-        // parquet file to create- all we care about here is the size, the rest is to satisfy DB
-        // constraints
-        let time_provider = Arc::new(SystemProvider::new());
-        let time_now = Timestamp::from(time_provider.now());
-        let mut p1 = ParquetFileParams {
-            namespace_id,
-            table_id,
-            partition_id,
-            object_store_id: Uuid::new_v4(),
-            min_time: Timestamp::new(1),
-            max_time: Timestamp::new(5),
-            file_size_bytes: 1337,
-            row_count: 0,
-            compaction_level: CompactionLevel::Initial, // level of file of new writes
-            created_at: time_now,
-            column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
-            max_l0_created_at: time_now,
-        };
+        // parquet file to create- all we care about here is the size
+        let mut p1 = arbitrary_parquet_file_params(&namespace, &table, &partition);
+        p1.file_size_bytes = 1337;
         let f1 = repos
             .parquet_files()
             .create(p1.clone())
             .await
             .expect("create parquet file should succeed");
-        // insert the same again with a different size; we should then have 3x1337 as total file size
+        // insert the same again with a different size; we should then have 3x1337 as total file
+        // size
         p1.object_store_id = Uuid::new_v4();
         p1.file_size_bytes *= 2;
         let _f2 = repos
@@ -1800,7 +2066,7 @@ mod tests {
         // flag f1 for deletion and assert that the total file size is reduced accordingly.
         repos
             .parquet_files()
-            .flag_for_delete(f1.id)
+            .create_upgrade_delete(&[f1.id], &[], &[], CompactionLevel::Initial)
             .await
             .expect("flag parquet file for deletion should succeed");
         let total_file_size_bytes: i64 =
@@ -1812,10 +2078,10 @@ mod tests {
         assert_eq!(total_file_size_bytes, 1337 * 2);
 
         // actually deleting shouldn't change the total
-        let now = Timestamp::from(time_provider.now());
+        let older_than = p1.created_at + 1;
         repos
             .parquet_files()
-            .delete_old_ids_only(now)
+            .delete_old_ids_only(older_than)
             .await
             .expect("parquet file deletion should succeed");
         let total_file_size_bytes: i64 =
@@ -1824,5 +2090,433 @@ mod tests {
                 .await
                 .expect("fetch total file size failed");
         assert_eq!(total_file_size_bytes, 1337 * 2);
+    }
+
+    #[tokio::test]
+    async fn namespace_partition_template_null_is_the_default_in_the_database() {
+        let sqlite = setup_db().await;
+        let pool = sqlite.pool.clone();
+        let sqlite: Arc<dyn Catalog> = Arc::new(sqlite);
+        let mut repos = sqlite.repositories().await;
+
+        let namespace_name = "apples";
+
+        // Create a namespace record in the database that has `NULL` for its `partition_template`
+        // value, which is what records existing before the migration adding that column will have.
+        let insert_null_partition_template_namespace = sqlx::query(
+            r#"
+INSERT INTO namespace (
+    name, topic_id, query_pool_id, retention_period_ns, max_tables, partition_template
+)
+VALUES ( $1, $2, $3, $4, $5, NULL )
+RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at,
+          partition_template;
+            "#,
+        )
+        .bind(namespace_name) // $1
+        .bind(SHARED_TOPIC_ID) // $2
+        .bind(SHARED_QUERY_POOL_ID) // $3
+        .bind(None::<Option<i64>>) // $4
+        .bind(DEFAULT_MAX_TABLES); // $5
+
+        insert_null_partition_template_namespace
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        let lookup_namespace = repos
+            .namespaces()
+            .get_by_name(namespace_name, SoftDeletedRows::ExcludeDeleted)
+            .await
+            .unwrap()
+            .unwrap();
+        // When fetching this namespace from the database, the `FromRow` impl should set its
+        // `partition_template` to the default.
+        assert_eq!(
+            lookup_namespace.partition_template,
+            NamespacePartitionTemplateOverride::default()
+        );
+
+        // When creating a namespace through the catalog functions without specifying a custom
+        // partition template,
+        let created_without_custom_template = repos
+            .namespaces()
+            .create(
+                &"lemons".try_into().unwrap(),
+                None, // no partition template
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // it should have the default template in the application,
+        assert_eq!(
+            created_without_custom_template.partition_template,
+            NamespacePartitionTemplateOverride::default()
+        );
+
+        // and store NULL in the database record.
+        let record = sqlx::query("SELECT name, partition_template FROM namespace WHERE id = $1;")
+            .bind(created_without_custom_template.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let name: String = record.try_get("name").unwrap();
+        assert_eq!(created_without_custom_template.name, name);
+        let partition_template: Option<NamespacePartitionTemplateOverride> =
+            record.try_get("partition_template").unwrap();
+        assert!(partition_template.is_none());
+
+        // When explicitly setting a template that happens to be equal to the application default,
+        // assume it's important that it's being specially requested and store it rather than NULL.
+        let namespace_custom_template_name = "kumquats";
+        let custom_partition_template_equal_to_default =
+            NamespacePartitionTemplateOverride::try_from(proto::PartitionTemplate {
+                parts: vec![proto::TemplatePart {
+                    part: Some(proto::template_part::Part::TimeFormat(
+                        "%Y-%m-%d".to_owned(),
+                    )),
+                }],
+            })
+            .unwrap();
+        let namespace_custom_template = repos
+            .namespaces()
+            .create(
+                &namespace_custom_template_name.try_into().unwrap(),
+                Some(custom_partition_template_equal_to_default.clone()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            namespace_custom_template.partition_template,
+            custom_partition_template_equal_to_default
+        );
+        let record = sqlx::query("SELECT name, partition_template FROM namespace WHERE id = $1;")
+            .bind(namespace_custom_template.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let name: String = record.try_get("name").unwrap();
+        assert_eq!(namespace_custom_template.name, name);
+        let partition_template: Option<NamespacePartitionTemplateOverride> =
+            record.try_get("partition_template").unwrap();
+        assert_eq!(
+            partition_template.unwrap(),
+            custom_partition_template_equal_to_default
+        );
+    }
+
+    #[tokio::test]
+    async fn table_partition_template_null_is_the_default_in_the_database() {
+        let sqlite = setup_db().await;
+        let pool = sqlite.pool.clone();
+        let sqlite: Arc<dyn Catalog> = Arc::new(sqlite);
+        let mut repos = sqlite.repositories().await;
+
+        let namespace_default_template_name = "oranges";
+        let namespace_default_template = repos
+            .namespaces()
+            .create(
+                &namespace_default_template_name.try_into().unwrap(),
+                None, // no partition template
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let namespace_custom_template_name = "limes";
+        let namespace_custom_template = repos
+            .namespaces()
+            .create(
+                &namespace_custom_template_name.try_into().unwrap(),
+                Some(
+                    NamespacePartitionTemplateOverride::try_from(proto::PartitionTemplate {
+                        parts: vec![proto::TemplatePart {
+                            part: Some(proto::template_part::Part::TimeFormat("year-%Y".into())),
+                        }],
+                    })
+                    .unwrap(),
+                ),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // In a namespace that also has a NULL template, create a table record in the database that
+        // has `NULL` for its `partition_template` value, which is what records existing before the
+        // migration adding that column will have.
+        let table_name = "null_template";
+        let insert_null_partition_template_table = sqlx::query(
+            r#"
+INSERT INTO table_name ( name, namespace_id, partition_template )
+VALUES ( $1, $2, NULL )
+RETURNING *;
+            "#,
+        )
+        .bind(table_name) // $1
+        .bind(namespace_default_template.id); // $2
+
+        insert_null_partition_template_table
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        let lookup_table = repos
+            .tables()
+            .get_by_namespace_and_name(namespace_default_template.id, table_name)
+            .await
+            .unwrap()
+            .unwrap();
+        // When fetching this table from the database, the `FromRow` impl should set its
+        // `partition_template` to the system default (because the namespace didn't have a template
+        // either).
+        assert_eq!(
+            lookup_table.partition_template,
+            TablePartitionTemplateOverride::default()
+        );
+
+        // In a namespace that has a custom template, create a table record in the database that
+        // has `NULL` for its `partition_template` value.
+        //
+        // THIS ACTUALLY SHOULD BE IMPOSSIBLE because:
+        //
+        // * Namespaces have to exist before tables
+        // * `partition_tables` are immutable on both namespaces and tables
+        // * When the migration adding the `partition_table` column is deployed, namespaces can
+        //   begin to be created with `partition_templates`
+        // * *Then* tables can be created with `partition_templates` or not
+        // * When tables don't get a custom table partition template but their namespace has one,
+        //   their database record will get the namespace partition template.
+        //
+        // In other words, table `partition_template` values in the database is allowed to possibly
+        // be `NULL` IFF their namespace's `partition_template` is `NULL`.
+        //
+        // That said, this test creates this hopefully-impossible scenario to ensure that the
+        // defined, expected behavior if a table record somehow exists in the database with a `NULL`
+        // `partition_template` value is that it will have the application default partition
+        // template *even if the namespace `partition_template` is not null*.
+        let table_name = "null_template";
+        let insert_null_partition_template_table = sqlx::query(
+            r#"
+INSERT INTO table_name ( name, namespace_id, partition_template )
+VALUES ( $1, $2, NULL )
+RETURNING *;
+            "#,
+        )
+        .bind(table_name) // $1
+        .bind(namespace_custom_template.id); // $2
+
+        insert_null_partition_template_table
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        let lookup_table = repos
+            .tables()
+            .get_by_namespace_and_name(namespace_custom_template.id, table_name)
+            .await
+            .unwrap()
+            .unwrap();
+        // When fetching this table from the database, the `FromRow` impl should set its
+        // `partition_template` to the system default *even though the namespace has a
+        // template*, because this should be impossible as detailed above.
+        assert_eq!(
+            lookup_table.partition_template,
+            TablePartitionTemplateOverride::default()
+        );
+
+        // # Table template false, namespace template true
+        //
+        // When creating a table through the catalog functions *without* a custom table template in
+        // a namespace *with* a custom partition template,
+        let table_no_template_with_namespace_template = repos
+            .tables()
+            .create(
+                "pomelo",
+                TablePartitionTemplateOverride::try_new(
+                    None, // no custom partition template
+                    &namespace_custom_template.partition_template,
+                )
+                .unwrap(),
+                namespace_custom_template.id,
+            )
+            .await
+            .unwrap();
+
+        // it should have the namespace's template
+        assert_eq!(
+            table_no_template_with_namespace_template.partition_template,
+            TablePartitionTemplateOverride::try_new(
+                None,
+                &namespace_custom_template.partition_template
+            )
+            .unwrap()
+        );
+
+        // and store that value in the database record.
+        let record = sqlx::query("SELECT name, partition_template FROM table_name WHERE id = $1;")
+            .bind(table_no_template_with_namespace_template.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let name: String = record.try_get("name").unwrap();
+        assert_eq!(table_no_template_with_namespace_template.name, name);
+        let partition_template: Option<TablePartitionTemplateOverride> =
+            record.try_get("partition_template").unwrap();
+        assert_eq!(
+            partition_template.unwrap(),
+            TablePartitionTemplateOverride::try_new(
+                None,
+                &namespace_custom_template.partition_template
+            )
+            .unwrap()
+        );
+
+        // # Table template true, namespace template false
+        //
+        // When creating a table through the catalog functions *with* a custom table template in
+        // a namespace *without* a custom partition template,
+        let custom_table_template = proto::PartitionTemplate {
+            parts: vec![proto::TemplatePart {
+                part: Some(proto::template_part::Part::TagValue("chemical".into())),
+            }],
+        };
+        let table_with_template_no_namespace_template = repos
+            .tables()
+            .create(
+                "tangerine",
+                TablePartitionTemplateOverride::try_new(
+                    Some(custom_table_template), // with custom partition template
+                    &namespace_default_template.partition_template,
+                )
+                .unwrap(),
+                namespace_default_template.id,
+            )
+            .await
+            .unwrap();
+
+        // it should have the custom table template
+        let table_template_parts: Vec<_> = table_with_template_no_namespace_template
+            .partition_template
+            .parts()
+            .collect();
+        assert_eq!(table_template_parts.len(), 1);
+        assert_matches!(
+            table_template_parts[0],
+            TemplatePart::TagValue(tag) if tag == "chemical"
+        );
+
+        // and store that value in the database record.
+        let record = sqlx::query("SELECT name, partition_template FROM table_name WHERE id = $1;")
+            .bind(table_with_template_no_namespace_template.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let name: String = record.try_get("name").unwrap();
+        assert_eq!(table_with_template_no_namespace_template.name, name);
+        let partition_template = record
+            .try_get::<Option<TablePartitionTemplateOverride>, _>("partition_template")
+            .unwrap()
+            .unwrap();
+        let table_template_parts: Vec<_> = partition_template.parts().collect();
+        assert_eq!(table_template_parts.len(), 1);
+        assert_matches!(
+            table_template_parts[0],
+            TemplatePart::TagValue(tag) if tag == "chemical"
+        );
+
+        // # Table template true, namespace template true
+        //
+        // When creating a table through the catalog functions *with* a custom table template in
+        // a namespace *with* a custom partition template,
+        let custom_table_template = proto::PartitionTemplate {
+            parts: vec![proto::TemplatePart {
+                part: Some(proto::template_part::Part::TagValue("vegetable".into())),
+            }],
+        };
+        let table_with_template_with_namespace_template = repos
+            .tables()
+            .create(
+                "nectarine",
+                TablePartitionTemplateOverride::try_new(
+                    Some(custom_table_template), // with custom partition template
+                    &namespace_custom_template.partition_template,
+                )
+                .unwrap(),
+                namespace_custom_template.id,
+            )
+            .await
+            .unwrap();
+
+        // it should have the custom table template
+        let table_template_parts: Vec<_> = table_with_template_with_namespace_template
+            .partition_template
+            .parts()
+            .collect();
+        assert_eq!(table_template_parts.len(), 1);
+        assert_matches!(
+            table_template_parts[0],
+            TemplatePart::TagValue(tag) if tag == "vegetable"
+        );
+
+        // and store that value in the database record.
+        let record = sqlx::query("SELECT name, partition_template FROM table_name WHERE id = $1;")
+            .bind(table_with_template_with_namespace_template.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let name: String = record.try_get("name").unwrap();
+        assert_eq!(table_with_template_with_namespace_template.name, name);
+        let partition_template = record
+            .try_get::<Option<TablePartitionTemplateOverride>, _>("partition_template")
+            .unwrap()
+            .unwrap();
+        let table_template_parts: Vec<_> = partition_template.parts().collect();
+        assert_eq!(table_template_parts.len(), 1);
+        assert_matches!(
+            table_template_parts[0],
+            TemplatePart::TagValue(tag) if tag == "vegetable"
+        );
+
+        // # Table template false, namespace template false
+        //
+        // When creating a table through the catalog functions *without* a custom table template in
+        // a namespace *without* a custom partition template,
+        let table_no_template_no_namespace_template = repos
+            .tables()
+            .create(
+                "grapefruit",
+                TablePartitionTemplateOverride::try_new(
+                    None, // no custom partition template
+                    &namespace_default_template.partition_template,
+                )
+                .unwrap(),
+                namespace_default_template.id,
+            )
+            .await
+            .unwrap();
+
+        // it should have the default template in the application,
+        assert_eq!(
+            table_no_template_no_namespace_template.partition_template,
+            TablePartitionTemplateOverride::default()
+        );
+
+        // and store NULL in the database record.
+        let record = sqlx::query("SELECT name, partition_template FROM table_name WHERE id = $1;")
+            .bind(table_no_template_no_namespace_template.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let name: String = record.try_get("name").unwrap();
+        assert_eq!(table_no_template_no_namespace_template.name, name);
+        let partition_template: Option<TablePartitionTemplateOverride> =
+            record.try_get("partition_template").unwrap();
+        assert!(partition_template.is_none());
     }
 }

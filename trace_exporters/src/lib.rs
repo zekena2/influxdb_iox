@@ -4,10 +4,15 @@
     clippy::explicit_iter_loop,
     clippy::use_self,
     clippy::clone_on_ref_ptr,
+    // See https://github.com/influxdata/influxdb_iox/pull/1671
     clippy::future_not_send,
     clippy::todo,
-    clippy::dbg_macro
+    clippy::dbg_macro,
+    unused_crate_dependencies
 )]
+
+// Workaround for "unused crate" lint false positives.
+use workspace_hack as _;
 
 use crate::export::AsyncExporter;
 use crate::jaeger::JaegerAgentExporter;
@@ -40,7 +45,11 @@ mod thrift {
     pub mod jaeger;
 }
 
+/// Default header name used to export traces
 pub const DEFAULT_JAEGER_TRACE_CONTEXT_HEADER_NAME: &str = "uber-trace-id";
+
+/// Default header name for Influx Cloud
+pub const DEFAULT_INFLUX_TRACE_CONTEXT_HEADER_NAME: &str = "influx-trace-id";
 
 /// CLI config for distributed tracing options
 #[derive(Debug, Clone, clap::Parser)]

@@ -5,21 +5,26 @@
     missing_copy_implementations,
     missing_docs,
     clippy::explicit_iter_loop,
+    // See https://github.com/influxdata/influxdb_iox/pull/1671
     clippy::future_not_send,
     clippy::use_self,
     clippy::clone_on_ref_ptr,
     clippy::todo,
-    clippy::dbg_macro
+    clippy::dbg_macro,
+    unused_crate_dependencies
 )]
+
+// Workaround for "unused crate" lint false positives.
+use workspace_hack as _;
 
 mod commit_wrapper;
 mod display;
 mod simulator;
 
-pub use display::{display_format, display_size, format_files, format_files_split};
+pub use display::{display_format, display_size, format_files, format_files_split, format_ranges};
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     future::Future,
     num::NonZeroUsize,
     sync::{atomic::AtomicUsize, Arc, Mutex},
@@ -33,11 +38,11 @@ use crate::{
 use async_trait::async_trait;
 use backoff::BackoffConfig;
 use compactor::{
-    compact,
-    config::{CompactionType, Config, PartitionsSourceConfig},
-    hardcoded_components, Components, PanicDataFusionPlanner, PartitionInfo,
+    compact, config::Config, hardcoded_components, Components, PanicDataFusionPlanner,
+    PartitionInfo,
 };
-use data_types::{ColumnType, CompactionLevel, ParquetFile, TableId};
+use compactor_scheduler::SchedulerConfig;
+use data_types::{ColumnType, CompactionLevel, ParquetFile, SortedColumnSet, TableId};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion_util::config::register_iox_object_store;
 use futures::TryStreamExt;
@@ -51,10 +56,10 @@ use iox_time::{MockProvider, Time, TimeProvider};
 use object_store::{path::Path, DynObjectStore};
 use parquet_file::storage::{ParquetStorage, StorageId};
 use schema::sort::SortKey;
+use trace::{RingBufferTraceCollector, TraceCollector};
 use tracker::AsyncSemaphoreMetrics;
 
 // Default values for the test setup builder
-const PARTITION_THRESHOLD: Duration = Duration::from_secs(10 * 60); // 10min
 const MAX_DESIRE_FILE_SIZE: u64 = 100 * 1024;
 const PERCENTAGE_MAX_FILE_SIZE: u16 = 5;
 const SPLIT_PERCENTAGE: u16 = 80;
@@ -78,6 +83,11 @@ pub struct TestSetupBuilder<const WITH_FILES: bool> {
     invariant_check: Arc<dyn InvariantCheck>,
     /// A shared count of total bytes written during test
     bytes_written: Arc<AtomicUsize>,
+    /// A shared count of the breakdown of where bytes were written
+    bytes_written_per_plan: Arc<Mutex<HashMap<String, usize>>>,
+    /// Suppresses showing detailed output of where bytes are written
+    suppress_writes_breakdown: bool,
+    /// Suppresses showing each 'run' (compact|split) output
     suppress_run_output: bool,
 }
 
@@ -88,17 +98,21 @@ impl TestSetupBuilder<false> {
         let ns = catalog.create_namespace_1hr_retention("ns").await;
         let table = ns.create_table("table").await;
         table.create_column("field_int", ColumnType::I64).await;
-        table.create_column("tag1", ColumnType::Tag).await;
-        table.create_column("tag2", ColumnType::Tag).await;
-        table.create_column("tag3", ColumnType::Tag).await;
-        table.create_column("time", ColumnType::Time).await;
+        let tag1 = table.create_column("tag1", ColumnType::Tag).await;
+        let tag2 = table.create_column("tag2", ColumnType::Tag).await;
+        let tag3 = table.create_column("tag3", ColumnType::Tag).await;
+        let col_time = table.create_column("time", ColumnType::Time).await;
 
         let partition = table.create_partition("2022-07-13").await;
 
         // The sort key comes from the catalog and should be the union of all tags the
         // ingester has seen
         let sort_key = SortKey::from_columns(["tag1", "tag2", "tag3", "time"]);
-        let partition = partition.update_sort_key(sort_key.clone()).await;
+        let sort_key_col_ids =
+            SortedColumnSet::from([tag1.id(), tag2.id(), tag3.id(), col_time.id()]);
+        let partition = partition
+            .update_sort_key(sort_key.clone(), &sort_key_col_ids)
+            .await;
 
         // Ensure the input scenario conforms to the expected invariants.
         let invariant_check = Arc::new(CatalogInvariants {
@@ -107,6 +121,7 @@ impl TestSetupBuilder<false> {
         });
 
         let suppress_run_output = false;
+        let suppress_writes_breakdown = true;
 
         // Intercept all catalog commit calls to record them in
         // `run_log` as well as ensuring the invariants still hold
@@ -114,10 +129,15 @@ impl TestSetupBuilder<false> {
         let commit_wrapper = CommitRecorderBuilder::new(Arc::clone(&run_log))
             .with_invariant_check(Arc::clone(&invariant_check) as _);
 
+        let ring_buffer = Arc::new(RingBufferTraceCollector::new(5));
+        let trace_collector: Option<Arc<dyn TraceCollector>> =
+            Some(Arc::new(Arc::clone(&ring_buffer)));
+
         let config = Config {
-            compaction_type: Default::default(),
             metric_registry: catalog.metric_registry(),
+            trace_collector,
             catalog: catalog.catalog(),
+            scheduler_config: SchedulerConfig::new_local_with_wrapper(Arc::new(commit_wrapper)),
             parquet_store_real: catalog.parquet_store.clone(),
             parquet_store_scratchpad: ParquetStorage::new(
                 Arc::new(object_store::memory::InMemory::new()),
@@ -133,23 +153,21 @@ impl TestSetupBuilder<false> {
             percentage_max_file_size: PERCENTAGE_MAX_FILE_SIZE,
             split_percentage: SPLIT_PERCENTAGE,
             partition_timeout: Duration::from_secs(3_600),
-            partitions_source: PartitionsSourceConfig::CatalogRecentWrites {
-                threshold: PARTITION_THRESHOLD,
-            },
             shadow_mode: false,
-            ignore_partition_skip_marker: false,
-            shard_config: None,
+            enable_scratchpad: true,
             min_num_l1_files_to_compact: MIN_NUM_L1_FILES_TO_COMPACT,
             process_once: true,
             simulate_without_object_store: false,
             parquet_files_sink_override: None,
-            commit_wrapper: Some(Arc::new(commit_wrapper)),
             all_errors_are_fatal: true,
             max_num_columns_per_table: 200,
             max_num_files_per_plan: 200,
+            max_partition_fetch_queries_per_second: None,
         };
 
         let bytes_written = Arc::new(AtomicUsize::new(0));
+        let bytes_written_per_plan: Arc<Mutex<HashMap<String, usize>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
         Self {
             config,
@@ -161,6 +179,8 @@ impl TestSetupBuilder<false> {
             run_log,
             invariant_check,
             bytes_written,
+            bytes_written_per_plan,
+            suppress_writes_breakdown,
             suppress_run_output,
         }
     }
@@ -286,6 +306,8 @@ impl TestSetupBuilder<false> {
         invariant_check.check().await;
 
         let bytes_written = Arc::new(AtomicUsize::new(0));
+        let bytes_written_per_plan: Arc<Mutex<HashMap<String, usize>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
         TestSetupBuilder::<true> {
             config: self.config,
@@ -297,6 +319,8 @@ impl TestSetupBuilder<false> {
             run_log: Arc::new(Mutex::new(vec![])),
             invariant_check,
             bytes_written,
+            bytes_written_per_plan,
+            suppress_writes_breakdown: true,
             suppress_run_output: false,
         }
     }
@@ -319,6 +343,8 @@ impl TestSetupBuilder<false> {
         invariant_check.check().await;
 
         let bytes_written = Arc::new(AtomicUsize::new(0));
+        let bytes_written_per_plan: Arc<Mutex<HashMap<String, usize>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
         TestSetupBuilder::<true> {
             config: self.config.clone(),
@@ -330,6 +356,8 @@ impl TestSetupBuilder<false> {
             run_log: Arc::new(Mutex::new(vec![])),
             invariant_check,
             bytes_written,
+            bytes_written_per_plan,
+            suppress_writes_breakdown: true,
             suppress_run_output: false,
         }
     }
@@ -353,6 +381,8 @@ impl TestSetupBuilder<false> {
         invariant_check.check().await;
 
         let bytes_written = Arc::new(AtomicUsize::new(0));
+        let bytes_written_per_plan: Arc<Mutex<HashMap<String, usize>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
         TestSetupBuilder::<true> {
             config: self.config.clone(),
@@ -364,6 +394,8 @@ impl TestSetupBuilder<false> {
             run_log: Arc::new(Mutex::new(vec![])),
             invariant_check,
             bytes_written,
+            bytes_written_per_plan,
+            suppress_writes_breakdown: true,
             suppress_run_output: false,
         }
     }
@@ -524,14 +556,24 @@ impl<const WITH_FILES: bool> TestSetupBuilder<WITH_FILES> {
         self
     }
 
+    /// Set option to show detailed output of where bytes are written
+    pub fn with_writes_breakdown(mut self) -> Self {
+        self.suppress_writes_breakdown = false;
+        self
+    }
+
     /// set simulate_without_object_store
     pub fn simulate_without_object_store(mut self) -> Self {
         let run_log = Arc::clone(&self.run_log);
         let bytes_written = Arc::clone(&self.bytes_written);
+        let bytes_written_per_plan = Arc::clone(&self.bytes_written_per_plan);
 
         self.config.simulate_without_object_store = true;
-        self.config.parquet_files_sink_override =
-            Some(Arc::new(ParquetFileSimulator::new(run_log, bytes_written)));
+        self.config.parquet_files_sink_override = Some(Arc::new(ParquetFileSimulator::new(
+            run_log,
+            bytes_written,
+            bytes_written_per_plan,
+        )));
         self
     }
 
@@ -559,19 +601,11 @@ impl<const WITH_FILES: bool> TestSetupBuilder<WITH_FILES> {
         self
     }
 
-    /// Set to do cold compaction
-    pub fn for_cold_compaction(mut self) -> Self {
-        self.config.compaction_type = CompactionType::Cold;
-        self.config.partitions_source = PartitionsSourceConfig::CatalogColdForWrites {
-            threshold: Duration::from_secs(60 * 60),
-        };
-        self
-    }
-
     /// Create a [`TestSetup`]
     pub async fn build(self) -> TestSetup {
         let candidate_partition = Arc::new(PartitionInfo {
             partition_id: self.partition.partition.id,
+            partition_hash_id: self.partition.partition.hash_id().cloned(),
             namespace_id: self.ns.namespace.id,
             namespace_name: self.ns.namespace.name.clone(),
             table: Arc::new(self.table.table.clone()),
@@ -589,7 +623,9 @@ impl<const WITH_FILES: bool> TestSetupBuilder<WITH_FILES> {
             config: Arc::new(self.config),
             run_log: self.run_log,
             bytes_written: self.bytes_written,
+            bytes_written_per_plan: self.bytes_written_per_plan,
             invariant_check: self.invariant_check,
+            suppress_writes_breakdown: self.suppress_writes_breakdown,
             suppress_run_output: self.suppress_run_output,
         }
     }
@@ -610,12 +646,16 @@ pub struct TestSetup {
     pub partition: Arc<TestPartition>,
     /// The compactor configuration
     pub config: Arc<Config>,
+    /// allows optionally suppressing detailed output of where bytes are written
+    pub suppress_writes_breakdown: bool,
     /// allows optionally suppressing output of running the test
     pub suppress_run_output: bool,
     /// a shared log of what happened during a simulated run
     run_log: Arc<Mutex<Vec<String>>>,
     /// A total of all bytes written during test.
     pub bytes_written: Arc<AtomicUsize>,
+    /// A total of bytes written during test per operation.
+    pub bytes_written_per_plan: Arc<Mutex<HashMap<String, usize>>>,
     /// Checker that catalog invariant are not violated
     invariant_check: Arc<dyn InvariantCheck>,
 }
@@ -635,7 +675,17 @@ impl TestSetup {
 
     /// Get the parquet files including the soft-deleted stored in the catalog
     pub async fn list_by_table(&self) -> Vec<ParquetFile> {
-        self.catalog.list_by_table(self.table.table.id).await
+        self.catalog
+            .catalog
+            .repositories()
+            .await
+            .parquet_files()
+            .list_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|f| f.table_id == self.table.table.id)
+            .collect()
     }
 
     /// Reads the specified parquet file out of object store
@@ -673,6 +723,7 @@ impl TestSetup {
         let df_semaphore = Arc::new(
             Arc::new(AsyncSemaphoreMetrics::new(&config.metric_registry, [])).new_semaphore(10),
         );
+        let trace_collector = config.trace_collector.clone();
 
         // register scratchpad store
         let runtime_env = self
@@ -688,6 +739,7 @@ impl TestSetup {
         );
 
         compact(
+            trace_collector,
             NonZeroUsize::new(10).unwrap(),
             config.partition_timeout,
             df_semaphore,
@@ -1583,6 +1635,69 @@ pub fn create_overlapped_files_3_mix_size(size: i64) -> Vec<ParquetFile> {
 
     // Put the files in random order
     vec![l0_3, l0_2, l0_1, l0_4, l0_5, l0_6, l1_1, l1_2]
+}
+
+/// This setup will return files with ranges as follows:
+///  Input:
+///                                              |--L0.1--|    |-L0.2-|
+///            |--L1.1--| |--L1.2--| |--L1.3--| |--L1.4--|    |--L1.5--|              |--L1.6--| |--L1.7--|  |--L1.8--|
+/// l1 size :     med        large      small       med           med                    small      large       med
+pub fn create_overlapped_files_mix_sizes_1(small: i64, med: i64, large: i64) -> Vec<ParquetFile> {
+    let l1_1 = ParquetFileBuilder::new(11)
+        .with_compaction_level(CompactionLevel::FileNonOverlapped)
+        .with_time_range(0, 100)
+        .with_file_size_bytes(med)
+        .build();
+    let l1_2 = ParquetFileBuilder::new(12)
+        .with_compaction_level(CompactionLevel::FileNonOverlapped)
+        .with_time_range(200, 300)
+        .with_file_size_bytes(large)
+        .build();
+    let l1_3 = ParquetFileBuilder::new(13)
+        .with_compaction_level(CompactionLevel::FileNonOverlapped)
+        .with_time_range(400, 500)
+        .with_file_size_bytes(small)
+        .build();
+    let l1_4 = ParquetFileBuilder::new(14)
+        .with_compaction_level(CompactionLevel::FileNonOverlapped)
+        .with_time_range(600, 700)
+        .with_file_size_bytes(med)
+        .build();
+    let l1_5 = ParquetFileBuilder::new(15)
+        .with_compaction_level(CompactionLevel::FileNonOverlapped)
+        .with_time_range(800, 900)
+        .with_file_size_bytes(med)
+        .build();
+    let l1_6 = ParquetFileBuilder::new(16)
+        .with_compaction_level(CompactionLevel::FileNonOverlapped)
+        .with_time_range(1000, 1100)
+        .with_file_size_bytes(small)
+        .build();
+    let l1_7 = ParquetFileBuilder::new(17)
+        .with_compaction_level(CompactionLevel::FileNonOverlapped)
+        .with_time_range(1200, 1300)
+        .with_file_size_bytes(large)
+        .build();
+    let l1_8 = ParquetFileBuilder::new(18)
+        .with_compaction_level(CompactionLevel::FileNonOverlapped)
+        .with_time_range(1400, 1500)
+        .with_file_size_bytes(med)
+        .build();
+
+    // L0_1 overlaps with L1_4
+    let l0_1 = ParquetFileBuilder::new(1)
+        .with_compaction_level(CompactionLevel::Initial)
+        .with_time_range(650, 750)
+        .with_file_size_bytes(small)
+        .build();
+    // L0_2 overlaps with L1_5
+    let l0_2 = ParquetFileBuilder::new(2)
+        .with_compaction_level(CompactionLevel::Initial)
+        .with_time_range(820, 850)
+        .with_file_size_bytes(small)
+        .build();
+
+    vec![l1_3, l1_7, l1_2, l1_1, l1_4, l1_5, l1_6, l0_2, l0_1, l1_8]
 }
 
 #[cfg(test)]

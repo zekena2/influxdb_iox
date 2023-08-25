@@ -1,7 +1,27 @@
 //! Implementation of the namespace gRPC service
+
+#![deny(rustdoc::broken_intra_doc_links, rust_2018_idioms)]
+#![warn(
+    clippy::clone_on_ref_ptr,
+    clippy::dbg_macro,
+    clippy::explicit_iter_loop,
+    // See https://github.com/influxdata/influxdb_iox/pull/1671
+    clippy::future_not_send,
+    clippy::todo,
+    clippy::use_self,
+    missing_debug_implementations,
+    unused_crate_dependencies
+)]
+
+// Workaround for "unused crate" lint false positives.
+use workspace_hack as _;
+
 use std::sync::Arc;
 
-use data_types::{Namespace as CatalogNamespace, NamespaceName};
+use data_types::{
+    partition_template::NamespacePartitionTemplateOverride, Namespace as CatalogNamespace,
+    NamespaceName, NamespaceServiceProtectionLimitsOverride,
+};
 use generated_types::influxdata::iox::namespace::v1::{
     update_namespace_service_protection_limit_request::LimitUpdate, *,
 };
@@ -53,6 +73,8 @@ impl namespace_service_server::NamespaceService for NamespaceService {
         let CreateNamespaceRequest {
             name: namespace_name,
             retention_period_ns,
+            partition_template,
+            service_protection_limits,
         } = request.into_inner();
 
         // Ensure the namespace name is consistently processed within IOx - this
@@ -66,11 +88,24 @@ impl namespace_service_server::NamespaceService for NamespaceService {
 
         let namespace = repos
             .namespaces()
-            .create(&namespace_name, retention_period_ns)
+            .create(
+                &namespace_name,
+                partition_template
+                    .map(NamespacePartitionTemplateOverride::try_from)
+                    .transpose()
+                    .map_err(|v| Status::invalid_argument(v.to_string()))?,
+                retention_period_ns,
+                service_protection_limits.map(NamespaceServiceProtectionLimitsOverride::from),
+            )
             .await
             .map_err(|e| {
                 warn!(error=%e, %namespace_name, "failed to create namespace");
-                Status::internal(e.to_string())
+                match e {
+                    iox_catalog::interface::Error::NameExists { name } => Status::already_exists(
+                        format!("A namespace with the name `{name}` already exists"),
+                    ),
+                    other => Status::internal(other.to_string()),
+                }
             })?;
 
         info!(
@@ -276,7 +311,10 @@ mod tests {
     use std::time::Duration;
 
     use assert_matches::assert_matches;
-    use generated_types::influxdata::iox::namespace::v1::namespace_service_server::NamespaceService as _;
+    use generated_types::influxdata::iox::{
+        namespace::v1::namespace_service_server::NamespaceService as _,
+        partition_template::v1::PartitionTemplate,
+    };
     use iox_catalog::mem::MemCatalog;
     use tonic::Code;
 
@@ -346,6 +384,8 @@ mod tests {
         let req = CreateNamespaceRequest {
             name: NS_NAME.to_string(),
             retention_period_ns: Some(RETENTION),
+            partition_template: None,
+            service_protection_limits: None,
         };
         let created_ns = handler
             .create_namespace(Request::new(req))
@@ -461,6 +501,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn creating_same_namespace_twice_fails() {
+        let catalog: Arc<dyn Catalog> =
+            Arc::new(MemCatalog::new(Arc::new(metric::Registry::default())));
+        let handler = NamespaceService::new(Arc::clone(&catalog));
+
+        let req = CreateNamespaceRequest {
+            name: NS_NAME.to_string(),
+            retention_period_ns: Some(RETENTION),
+            partition_template: None,
+            service_protection_limits: None,
+        };
+
+        let created_ns = handler
+            .create_namespace(Request::new(req.clone()))
+            .await
+            .unwrap()
+            .into_inner()
+            .namespace
+            .unwrap();
+
+        // First creation attempt succeeds
+        assert_eq!(created_ns.name, NS_NAME);
+        assert_eq!(created_ns.retention_period_ns, Some(RETENTION));
+
+        // Trying to create a namespace with the same name fails with an "already exists" error
+        let error = handler
+            .create_namespace(Request::new(req))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), Code::AlreadyExists);
+        assert_eq!(
+            error.message(),
+            "A namespace with the name `bananas` already exists"
+        );
+
+        let all_namespaces = catalog
+            .repositories()
+            .await
+            .namespaces()
+            .list(SoftDeletedRows::ExcludeDeleted)
+            .await
+            .unwrap();
+        assert_eq!(all_namespaces.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn invalid_custom_namespace_template_returns_error() {
+        let catalog: Arc<dyn Catalog> =
+            Arc::new(MemCatalog::new(Arc::new(metric::Registry::default())));
+        let handler = NamespaceService::new(Arc::clone(&catalog));
+
+        let req = CreateNamespaceRequest {
+            name: NS_NAME.to_string(),
+            retention_period_ns: None,
+            partition_template: Some(PartitionTemplate { parts: vec![] }),
+            service_protection_limits: None,
+        };
+
+        let error = handler
+            .create_namespace(Request::new(req))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert_eq!(
+            error.message(),
+            "Custom partition template must have at least one part"
+        );
+
+        let all_namespaces = catalog
+            .repositories()
+            .await
+            .namespaces()
+            .list(SoftDeletedRows::ExcludeDeleted)
+            .await
+            .unwrap();
+        assert_eq!(all_namespaces.len(), 0);
+    }
+
+    #[tokio::test]
     async fn test_reject_invalid_service_protection_limits() {
         let catalog: Arc<dyn Catalog> =
             Arc::new(MemCatalog::new(Arc::new(metric::Registry::default())));
@@ -469,6 +590,8 @@ mod tests {
         let req = CreateNamespaceRequest {
             name: NS_NAME.to_string(),
             retention_period_ns: Some(RETENTION),
+            partition_template: None,
+            service_protection_limits: None,
         };
         let created_ns = handler
             .create_namespace(Request::new(req))
@@ -509,6 +632,37 @@ mod tests {
         assert_eq!(status.code(), Code::InvalidArgument);
     }
 
+    #[tokio::test]
+    async fn test_create_with_service_protection_limits() {
+        let catalog: Arc<dyn Catalog> =
+            Arc::new(MemCatalog::new(Arc::new(metric::Registry::default())));
+
+        let max_tables = 123;
+        let max_columns_per_table = 321;
+
+        let handler = NamespaceService::new(catalog);
+        let req = CreateNamespaceRequest {
+            name: NS_NAME.to_string(),
+            retention_period_ns: Some(RETENTION),
+            partition_template: None,
+            service_protection_limits: Some(ServiceProtectionLimits {
+                max_tables: Some(max_tables),
+                max_columns_per_table: Some(max_columns_per_table),
+            }),
+        };
+        let created_ns = handler
+            .create_namespace(Request::new(req))
+            .await
+            .expect("failed to create namespace")
+            .into_inner()
+            .namespace
+            .expect("no namespace in response");
+        assert_eq!(created_ns.name, NS_NAME);
+        assert_eq!(created_ns.retention_period_ns, Some(RETENTION));
+        assert_eq!(created_ns.max_tables, max_tables);
+        assert_eq!(created_ns.max_columns_per_table, max_columns_per_table);
+    }
+
     macro_rules! test_create_namespace_name {
         (
             $test_name:ident,
@@ -528,6 +682,8 @@ mod tests {
                     let req = CreateNamespaceRequest {
                         name: String::from($name),
                         retention_period_ns: Some(RETENTION),
+                        partition_template: None,
+                        service_protection_limits: None,
                     };
 
                     let got = handler.create_namespace(Request::new(req)).await;

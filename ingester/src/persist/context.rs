@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use data_types::{NamespaceId, ParquetFileParams, PartitionId, PartitionKey, TableId};
+use data_types::{NamespaceId, ParquetFileParams, PartitionKey, TableId, TransitionPartitionId};
 use observability_deps::tracing::*;
 use parking_lot::Mutex;
 use schema::sort::SortKey;
@@ -15,7 +15,7 @@ use crate::{
     buffer_tree::{
         namespace::NamespaceName,
         partition::{persisting::PersistingData, PartitionData, SortKeyState},
-        table::TableName,
+        table::TableMetadata,
     },
     deferred_load::DeferredLoad,
     persist::completion_observer::CompletedPersist,
@@ -65,8 +65,8 @@ impl PersistRequest {
         )
     }
 
-    /// Return the partition ID of the persisting data.
-    pub(super) fn partition_id(&self) -> PartitionId {
+    /// Return the partition identifier of the persisting data.
+    pub(super) fn partition_id(&self) -> &TransitionPartitionId {
         self.data.partition_id()
     }
 }
@@ -85,19 +85,19 @@ pub(super) struct Context {
     /// IDs loaded from the partition at construction time.
     namespace_id: NamespaceId,
     table_id: TableId,
-    partition_id: PartitionId,
+    partition_id: TransitionPartitionId,
 
     // The partition key for this partition
     partition_key: PartitionKey,
 
-    /// Deferred strings needed for persistence.
+    /// Deferred data needed for persistence.
     ///
     /// These [`DeferredLoad`] are given a pre-fetch hint when this [`Context`]
     /// is constructed to load them in the background (if not already resolved)
     /// in order to avoid incurring the query latency when the values are
     /// needed.
     namespace_name: Arc<DeferredLoad<NamespaceName>>,
-    table_name: Arc<DeferredLoad<TableName>>,
+    table: Arc<DeferredLoad<TableMetadata>>,
 
     /// The [`SortKey`] for the [`PartitionData`] at the time of [`Context`]
     /// construction.
@@ -133,7 +133,7 @@ impl Context {
     /// Locks the [`PartitionData`] in `req` to read various properties which
     /// are then cached in the [`Context`].
     pub(super) fn new(req: PersistRequest) -> Self {
-        let partition_id = req.data.partition_id();
+        let partition_id = req.data.partition_id().clone();
 
         // Obtain the partition lock and load the immutable values that will be
         // used during this persistence.
@@ -149,7 +149,7 @@ impl Context {
             let p = Arc::clone(&partition);
             let guard = p.lock();
 
-            assert_eq!(partition_id, guard.partition_id());
+            assert_eq!(&partition_id, guard.partition_id());
 
             Self {
                 partition,
@@ -159,7 +159,7 @@ impl Context {
                 partition_id,
                 partition_key: guard.partition_key().clone(),
                 namespace_name: Arc::clone(guard.namespace_name()),
-                table_name: Arc::clone(guard.table_name()),
+                table: Arc::clone(guard.table()),
 
                 // Technically the sort key isn't immutable, but MUST NOT be
                 // changed by an external actor (by something other than code in
@@ -177,7 +177,7 @@ impl Context {
         // Pre-fetch the deferred values in a background thread (if not already
         // resolved)
         s.namespace_name.prefetch_now();
-        s.table_name.prefetch_now();
+        s.table.prefetch_now();
         if let SortKeyState::Deferred(ref d) = s.sort_key {
             d.prefetch_now();
         }
@@ -248,7 +248,7 @@ impl Context {
             namespace_id = %self.namespace_id,
             namespace_name = %self.namespace_name,
             table_id = %self.table_id,
-            table_name = %self.table_name,
+            table = %self.table,
             partition_id = %self.partition_id,
             partition_key = %self.partition_key,
             total_persist_duration = ?now.duration_since(self.enqueued_at),
@@ -287,8 +287,8 @@ impl Context {
         self.table_id
     }
 
-    pub(super) fn partition_id(&self) -> PartitionId {
-        self.partition_id
+    pub(super) fn partition_id(&self) -> &TransitionPartitionId {
+        &self.partition_id
     }
 
     pub(super) fn partition_key(&self) -> &PartitionKey {
@@ -299,7 +299,7 @@ impl Context {
         self.namespace_name.as_ref()
     }
 
-    pub(super) fn table_name(&self) -> &DeferredLoad<TableName> {
-        self.table_name.as_ref()
+    pub(super) fn table(&self) -> &DeferredLoad<TableMetadata> {
+        self.table.as_ref()
     }
 }

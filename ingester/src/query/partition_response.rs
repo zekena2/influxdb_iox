@@ -2,44 +2,26 @@
 //!
 //! [`QueryResponse`]: super::response::QueryResponse
 
-use data_types::PartitionId;
-use datafusion::physical_plan::SendableRecordBatchStream;
+use arrow::record_batch::RecordBatch;
+use data_types::TransitionPartitionId;
 
 /// Response data for a single partition.
+#[derive(Debug)]
 pub(crate) struct PartitionResponse {
     /// Stream of snapshots.
-    batches: Option<SendableRecordBatchStream>,
+    batches: Vec<RecordBatch>,
 
     /// Partition ID.
-    id: PartitionId,
+    id: TransitionPartitionId,
 
     /// Count of persisted Parquet files for this partition by this ingester instance.
     completed_persistence_count: u64,
 }
 
-impl std::fmt::Debug for PartitionResponse {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PartitionResponse")
-            .field(
-                "batches",
-                &match self.batches {
-                    Some(_) => "<SNAPSHOT STREAM>",
-                    None => "<NO DATA>,",
-                },
-            )
-            .field("partition_id", &self.id)
-            .field(
-                "completed_persistence_count",
-                &self.completed_persistence_count,
-            )
-            .finish()
-    }
-}
-
 impl PartitionResponse {
     pub(crate) fn new(
-        data: Option<SendableRecordBatchStream>,
-        id: PartitionId,
+        data: Vec<RecordBatch>,
+        id: TransitionPartitionId,
         completed_persistence_count: u64,
     ) -> Self {
         Self {
@@ -49,15 +31,15 @@ impl PartitionResponse {
         }
     }
 
-    pub(crate) fn id(&self) -> PartitionId {
-        self.id
+    pub(crate) fn id(&self) -> &TransitionPartitionId {
+        &self.id
     }
 
     pub(crate) fn completed_persistence_count(&self) -> u64 {
         self.completed_persistence_count
     }
 
-    pub(crate) fn into_record_batch_stream(self) -> Option<SendableRecordBatchStream> {
+    pub(crate) fn into_record_batches(self) -> Vec<RecordBatch> {
         self.batches
     }
 }

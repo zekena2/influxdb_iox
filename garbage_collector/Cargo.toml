@@ -14,7 +14,7 @@ futures = "0.3"
 humantime = "2.1.0"
 iox_catalog = { path = "../iox_catalog" }
 backoff = { path = "../backoff" }
-object_store = { version = "0.5.6" }
+object_store = { workspace = true }
 observability_deps = { path = "../observability_deps" }
 snafu = "0.7"
 tokio = { version = "1", features = ["macros", "rt", "sync"] }
@@ -24,10 +24,13 @@ uuid = { version = "1", features = ["v4"] }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
+async-trait = "0.1"
 bytes = "1.4"
 data_types = { path = "../data_types" }
 filetime = "0.2"
 metric = { path = "../metric" }
-once_cell = { version = "1.17", features = ["parking_lot"] }
+once_cell = { version = "1.18", features = ["parking_lot"] }
 parquet_file = { path = "../parquet_file" }
 tempfile = "3"
+sqlx = { version = "0.7.1", features = [ "runtime-tokio-rustls" ] }
+

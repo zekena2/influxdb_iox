@@ -1,8 +1,6 @@
 //! Implementation of a DataFusion `TableProvider` in terms of `QueryChunk`s
 
 use async_trait::async_trait;
-use data_types::DeletePredicate;
-use hashbrown::HashMap;
 use std::{collections::HashSet, sync::Arc};
 
 use arrow::{
@@ -10,19 +8,19 @@ use arrow::{
     error::ArrowError,
 };
 use datafusion::{
-    datasource::TableProvider,
+    datasource::{provider_as_source, TableProvider},
     error::{DataFusionError, Result as DataFusionResult},
     execution::context::SessionState,
-    logical_expr::{TableProviderFilterPushDown, TableType},
+    logical_expr::{LogicalPlanBuilder, TableProviderFilterPushDown, TableType},
     optimizer::utils::{conjunction, split_conjunction},
     physical_plan::{
         expressions::col as physical_col, filter::FilterExec, projection::ProjectionExec,
         ExecutionPlan,
     },
     prelude::Expr,
+    sql::TableReference,
 };
 use observability_deps::tracing::trace;
-use predicate::Predicate;
 use schema::{sort::SortKey, Schema};
 
 use crate::{
@@ -96,7 +94,7 @@ pub trait ChunkPruner: Sync + Send + std::fmt::Debug {
         table_name: &str,
         table_schema: &Schema,
         chunks: Vec<Arc<dyn QueryChunk>>,
-        predicate: &Predicate,
+        filters: &[Expr],
     ) -> Result<Vec<Arc<dyn QueryChunk>>>;
 }
 
@@ -180,6 +178,22 @@ impl ChunkTableProvider {
     pub fn deduplication(&self) -> bool {
         self.deduplication
     }
+
+    /// Convert into a logical plan builder.
+    pub fn into_logical_plan_builder(
+        self: Arc<Self>,
+    ) -> Result<LogicalPlanBuilder, DataFusionError> {
+        let table_name = self.table_name().to_owned();
+        let source = provider_as_source(self as _);
+
+        // Scan all columns (DataFusion optimizer will prune this
+        // later if possible)
+        let projection = None;
+
+        // Do not parse the tablename as a SQL identifer, but use as is
+        let table_ref = TableReference::bare(table_name);
+        LogicalPlanBuilder::scan(table_ref, source, projection)
+    }
 }
 
 #[async_trait]
@@ -214,34 +228,12 @@ impl TableProvider for ChunkTableProvider {
         let pk = self.iox_schema().primary_key();
         let dedup_sort_key = SortKey::from_columns(pk.iter().copied());
 
-        let mut chunks_by_delete_predicates =
-            HashMap::<&[Arc<DeletePredicate>], Vec<Arc<dyn QueryChunk>>>::new();
-        for chunk in &self.chunks {
-            chunks_by_delete_predicates
-                .entry(chunk.delete_predicates())
-                .or_default()
-                .push(Arc::clone(chunk));
-        }
-
-        let (delete_predicates, chunks) = match chunks_by_delete_predicates.len() {
-            0 => (&[] as _, vec![]),
-            1 => chunks_by_delete_predicates
-                .into_iter()
-                .next()
-                .expect("checked len"),
-            n => {
-                return Err(DataFusionError::External(
-                    format!("expected at most 1 delete predicate set, got {n}").into(),
-                ));
-            }
-        };
-
         // Create data stream from chunk data. This is the most simple data stream possible and contains duplicates and
         // has no filters at all.
         let plan = chunks_to_physical_nodes(
             &schema_with_chunk_order,
             None,
-            chunks,
+            self.chunks.clone(),
             ctx.config().target_partitions(),
         );
 
@@ -253,20 +245,8 @@ impl TableProvider for ChunkTableProvider {
             plan
         };
 
-        // Convert delete predicates to DF
-        let del_preds: Vec<Arc<Predicate>> = delete_predicates
-            .iter()
-            .map(|pred| Arc::new(pred.as_ref().clone().into()))
-            .collect();
-        let negated_del_expr_val = Predicate::negated_expr(&del_preds[..]);
-
         // Filter as early as possible (AFTER de-dup!). Predicate pushdown will eventually push down parts of this.
-        let plan = if let Some(expr) = filters
-            .iter()
-            .cloned()
-            .chain(negated_del_expr_val)
-            .reduce(|a, b| a.and(b))
-        {
+        let plan = if let Some(expr) = filters.iter().cloned().reduce(|a, b| a.and(b)) {
             let maybe_expr = if !self.deduplication {
                 let dedup_cols = pk.into_iter().collect::<HashSet<_>>();
                 conjunction(
@@ -343,8 +323,8 @@ mod test {
     use super::*;
     use crate::{
         exec::IOxSessionContext,
+        pruning::retention_expr,
         test::{format_execution_plan, TestChunk},
-        QueryChunkMeta,
     };
     use datafusion::prelude::{col, lit};
 
@@ -553,15 +533,14 @@ mod test {
     #[tokio::test]
     async fn provider_scan_retention() {
         let table_name = "t";
-        let pred = Arc::new(DeletePredicate::retention_delete_predicate(100));
+        let pred = retention_expr(100);
         let chunk1 = Arc::new(
             TestChunk::new(table_name)
                 .with_id(1)
                 .with_tag_column("tag1")
                 .with_tag_column("tag2")
                 .with_f64_field_column("field")
-                .with_time_column()
-                .with_delete_predicate(Arc::clone(&pred)),
+                .with_time_column(),
         ) as Arc<dyn QueryChunk>;
         let chunk2 = Arc::new(
             TestChunk::new(table_name)
@@ -570,8 +549,7 @@ mod test {
                 .with_tag_column("tag1")
                 .with_tag_column("tag2")
                 .with_f64_field_column("field")
-                .with_time_column()
-                .with_delete_predicate(Arc::clone(&pred)),
+                .with_time_column(),
         ) as Arc<dyn QueryChunk>;
         let schema = chunk1.schema().clone();
 
@@ -585,13 +563,16 @@ mod test {
             .unwrap();
 
         // simple plan
-        let plan = provider.scan(&state, None, &[], None).await.unwrap();
+        let plan = provider
+            .scan(&state, None, &[pred.clone()], None)
+            .await
+            .unwrap();
         insta::assert_yaml_snapshot!(
             format_execution_plan(&plan),
             @r###"
         ---
         - " ProjectionExec: expr=[field@0 as field, tag1@1 as tag1, tag2@2 as tag2, time@3 as time]"
-        - "   FilterExec: time@3 < -9223372036854775808 OR time@3 > 100"
+        - "   FilterExec: time@3 > 100"
         - "     DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
         - "       UnionExec"
         - "         RecordBatchesExec: batches_groups=1 batches=0 total_rows=0"
@@ -601,7 +582,7 @@ mod test {
 
         // projection
         let plan = provider
-            .scan(&state, Some(&vec![1, 3]), &[], None)
+            .scan(&state, Some(&vec![1, 3]), &[pred.clone()], None)
             .await
             .unwrap();
         insta::assert_yaml_snapshot!(
@@ -609,7 +590,7 @@ mod test {
             @r###"
         ---
         - " ProjectionExec: expr=[tag1@1 as tag1, time@3 as time]"
-        - "   FilterExec: time@3 < -9223372036854775808 OR time@3 > 100"
+        - "   FilterExec: time@3 > 100"
         - "     DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
         - "       UnionExec"
         - "         RecordBatchesExec: batches_groups=1 batches=0 total_rows=0"
@@ -618,11 +599,14 @@ mod test {
         );
 
         // filters
-        let expr = vec![lit(false)];
+        let expr = vec![lit(false), pred.clone()];
         let expr_ref = expr.iter().collect::<Vec<_>>();
         assert_eq!(
             provider.supports_filters_pushdown(&expr_ref).unwrap(),
-            vec![TableProviderFilterPushDown::Exact]
+            vec![
+                TableProviderFilterPushDown::Exact,
+                TableProviderFilterPushDown::Exact
+            ]
         );
         let plan = provider.scan(&state, None, &expr, None).await.unwrap();
         insta::assert_yaml_snapshot!(
@@ -630,7 +614,7 @@ mod test {
             @r###"
         ---
         - " ProjectionExec: expr=[field@0 as field, tag1@1 as tag1, tag2@2 as tag2, time@3 as time]"
-        - "   FilterExec: false AND (time@3 < -9223372036854775808 OR time@3 > 100)"
+        - "   FilterExec: false AND time@3 > 100"
         - "     DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
         - "       UnionExec"
         - "         RecordBatchesExec: batches_groups=1 batches=0 total_rows=0"
@@ -639,58 +623,18 @@ mod test {
         );
 
         // limit pushdown is unimplemented at the moment
-        let plan = provider.scan(&state, None, &[], Some(1)).await.unwrap();
+        let plan = provider.scan(&state, None, &[pred], Some(1)).await.unwrap();
         insta::assert_yaml_snapshot!(
             format_execution_plan(&plan),
             @r###"
         ---
         - " ProjectionExec: expr=[field@0 as field, tag1@1 as tag1, tag2@2 as tag2, time@3 as time]"
-        - "   FilterExec: time@3 < -9223372036854775808 OR time@3 > 100"
+        - "   FilterExec: time@3 > 100"
         - "     DeduplicateExec: [tag1@1 ASC,tag2@2 ASC,time@3 ASC]"
         - "       UnionExec"
         - "         RecordBatchesExec: batches_groups=1 batches=0 total_rows=0"
         - "         ParquetExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC]"
         "###
-        );
-    }
-
-    #[tokio::test]
-    async fn provider_scan_multiple_delete_predicates() {
-        let table_name = "t";
-        let chunk1 = Arc::new(
-            TestChunk::new(table_name)
-                .with_id(1)
-                .with_tag_column("tag1")
-                .with_tag_column("tag2")
-                .with_f64_field_column("field")
-                .with_time_column()
-                .with_delete_predicate(Arc::new(DeletePredicate::retention_delete_predicate(100))),
-        ) as Arc<dyn QueryChunk>;
-        let chunk2 = Arc::new(
-            TestChunk::new(table_name)
-                .with_id(2)
-                .with_dummy_parquet_file()
-                .with_tag_column("tag1")
-                .with_tag_column("tag2")
-                .with_f64_field_column("field")
-                .with_time_column()
-                .with_delete_predicate(Arc::new(DeletePredicate::retention_delete_predicate(200))),
-        ) as Arc<dyn QueryChunk>;
-        let schema = chunk1.schema().clone();
-
-        let ctx = IOxSessionContext::with_testing();
-        let state = ctx.inner().state();
-
-        let provider = ProviderBuilder::new(Arc::from(table_name), schema)
-            .add_chunk(Arc::clone(&chunk1))
-            .add_chunk(Arc::clone(&chunk2))
-            .build()
-            .unwrap();
-
-        let err = provider.scan(&state, None, &[], None).await.unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "External error: expected at most 1 delete predicate set, got 2"
         );
     }
 }

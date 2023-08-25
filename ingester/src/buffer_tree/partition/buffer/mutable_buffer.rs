@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use arrow::record_batch::RecordBatch;
 use mutable_batch::MutableBatch;
 use schema::Projection;
@@ -9,7 +7,7 @@ use schema::Projection;
 ///
 /// A [`Buffer`] can contain no writes.
 ///
-/// [`BufferState`]: super::super::BufferState
+/// [`BufferState`]: super::BufferState
 #[derive(Debug, Default)]
 pub(super) struct Buffer {
     buffer: Option<MutableBatch>,
@@ -39,18 +37,20 @@ impl Buffer {
     /// # Panics
     ///
     /// If generating the snapshot fails, this method panics.
-    pub(super) fn snapshot(self) -> Option<Arc<RecordBatch>> {
-        Some(Arc::new(
+    pub(super) fn snapshot(self) -> Option<RecordBatch> {
+        Some(
             self.buffer?
                 .to_arrow(Projection::All)
                 .expect("failed to snapshot buffer data"),
-        ))
+        )
     }
 
     pub(super) fn is_empty(&self) -> bool {
         self.buffer.is_none()
     }
 
+    /// Returns the underlying buffer if this [`Buffer`] contains data,
+    /// otherwise returns [`None`].
     pub(super) fn buffer(&self) -> Option<&MutableBatch> {
         self.buffer.as_ref()
     }

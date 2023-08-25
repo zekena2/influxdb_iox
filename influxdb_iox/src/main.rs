@@ -6,6 +6,7 @@
     clippy::explicit_iter_loop,
     clippy::use_self,
     clippy::clone_on_ref_ptr,
+    // See https://github.com/influxdata/influxdb_iox/pull/1671
     clippy::future_not_send
 )]
 
@@ -31,21 +32,28 @@ use std::{
     time::Duration,
 };
 use tokio::runtime::Runtime;
+use trace_exporters::{
+    DEFAULT_INFLUX_TRACE_CONTEXT_HEADER_NAME, DEFAULT_JAEGER_TRACE_CONTEXT_HEADER_NAME,
+};
 
 mod commands {
     pub mod catalog;
     pub mod debug;
-    pub mod import;
     pub mod namespace;
+    pub mod partition_template;
     pub mod query;
     pub mod query_ingester;
     pub mod remote;
     pub mod run;
     pub mod sql;
     pub mod storage;
+    pub mod table;
     pub mod tracing;
     pub mod write;
 }
+
+#[cfg(all(not(feature = "heappy"), feature = "jemalloc_replacing_malloc"))]
+mod jemalloc;
 
 mod process_info;
 
@@ -127,7 +135,9 @@ struct Config {
 
     /// Additional headers to add to CLI requests
     ///
-    /// Values should be key value pairs separated by ':'
+    /// Values should be key value pairs separated by ':'. For example:
+    /// `foo:bar` or
+    /// `influx-trace-id:"f52000bb08c9520:1112223334445:0:1"`
     #[clap(long, global = true, action)]
     header: Vec<KeyValue<http::header::HeaderName, http::HeaderValue>>,
 
@@ -140,22 +150,25 @@ struct Config {
     )]
     rpc_timeout: Duration,
 
-    /// Trace ID header.
+    /// HTTP header names sent with Trace ID information
     ///
-    /// See `--gen-trace-id` to trigger header generation.
+    /// See `--gen-trace-id` to trigger automatic header generation.
     #[clap(
         long,
         global = true,
-        default_value = trace_exporters::DEFAULT_JAEGER_TRACE_CONTEXT_HEADER_NAME,
-        action,
+        default_values = [
+            DEFAULT_JAEGER_TRACE_CONTEXT_HEADER_NAME,
+            DEFAULT_INFLUX_TRACE_CONTEXT_HEADER_NAME
+        ],
     )]
-    trace_id_header: String,
+    trace_id_header: Vec<String>,
 
-    /// Automatically generate an trace id header for CLI requests
+    /// Automatically generate an trace id header, triggering the
+    /// server to send spans to Jaeger, if configured
     ///
-    /// The generated trace ID will be emitted at the beginning of the response.
+    /// The generated trace ID is printed to the console.
     ///
-    /// See `--trace-id-header` to set how the header should be named.
+    /// See `--trace-id-header` to control the header name used
     #[clap(long, global = true, action)]
     gen_trace_id: bool,
 
@@ -209,11 +222,11 @@ enum Command {
     /// Query the ingester only
     QueryIngester(commands::query_ingester::Config),
 
-    /// Commands related to the bulk ingest of data
-    Import(commands::import::Config),
-
     /// Various commands for namespace manipulation
     Namespace(commands::namespace::Config),
+
+    /// Various commands for table manipulation
+    Table(commands::table::Config),
 }
 
 fn main() -> Result<(), std::io::Error> {
@@ -242,18 +255,7 @@ fn main() -> Result<(), std::io::Error> {
             builder = builder.timeout(rpc_timeout);
 
             if global_config.gen_trace_id {
-                let key =
-                    http::header::HeaderName::from_str(&global_config.trace_id_header).unwrap();
-                let trace_id = gen_trace_id();
-                let value = http::header::HeaderValue::from_str(trace_id.as_str()).unwrap();
-                debug!(name=?key, value=?value, "Setting trace header");
-                builder = builder.header(key, value);
-
-                // Emit trace id information
-                println!(
-                    "Trace ID set to {}={}",
-                    global_config.trace_id_header, trace_id
-                );
+                builder = configure_tracing(builder, &global_config.trace_id_header);
             }
 
             if let Some(token) = global_config.token.as_ref() {
@@ -373,17 +375,18 @@ fn main() -> Result<(), std::io::Error> {
                     std::process::exit(ReturnCode::Failure as _)
                 }
             }
-            Some(Command::Import(config)) => {
-                let _tracing_guard = handle_init_logs(init_simple_logs(log_verbose_count));
-                if let Err(e) = commands::import::command(config).await {
-                    eprintln!("{e}");
-                    std::process::exit(ReturnCode::Failure as _)
-                }
-            }
             Some(Command::Namespace(config)) => {
                 let _tracing_guard = handle_init_logs(init_simple_logs(log_verbose_count));
                 let connection = connection(grpc_host).await;
                 if let Err(e) = commands::namespace::command(connection, config).await {
+                    eprintln!("{e}");
+                    std::process::exit(ReturnCode::Failure as _)
+                }
+            }
+            Some(Command::Table(config)) => {
+                let _tracing_guard = handle_init_logs(init_simple_logs(log_verbose_count));
+                let connection = connection(grpc_host).await;
+                if let Err(e) = commands::table::command(connection, config).await {
                     eprintln!("{e}");
                     std::process::exit(ReturnCode::Failure as _)
                 }
@@ -394,13 +397,39 @@ fn main() -> Result<(), std::io::Error> {
     Ok(())
 }
 
-// Generates a compatible header values for a jaeger trace context header.
-fn gen_trace_id() -> String {
+/// configures tracing headers, so the remote server will sends
+/// tracing spans to Jaeger, if configured to do so.
+fn configure_tracing(mut builder: Builder, trace_id_headers: &[String]) -> Builder {
+    let (trace_id, header_value) = gen_trace_id();
+
+    for trace_id_header in trace_id_headers {
+        builder = set_trace_header(builder, trace_id_header, &header_value);
+    }
+
+    println!("Trace ID set to {trace_id}");
+    builder
+}
+
+fn set_trace_header(mut builder: Builder, header_name: &str, header_value: &str) -> Builder {
+    let key = http::header::HeaderName::from_str(header_name).unwrap();
+    let value = http::header::HeaderValue::from_str(header_value).unwrap();
+    debug!(name=?key, value=?value, "Setting trace header");
+    builder = builder.header(key, value);
+
+    // Emit trace id information to stdout
+    builder
+}
+
+/// Generates a compatible header values for a jaeger trace context header.
+/// returns (trace_id, header_value)
+fn gen_trace_id() -> (String, String) {
     let now = SystemProvider::new().now();
     let mut hasher = DefaultHasher::new();
     now.timestamp_nanos().hash(&mut hasher);
 
-    format!("{:x}:1112223334445:0:1", hasher.finish())
+    let trace_id = format!("{:x}", hasher.finish());
+    let header_value = format!("{trace_id}:1112223334445:0:1");
+    (trace_id, header_value)
 }
 
 /// Creates the tokio runtime for executing IOx

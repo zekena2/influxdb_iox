@@ -2,8 +2,6 @@
 //!
 //! [`PartitionData`]: crate::buffer_tree::partition::PartitionData
 
-#![allow(unused_imports)] // Transition time only.
-
 mod cache;
 pub(crate) use cache::*;
 
@@ -18,6 +16,9 @@ pub(crate) use sort_key::*;
 
 mod coalesce;
 pub(crate) use coalesce::*;
+
+mod old_filter;
+pub(crate) use old_filter::*;
 
 #[cfg(test)]
 pub(crate) mod mock;

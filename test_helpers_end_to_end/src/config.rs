@@ -2,7 +2,7 @@ use crate::{addrs::BindAddresses, ServerType, UdpCapture};
 use http::{header::HeaderName, HeaderValue};
 use observability_deps::tracing::info;
 use rand::Rng;
-use std::{collections::HashMap, num::NonZeroUsize, sync::Arc};
+use std::{collections::HashMap, num::NonZeroUsize, path::Path, sync::Arc};
 use tempfile::TempDir;
 
 /// Options for creating test servers (`influxdb_iox` processes)
@@ -155,6 +155,28 @@ impl TestConfig {
         Self::new(ServerType::AllInOne, dsn, random_catalog_schema_name()).with_new_object_store()
     }
 
+    /// Create a minimal all in one configuration with the specified
+    /// data directory (`--data_dir = <data_dir>`)
+    ///
+    /// the data_dir has a file based object store and sqlite catalog
+    pub fn new_all_in_one_with_data_dir(data_dir: &Path) -> Self {
+        let dsn = None; // use default sqlite catalog in data_dir
+
+        let data_dir_str = data_dir.as_os_str().to_str().unwrap();
+        Self::new(ServerType::AllInOne, dsn, random_catalog_schema_name())
+            .with_env("INFLUXDB_IOX_DB_DIR", data_dir_str)
+    }
+
+    /// Set the number of failed ingester queries before the querier considers
+    /// the ingester to be dead.
+    pub fn with_querier_circuit_breaker_threshold(self, count: usize) -> Self {
+        assert!(count > 0);
+        self.with_env(
+            "INFLUXDB_IOX_INGESTER_CIRCUIT_BREAKER_THRESHOLD",
+            count.to_string(),
+        )
+    }
+
     /// Configure tracing capture
     pub fn with_tracing(self, udp_capture: &UdpCapture) -> Self {
         self.with_env("TRACES_EXPORTER", "jaeger")
@@ -165,6 +187,7 @@ impl TestConfig {
                 "custom-trace-header",
             )
             .with_client_header("custom-trace-header", "4:3:2:1")
+            .with_env("INFLUXDB_IOX_COMPACTION_PARTITION_TRACE", "all")
     }
 
     /// Configure a custom debug name for tracing
@@ -191,6 +214,10 @@ impl TestConfig {
         )
     }
 
+    pub fn with_ingester_never_persist(self) -> Self {
+        self.with_env("INFLUXDB_IOX_WAL_ROTATION_PERIOD_SECONDS", "86400")
+    }
+
     /// Configure the single tenancy mode, including the authorization server.
     pub fn with_single_tenancy(self, addr: impl Into<String>) -> Self {
         self.with_env("INFLUXDB_IOX_AUTHZ_ADDR", addr)
@@ -205,6 +232,16 @@ impl TestConfig {
     // Get the catalog postgres schema name
     pub fn catalog_schema_name(&self) -> &str {
         &self.catalog_schema_name
+    }
+
+    /// Retrieve the directory used to write WAL files to, if set
+    pub fn wal_dir(&self) -> &Option<Arc<TempDir>> {
+        &self.wal_dir
+    }
+
+    /// Retrieve the directory used for object store, if set
+    pub fn object_store_dir(&self) -> &Option<Arc<TempDir>> {
+        &self.object_store_dir
     }
 
     // copy a reference to the catalog temp dir, if any

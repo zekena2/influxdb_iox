@@ -4,11 +4,13 @@
     missing_debug_implementations,
     missing_docs,
     clippy::explicit_iter_loop,
+    // See https://github.com/influxdata/influxdb_iox/pull/1671
     clippy::future_not_send,
     clippy::use_self,
     clippy::clone_on_ref_ptr,
     clippy::todo,
-    clippy::dbg_macro
+    clippy::dbg_macro,
+    unused_crate_dependencies
 )]
 
 //! A mutable data structure for a collection of writes.
@@ -16,6 +18,9 @@
 //! Can be viewed as a mutable version of [`RecordBatch`] that remains the exclusive
 //! owner of its buffers, permitting mutability. The in-memory layout is similar, however,
 //! permitting fast conversion to [`RecordBatch`].
+
+// Workaround for "unused crate" lint false positives.
+use workspace_hack as _;
 
 use crate::column::{Column, ColumnData};
 use arrow::record_batch::RecordBatch;

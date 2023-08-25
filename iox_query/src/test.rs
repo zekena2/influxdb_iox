@@ -5,10 +5,10 @@
 use crate::{
     exec::{
         stringset::{StringSet, StringSetRef},
-        ExecutionContextProvider, Executor, ExecutorType, IOxSessionContext,
+        Executor, ExecutorType, IOxSessionContext,
     },
-    Predicate, PredicateMatch, QueryChunk, QueryChunkData, QueryChunkMeta, QueryCompletedToken,
-    QueryNamespace, QueryText,
+    pruning::prune_chunks,
+    QueryChunk, QueryChunkData, QueryCompletedToken, QueryNamespace, QueryText,
 };
 use arrow::array::{BooleanArray, Float64Array};
 use arrow::datatypes::SchemaRef;
@@ -20,29 +20,33 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use async_trait::async_trait;
-use data_types::{
-    ChunkId, ChunkOrder, ColumnSummary, DeletePredicate, InfluxDbType, PartitionId, StatValues,
-    Statistics, TableSummary,
-};
-use datafusion::datasource::{object_store::ObjectStoreUrl, TableProvider, TableType};
+use data_types::{ChunkId, ChunkOrder, PartitionKey, TableId, TransitionPartitionId};
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::{catalog::catalog::CatalogProvider, physical_plan::displayable};
 use datafusion::{catalog::schema::SchemaProvider, logical_expr::LogicalPlan};
-use hashbrown::HashSet;
+use datafusion::{catalog::CatalogProvider, physical_plan::displayable};
+use datafusion::{
+    datasource::{object_store::ObjectStoreUrl, TableProvider, TableType},
+    physical_plan::{ColumnStatistics, Statistics as DataFusionStatistics},
+    scalar::ScalarValue,
+};
+use datafusion_util::config::DEFAULT_SCHEMA;
 use itertools::Itertools;
 use object_store::{path::Path, ObjectMeta};
-use observability_deps::tracing::debug;
 use parking_lot::Mutex;
 use parquet_file::storage::ParquetExecInput;
-use predicate::rpc_predicate::QueryNamespaceMeta;
 use schema::{
-    builder::SchemaBuilder, merge::SchemaMerger, sort::SortKey, InfluxColumnType, Projection,
-    Schema, TIME_COLUMN_NAME,
+    builder::SchemaBuilder, merge::SchemaMerger, sort::SortKey, Schema, TIME_COLUMN_NAME,
 };
-use std::{any::Any, collections::BTreeMap, fmt, num::NonZeroU64, sync::Arc};
+use std::{
+    any::Any,
+    collections::{BTreeMap, HashMap},
+    fmt,
+    num::NonZeroU64,
+    sync::Arc,
+};
 use trace::ctx::SpanContext;
 
 #[derive(Debug)]
@@ -57,7 +61,10 @@ pub struct TestDatabase {
     column_names: Arc<Mutex<Option<StringSetRef>>>,
 
     /// The predicate passed to the most recent call to `chunks()`
-    chunks_predicate: Mutex<Predicate>,
+    chunks_predicate: Mutex<Vec<Expr>>,
+
+    /// Retention time ns.
+    retention_time_ns: Option<i64>,
 }
 
 impl TestDatabase {
@@ -67,6 +74,7 @@ impl TestDatabase {
             partitions: Default::default(),
             column_names: Default::default(),
             chunks_predicate: Default::default(),
+            retention_time_ns: None,
         }
     }
 
@@ -95,7 +103,7 @@ impl TestDatabase {
     }
 
     /// Return the most recent predicate passed to get_chunks()
-    pub fn get_chunks_predicate(&self) -> Predicate {
+    pub fn get_chunks_predicate(&self) -> Vec<Expr> {
         self.chunks_predicate.lock().clone()
     }
 
@@ -107,6 +115,12 @@ impl TestDatabase {
 
         *Arc::clone(&self.column_names).lock() = Some(column_names)
     }
+
+    /// Set retention time.
+    pub fn with_retention_time_ns(mut self, retention_time_ns: Option<i64>) -> Self {
+        self.retention_time_ns = retention_time_ns;
+        self
+    }
 }
 
 #[async_trait]
@@ -114,12 +128,12 @@ impl QueryNamespace for TestDatabase {
     async fn chunks(
         &self,
         table_name: &str,
-        predicate: &Predicate,
+        filters: &[Expr],
         _projection: Option<&Vec<usize>>,
-        ctx: IOxSessionContext,
+        _ctx: IOxSessionContext,
     ) -> Result<Vec<Arc<dyn QueryChunk>>, DataFusionError> {
         // save last predicate
-        *self.chunks_predicate.lock() = predicate.clone();
+        *self.chunks_predicate.lock() = filters.to_vec();
 
         let partitions = self.partitions.lock().clone();
         Ok(partitions
@@ -129,17 +143,21 @@ impl QueryNamespace for TestDatabase {
             .filter(|c| c.table_name == table_name)
             // only keep chunks if their statistics overlap
             .filter(|c| {
-                !matches!(
-                    predicate.apply_to_table_summary(
-                        ctx.inner().state().execution_props(),
-                        &c.table_summary,
-                        c.schema.as_arrow()
-                    ),
-                    PredicateMatch::Zero
+                prune_chunks(
+                    c.schema(),
+                    &[Arc::clone(*c) as Arc<dyn QueryChunk>],
+                    filters,
                 )
+                .ok()
+                .map(|res| res[0])
+                .unwrap_or(true)
             })
             .map(|x| Arc::clone(x) as Arc<dyn QueryChunk>)
             .collect::<Vec<_>>())
+    }
+
+    fn retention_time_ns(&self) -> Option<i64> {
+        self.retention_time_ns
     }
 
     fn record_query(
@@ -151,43 +169,6 @@ impl QueryNamespace for TestDatabase {
         QueryCompletedToken::new(|_| {})
     }
 
-    fn as_meta(&self) -> &dyn QueryNamespaceMeta {
-        self
-    }
-}
-
-impl QueryNamespaceMeta for TestDatabase {
-    fn table_schema(&self, table_name: &str) -> Option<Schema> {
-        let mut merger = SchemaMerger::new();
-        let mut found_one = false;
-
-        let partitions = self.partitions.lock();
-        for partition in partitions.values() {
-            for chunk in partition.values() {
-                if chunk.table_name() == table_name {
-                    merger = merger.merge(chunk.schema()).expect("consistent schemas");
-                    found_one = true;
-                }
-            }
-        }
-
-        found_one.then(|| merger.build())
-    }
-
-    fn table_names(&self) -> Vec<String> {
-        let mut values = HashSet::new();
-        let partitions = self.partitions.lock();
-        for chunks in partitions.values() {
-            for chunk in chunks.values() {
-                values.get_or_insert_owned(&chunk.table_name);
-            }
-        }
-
-        values.into_iter().collect()
-    }
-}
-
-impl ExecutionContextProvider for TestDatabase {
     fn new_query_context(&self, span_ctx: Option<SpanContext>) -> IOxSessionContext {
         // Note: unlike Db this does not register a catalog provider
         self.executor
@@ -199,9 +180,6 @@ impl ExecutionContextProvider for TestDatabase {
             .build()
     }
 }
-
-// The default schema name - this impacts what SQL queries use if not specified
-const DEFAULT_SCHEMA: &str = "iox";
 
 struct TestDatabaseCatalogProvider {
     partitions: BTreeMap<String, BTreeMap<ChunkId, Arc<TestChunk>>>,
@@ -312,30 +290,22 @@ pub struct TestChunk {
     /// Schema of the table
     schema: Schema,
 
-    /// Return value for summary()
-    table_summary: TableSummary,
+    /// Values for stats()
+    column_stats: HashMap<String, ColumnStatistics>,
+    num_rows: Option<usize>,
 
     id: ChunkId,
 
-    partition_id: PartitionId,
+    partition_id: TransitionPartitionId,
 
     /// Set the flag if this chunk might contain duplicates
     may_contain_pk_duplicates: bool,
-
-    /// A copy of the captured predicates passed
-    predicates: Mutex<Vec<Predicate>>,
 
     /// Data in this chunk.
     table_data: QueryChunkData,
 
     /// A saved error that is returned instead of actual results
     saved_error: Option<String>,
-
-    /// Return value for apply_predicate, if desired
-    predicate_match: Option<PredicateMatch>,
-
-    /// Copy of delete predicates passed
-    delete_predicates: Vec<Arc<DeletePredicate>>,
 
     /// Order of this chunk relative to other overlapping chunks.
     order: ChunkOrder,
@@ -358,24 +328,7 @@ macro_rules! impl_with_column {
                 .unwrap()
                 .build()
                 .unwrap();
-            self.add_schema_to_table(new_column_schema, true, None)
-        }
-    };
-}
-
-/// Implements a method for adding a column without any stats
-macro_rules! impl_with_column_no_stats {
-    ($NAME:ident, $DATA_TYPE:ident) => {
-        pub fn $NAME(self, column_name: impl Into<String>) -> Self {
-            let column_name = column_name.into();
-
-            let new_column_schema = SchemaBuilder::new()
-                .field(&column_name, DataType::$DATA_TYPE)
-                .unwrap()
-                .build()
-                .unwrap();
-
-            self.add_schema_to_table(new_column_schema, false, None)
+            self.add_schema_to_table(new_column_schema, None)
         }
     };
 }
@@ -397,13 +350,14 @@ macro_rules! impl_with_column_with_stats {
                 .build()
                 .unwrap();
 
-            let stats = Statistics::$STAT_TYPE(StatValues {
-                min,
-                max,
-                ..Default::default()
-            });
+            let stats = ColumnStatistics {
+                null_count: None,
+                max_value: max.map(|s| ScalarValue::from(s)),
+                min_value: min.map(|s| ScalarValue::from(s)),
+                distinct_count: None,
+            };
 
-            self.add_schema_to_table(new_column_schema, true, Some(stats))
+            self.add_schema_to_table(new_column_schema, Some(stats))
         }
     };
 }
@@ -414,17 +368,15 @@ impl TestChunk {
         Self {
             table_name,
             schema: SchemaBuilder::new().build().unwrap(),
-            table_summary: TableSummary::default(),
+            column_stats: Default::default(),
+            num_rows: None,
             id: ChunkId::new_test(0),
             may_contain_pk_duplicates: Default::default(),
-            predicates: Default::default(),
             table_data: QueryChunkData::RecordBatches(vec![]),
             saved_error: Default::default(),
-            predicate_match: Default::default(),
-            delete_predicates: Default::default(),
             order: ChunkOrder::MIN,
             sort_key: None,
-            partition_id: PartitionId::new(0),
+            partition_id: TransitionPartitionId::arbitrary_for_testing(),
             quiet: false,
         }
     }
@@ -436,11 +388,6 @@ impl TestChunk {
             }
             QueryChunkData::Parquet(_) => panic!("chunk is parquet-based"),
         }
-    }
-
-    pub fn with_delete_predicate(mut self, pred: Arc<DeletePredicate>) -> Self {
-        self.delete_predicates.push(pred);
-        self
     }
 
     pub fn with_order(self, order: i64) -> Self {
@@ -469,6 +416,7 @@ impl TestChunk {
                     location: Self::parquet_location(self.id),
                     last_modified: Default::default(),
                     size: 1,
+                    e_tag: None,
                 },
             }),
             ..self
@@ -495,8 +443,14 @@ impl TestChunk {
         self
     }
 
-    pub fn with_partition_id(mut self, id: i64) -> Self {
-        self.partition_id = PartitionId::new(id);
+    pub fn with_partition(mut self, id: i64) -> Self {
+        self.partition_id =
+            TransitionPartitionId::new(TableId::new(id), &PartitionKey::from("arbitrary"));
+        self
+    }
+
+    pub fn with_partition_id(mut self, id: TransitionPartitionId) -> Self {
+        self.partition_id = id;
         self
     }
 
@@ -504,12 +458,6 @@ impl TestChunk {
     /// specified
     pub fn with_error(mut self, error_message: impl Into<String>) -> Self {
         self.saved_error = Some(error_message.into());
-        self
-    }
-
-    /// specify that any call to apply_predicate should return this value
-    pub fn with_predicate_match(mut self, predicate_match: PredicateMatch) -> Self {
-        self.predicate_match = Some(predicate_match);
         self
     }
 
@@ -536,7 +484,7 @@ impl TestChunk {
         // merge it in to any existing schema
         let new_column_schema = SchemaBuilder::new().tag(&column_name).build().unwrap();
 
-        self.add_schema_to_table(new_column_schema, true, None)
+        self.add_schema_to_table(new_column_schema, None)
     }
 
     /// Register a tag column with stats with the test chunk
@@ -569,9 +517,16 @@ impl TestChunk {
         )
     }
 
+    fn update_count(&mut self, count: usize) {
+        match self.num_rows {
+            Some(existing) => assert_eq!(existing, count),
+            None => self.num_rows = Some(count),
+        }
+    }
+
     /// Register a tag column with stats with the test chunk
     pub fn with_tag_column_with_nulls_and_full_stats(
-        self,
+        mut self,
         column_name: impl Into<String>,
         min: Option<&str>,
         max: Option<&str>,
@@ -586,15 +541,15 @@ impl TestChunk {
         let new_column_schema = SchemaBuilder::new().tag(&column_name).build().unwrap();
 
         // Construct stats
-        let stats = Statistics::String(StatValues {
-            min: min.map(ToString::to_string),
-            max: max.map(ToString::to_string),
-            total_count: count,
-            null_count: Some(null_count),
-            distinct_count,
-        });
+        let stats = ColumnStatistics {
+            null_count: Some(null_count as usize),
+            max_value: max.map(ScalarValue::from),
+            min_value: min.map(ScalarValue::from),
+            distinct_count: distinct_count.map(|c| c.get() as usize),
+        };
 
-        self.add_schema_to_table(new_column_schema, true, Some(stats))
+        self.update_count(count as usize);
+        self.add_schema_to_table(new_column_schema, Some(stats))
     }
 
     /// Register a timestamp column with the test chunk with default stats
@@ -603,7 +558,7 @@ impl TestChunk {
         // merge it in to any existing schema
         let new_column_schema = SchemaBuilder::new().timestamp().build().unwrap();
 
-        self.add_schema_to_table(new_column_schema, true, None)
+        self.add_schema_to_table(new_column_schema, None)
     }
 
     /// Register a timestamp column with the test chunk
@@ -613,7 +568,7 @@ impl TestChunk {
 
     /// Register a timestamp column with full stats with the test chunk
     pub fn with_time_column_with_full_stats(
-        self,
+        mut self,
         min: Option<i64>,
         max: Option<i64>,
         count: u64,
@@ -625,66 +580,39 @@ impl TestChunk {
         let null_count = 0;
 
         // Construct stats
-        let stats = Statistics::I64(StatValues {
-            min,
-            max,
-            total_count: count,
-            null_count: Some(null_count),
-            distinct_count,
-        });
+        let stats = ColumnStatistics {
+            null_count: Some(null_count as usize),
+            max_value: max.map(|v| ScalarValue::TimestampNanosecond(Some(v), None)),
+            min_value: min.map(|v| ScalarValue::TimestampNanosecond(Some(v), None)),
+            distinct_count: distinct_count.map(|c| c.get() as usize),
+        };
 
-        self.add_schema_to_table(new_column_schema, true, Some(stats))
+        self.update_count(count as usize);
+        self.add_schema_to_table(new_column_schema, Some(stats))
     }
 
     pub fn with_timestamp_min_max(mut self, min: i64, max: i64) -> Self {
-        match self
-            .table_summary
-            .columns
-            .iter_mut()
-            .find(|c| c.name == TIME_COLUMN_NAME)
-        {
-            Some(col) => {
-                let stats = &mut col.stats;
-                *stats = Statistics::I64(StatValues {
-                    min: Some(min),
-                    max: Some(max),
-                    total_count: stats.total_count(),
-                    null_count: stats.null_count(),
-                    distinct_count: stats.distinct_count(),
-                });
-            }
-            None => {
-                let total_count = self.table_summary.total_count();
-                self.table_summary.columns.push(ColumnSummary {
-                    name: TIME_COLUMN_NAME.to_string(),
-                    influxdb_type: InfluxDbType::Timestamp,
-                    stats: Statistics::I64(StatValues {
-                        min: Some(min),
-                        max: Some(max),
-                        total_count,
-                        null_count: None,
-                        distinct_count: None,
-                    }),
-                });
-            }
-        }
+        let stats = self
+            .column_stats
+            .get_mut(TIME_COLUMN_NAME)
+            .expect("stats in sync w/ columns");
+
+        stats.min_value = Some(ScalarValue::TimestampNanosecond(Some(min), None));
+        stats.max_value = Some(ScalarValue::TimestampNanosecond(Some(max), None));
+
         self
     }
 
     impl_with_column!(with_i64_field_column, Int64);
-    impl_with_column_no_stats!(with_i64_field_column_no_stats, Int64);
     impl_with_column_with_stats!(with_i64_field_column_with_stats, Int64, i64, I64);
 
     impl_with_column!(with_u64_column, UInt64);
-    impl_with_column_no_stats!(with_u64_field_column_no_stats, UInt64);
     impl_with_column_with_stats!(with_u64_field_column_with_stats, UInt64, u64, U64);
 
     impl_with_column!(with_f64_field_column, Float64);
-    impl_with_column_no_stats!(with_f64_field_column_no_stats, Float64);
     impl_with_column_with_stats!(with_f64_field_column_with_stats, Float64, f64, F64);
 
     impl_with_column!(with_bool_field_column, Boolean);
-    impl_with_column_no_stats!(with_bool_field_column_no_stats, Boolean);
     impl_with_column_with_stats!(with_bool_field_column_with_stats, Boolean, bool, Bool);
 
     /// Register a string field column with the test chunk
@@ -705,13 +633,14 @@ impl TestChunk {
             .unwrap();
 
         // Construct stats
-        let stats = Statistics::String(StatValues {
-            min: min.map(ToString::to_string),
-            max: max.map(ToString::to_string),
-            ..Default::default()
-        });
+        let stats = ColumnStatistics {
+            null_count: None,
+            max_value: max.map(ScalarValue::from),
+            min_value: min.map(ScalarValue::from),
+            distinct_count: None,
+        };
 
-        self.add_schema_to_table(new_column_schema, true, Some(stats))
+        self.add_schema_to_table(new_column_schema, Some(stats))
     }
 
     /// Adds the specified schema and optionally a column summary containing optional stats.
@@ -720,54 +649,21 @@ impl TestChunk {
     fn add_schema_to_table(
         mut self,
         new_column_schema: Schema,
-        add_column_summary: bool,
-        input_stats: Option<Statistics>,
+        input_stats: Option<ColumnStatistics>,
     ) -> Self {
         let mut merger = SchemaMerger::new();
         merger = merger.merge(&new_column_schema).unwrap();
         merger = merger.merge(&self.schema).expect("merging was successful");
         self.schema = merger.build();
 
-        for i in 0..new_column_schema.len() {
-            let (col_type, new_field) = new_column_schema.field(i);
-            if add_column_summary {
-                let influxdb_type = match col_type {
-                    InfluxColumnType::Tag => InfluxDbType::Tag,
-                    InfluxColumnType::Field(_) => InfluxDbType::Field,
-                    InfluxColumnType::Timestamp => InfluxDbType::Timestamp,
-                };
-
-                let stats = input_stats.clone();
-                let stats = stats.unwrap_or_else(|| match new_field.data_type() {
-                    DataType::Boolean => Statistics::Bool(StatValues::default()),
-                    DataType::Int64 => Statistics::I64(StatValues::default()),
-                    DataType::UInt64 => Statistics::U64(StatValues::default()),
-                    DataType::Utf8 => Statistics::String(StatValues::default()),
-                    DataType::Dictionary(_, value_type) => {
-                        assert!(matches!(**value_type, DataType::Utf8));
-                        Statistics::String(StatValues::default())
-                    }
-                    DataType::Float64 => Statistics::F64(StatValues::default()),
-                    DataType::Timestamp(_, _) => Statistics::I64(StatValues::default()),
-                    _ => panic!("Unsupported type in TestChunk: {:?}", new_field.data_type()),
-                });
-
-                let column_summary = ColumnSummary {
-                    name: new_field.name().clone(),
-                    influxdb_type,
-                    stats,
-                };
-
-                self.table_summary.columns.push(column_summary);
-            }
+        for f in new_column_schema.inner().fields() {
+            self.column_stats.insert(
+                f.name().clone(),
+                input_stats.as_ref().cloned().unwrap_or_default(),
+            );
         }
 
         self
-    }
-
-    /// Get a copy of any predicate passed to the function
-    pub fn predicates(&self) -> Vec<Predicate> {
-        self.predicates.lock().clone()
     }
 
     /// Prepares this chunk to return a specific record batch with one
@@ -1129,23 +1025,6 @@ impl TestChunk {
         }
     }
 
-    /// Returns all columns of the table
-    pub fn all_column_names(&self) -> StringSet {
-        self.schema
-            .iter()
-            .map(|(_, field)| field.name().to_string())
-            .collect()
-    }
-
-    /// Returns just the specified columns
-    pub fn specific_column_names_selection(&self, columns: &[&str]) -> StringSet {
-        self.schema
-            .iter()
-            .map(|(_, field)| field.name().to_string())
-            .filter(|col| columns.contains(&col.as_str()))
-            .collect()
-    }
-
     pub fn table_name(&self) -> &str {
         &self.table_name
     }
@@ -1158,6 +1037,36 @@ impl fmt::Display for TestChunk {
 }
 
 impl QueryChunk for TestChunk {
+    fn stats(&self) -> Arc<DataFusionStatistics> {
+        self.check_error().unwrap();
+
+        Arc::new(DataFusionStatistics {
+            num_rows: self.num_rows,
+            total_byte_size: None,
+            column_statistics: Some(
+                self.schema
+                    .inner()
+                    .fields()
+                    .iter()
+                    .map(|f| self.column_stats.get(f.name()).cloned().unwrap_or_default())
+                    .collect(),
+            ),
+            is_exact: true,
+        })
+    }
+
+    fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    fn partition_id(&self) -> &TransitionPartitionId {
+        &self.partition_id
+    }
+
+    fn sort_key(&self) -> Option<&SortKey> {
+        self.sort_key.as_ref()
+    }
+
     fn id(&self) -> ChunkId {
         self.id
     }
@@ -1167,59 +1076,13 @@ impl QueryChunk for TestChunk {
     }
 
     fn data(&self) -> QueryChunkData {
+        self.check_error().unwrap();
+
         self.table_data.clone()
     }
 
     fn chunk_type(&self) -> &str {
         "Test Chunk"
-    }
-
-    fn apply_predicate_to_metadata(
-        &self,
-        _ctx: &IOxSessionContext,
-        predicate: &Predicate,
-    ) -> Result<PredicateMatch, DataFusionError> {
-        self.check_error()?;
-
-        // save the predicate
-        self.predicates.lock().push(predicate.clone());
-
-        // check if there is a saved result to return
-        if let Some(&predicate_match) = self.predicate_match.as_ref() {
-            return Ok(predicate_match);
-        }
-
-        Ok(PredicateMatch::Unknown)
-    }
-
-    fn column_values(
-        &self,
-        _ctx: IOxSessionContext,
-        _column_name: &str,
-        _predicate: &Predicate,
-    ) -> Result<Option<StringSet>, DataFusionError> {
-        // Model not being able to get column values from metadata
-        Ok(None)
-    }
-
-    fn column_names(
-        &self,
-        _ctx: IOxSessionContext,
-        predicate: &Predicate,
-        selection: Projection<'_>,
-    ) -> Result<Option<StringSet>, DataFusionError> {
-        self.check_error()?;
-
-        // save the predicate
-        self.predicates.lock().push(predicate.clone());
-
-        // only return columns specified in selection
-        let column_names = match selection {
-            Projection::All => self.all_column_names(),
-            Projection::Some(cols) => self.specific_column_names_selection(cols),
-        };
-
-        Ok(Some(column_names))
     }
 
     fn order(&self) -> ChunkOrder {
@@ -1228,32 +1091,6 @@ impl QueryChunk for TestChunk {
 
     fn as_any(&self) -> &dyn Any {
         self
-    }
-}
-
-impl QueryChunkMeta for TestChunk {
-    fn summary(&self) -> Arc<TableSummary> {
-        Arc::new(self.table_summary.clone())
-    }
-
-    fn schema(&self) -> &Schema {
-        &self.schema
-    }
-
-    fn partition_id(&self) -> PartitionId {
-        self.partition_id
-    }
-
-    fn sort_key(&self) -> Option<&SortKey> {
-        self.sort_key.as_ref()
-    }
-
-    // return a reference to delete predicates of the chunk
-    fn delete_predicates(&self) -> &[Arc<DeletePredicate>] {
-        let pred = &self.delete_predicates;
-        debug!(?pred, "Delete predicate in Test Chunk");
-
-        pred
     }
 }
 
@@ -1272,7 +1109,7 @@ pub fn format_logical_plan(plan: &LogicalPlan) -> Vec<String> {
 }
 
 pub fn format_execution_plan(plan: &Arc<dyn ExecutionPlan>) -> Vec<String> {
-    format_lines(&displayable(plan.as_ref()).indent().to_string())
+    format_lines(&displayable(plan.as_ref()).indent(false).to_string())
 }
 
 fn format_lines(s: &str) -> Vec<String> {

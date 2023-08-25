@@ -28,6 +28,7 @@ fn main() -> Result<()> {
 /// - `influxdata.iox.predicate.v1.rs`
 /// - `influxdata.iox.querier.v1.rs`
 /// - `influxdata.iox.schema.v1.rs`
+/// - `influxdata.iox.table.v1.rs`
 /// - `influxdata.iox.wal.v1.rs`
 /// - `influxdata.iox.write.v1.rs`
 /// - `influxdata.platform.storage.rs`
@@ -36,6 +37,7 @@ fn generate_grpc_types(root: &Path) -> Result<()> {
     let catalog_path = root.join("influxdata/iox/catalog/v1");
     let compactor_path = root.join("influxdata/iox/compactor/v1");
     let delete_path = root.join("influxdata/iox/delete/v1");
+    let gossip_path = root.join("influxdata/iox/gossip/v1");
     let ingester_path = root.join("influxdata/iox/ingester/v1");
     let namespace_path = root.join("influxdata/iox/namespace/v1");
     let object_store_path = root.join("influxdata/iox/object_store/v1");
@@ -45,17 +47,19 @@ fn generate_grpc_types(root: &Path) -> Result<()> {
     let schema_path = root.join("influxdata/iox/schema/v1");
     let storage_errors_path = root.join("influxdata/platform/errors");
     let storage_path = root.join("influxdata/platform/storage");
+    let table_path = root.join("influxdata/iox/table/v1");
     let wal_path = root.join("influxdata/iox/wal/v1");
 
     let proto_files = vec![
         authz_path.join("authz.proto"),
         catalog_path.join("parquet_file.proto"),
+        catalog_path.join("partition_identifier.proto"),
         catalog_path.join("service.proto"),
         compactor_path.join("service.proto"),
         delete_path.join("service.proto"),
+        gossip_path.join("schema.proto"),
         ingester_path.join("parquet_metadata.proto"),
         ingester_path.join("persist.proto"),
-        ingester_path.join("replication.proto"),
         ingester_path.join("write.proto"),
         namespace_path.join("service.proto"),
         object_store_path.join("service.proto"),
@@ -74,6 +78,7 @@ fn generate_grpc_types(root: &Path) -> Result<()> {
         storage_path.join("source.proto"),
         storage_path.join("storage_common.proto"),
         storage_path.join("test.proto"),
+        table_path.join("service.proto"),
         wal_path.join("wal.proto"),
     ];
 

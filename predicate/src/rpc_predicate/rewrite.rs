@@ -1,7 +1,7 @@
 use datafusion::{
     common::tree_node::{Transformed, TreeNode},
     error::Result,
-    logical_expr::{binary_expr, expr::Case, BinaryExpr, Operator},
+    logical_expr::{binary_expr, expr::Case, BinaryExpr, Cast, Like, Operator},
     prelude::Expr,
 };
 
@@ -159,6 +159,9 @@ fn is_comparison(op: Operator) -> bool {
         Operator::RegexNotMatch => true,
         Operator::RegexNotIMatch => true,
         Operator::StringConcat => false,
+        // array containment operators
+        Operator::ArrowAt => true,
+        Operator::AtArrow => true,
     }
 }
 
@@ -214,10 +217,10 @@ fn inline_case(case_on_left: bool, left: Expr, right: Expr, op: Operator) -> Exp
 
 /// returns the column name for a column expression
 fn is_col(expr: &Expr) -> Option<&str> {
-    if let Expr::Column(c) = &expr {
-        Some(c.name.as_str())
-    } else {
-        None
+    match expr {
+        Expr::Column(c) => Some(c.name.as_str()),
+        Expr::Cast(Cast { expr, data_type: _ }) => is_col(expr),
+        _ => None,
     }
 }
 
@@ -248,16 +251,18 @@ fn is_col_op_lit(expr: &Expr) -> Option<&str> {
     match expr {
         Expr::BinaryExpr(BinaryExpr { left, op: _, right }) if is_lit(right) => is_col(left),
         Expr::BinaryExpr(BinaryExpr { left, op: _, right }) if is_lit(left) => is_col(right),
+        Expr::Like(Like { expr, pattern, .. }) if is_lit(pattern) => is_col(expr),
         _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::ops::Add;
+    use std::ops::{Add, Not};
 
     use super::*;
-    use datafusion::prelude::{case, col, lit, when};
+    use arrow::datatypes::DataType;
+    use datafusion::prelude::{case, cast, col, lit, when};
 
     #[test]
     fn test_fold_case_expr() {
@@ -472,6 +477,55 @@ mod tests {
         // can't rewrite to some thing else fancy on the right
         let expr = col("foo").is_null().not().and(col("foo").eq(col("foo")));
         let expected = expr.clone();
+        assert_eq!(expected, simplify_predicate(expr).unwrap());
+    }
+
+    #[test]
+    fn test_simplify_predicate_cast_left() {
+        let expr = cast(col("foo"), DataType::Utf8)
+            .is_null()
+            .not()
+            .and(col("foo").eq(lit("bar")));
+        let expected = col("foo").eq(lit("bar"));
+        assert_eq!(expected, simplify_predicate(expr).unwrap());
+    }
+
+    #[test]
+    fn test_simplify_predicate_cast_right() {
+        let expr = col("foo")
+            .is_null()
+            .not()
+            .and(cast(col("foo"), DataType::Utf8).eq(lit("bar")));
+        let expected = cast(col("foo"), DataType::Utf8).eq(lit("bar"));
+        assert_eq!(expected, simplify_predicate(expr).unwrap());
+    }
+
+    #[test]
+    fn test_simplify_predicate_cast_both() {
+        let expr = cast(col("foo"), DataType::Utf8)
+            .is_null()
+            .not()
+            .and(cast(col("foo"), DataType::Utf8).eq(lit("bar")));
+        let expected = cast(col("foo"), DataType::Utf8).eq(lit("bar"));
+        assert_eq!(expected, simplify_predicate(expr).unwrap());
+    }
+
+    fn like(expr: Expr, pattern: Expr) -> Expr {
+        let expr = Box::new(expr);
+        let pattern = Box::new(pattern);
+        Expr::Like(Like {
+            negated: false,
+            expr,
+            pattern,
+            escape_char: None,
+            case_insensitive: false,
+        })
+    }
+
+    #[test]
+    fn test_simplify_predicate_like() {
+        let expr = col("foo").is_null().not().and(like(col("foo"), lit("bar")));
+        let expected = like(col("foo"), lit("bar"));
         assert_eq!(expected, simplify_predicate(expr).unwrap());
     }
 }

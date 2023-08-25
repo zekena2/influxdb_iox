@@ -99,6 +99,14 @@ impl Extend<SequenceNumber> for SequenceNumberSet {
     }
 }
 
+impl Extend<SequenceNumberSet> for SequenceNumberSet {
+    fn extend<T: IntoIterator<Item = SequenceNumberSet>>(&mut self, iter: T) {
+        for new_set in iter {
+            self.add_set(&new_set);
+        }
+    }
+}
+
 impl FromIterator<SequenceNumber> for SequenceNumberSet {
     fn from_iter<T: IntoIterator<Item = SequenceNumber>>(iter: T) -> Self {
         Self(iter.into_iter().map(|v| v.get() as _).collect())
@@ -175,6 +183,29 @@ mod tests {
     }
 
     #[test]
+    fn test_extend_multiple_sets() {
+        let mut a = SequenceNumberSet::default();
+        a.add(SequenceNumber::new(7));
+
+        let b = [SequenceNumber::new(13), SequenceNumber::new(76)];
+        let c = [SequenceNumber::new(42), SequenceNumber::new(64)];
+
+        assert!(a.contains(SequenceNumber::new(7)));
+        for &num in [b, c].iter().flatten() {
+            assert!(!a.contains(num));
+        }
+
+        a.extend([
+            SequenceNumberSet::from_iter(b),
+            SequenceNumberSet::from_iter(c),
+        ]);
+        assert!(a.contains(SequenceNumber::new(7)));
+        for &num in [b, c].iter().flatten() {
+            assert!(a.contains(num));
+        }
+    }
+
+    #[test]
     fn test_collect() {
         let collect_set = [SequenceNumber::new(4), SequenceNumber::new(2)];
 
@@ -207,18 +238,18 @@ mod tests {
 
     #[test]
     fn test_intersect() {
-        let a = [0, i64::MAX, 40, 41, 42, 43, 44, 45]
+        let a = [0, u64::MAX, 40, 41, 42, 43, 44, 45]
             .into_iter()
             .map(SequenceNumber::new)
             .collect::<SequenceNumberSet>();
 
-        let b = [1, 5, i64::MAX, 42]
+        let b = [1, 5, u64::MAX, 42]
             .into_iter()
             .map(SequenceNumber::new)
             .collect::<SequenceNumberSet>();
 
         let intersection = intersect(&a, &b);
-        let want = [i64::MAX, 42]
+        let want = [u64::MAX, 42]
             .into_iter()
             .map(SequenceNumber::new)
             .collect::<SequenceNumberSet>();
@@ -226,21 +257,17 @@ mod tests {
         assert_eq!(intersection, want);
     }
 
-    /// Yield vec's of [`SequenceNumber`] derived from u64 values and cast to
-    /// i64.
+    /// Yield vec's of [`SequenceNumber`] derived from u64 values.
     ///
     /// This matches how the ingester allocates [`SequenceNumber`] - from a u64
     /// source.
     fn sequence_number_vec() -> impl Strategy<Value = Vec<SequenceNumber>> {
-        prop::collection::vec(0..u64::MAX, 0..1024).prop_map(|vec| {
-            vec.into_iter()
-                .map(|v| SequenceNumber::new(v as i64))
-                .collect()
-        })
+        prop::collection::vec(0..u64::MAX, 0..1024)
+            .prop_map(|vec| vec.into_iter().map(SequenceNumber::new).collect())
     }
 
     // The following tests compare to an order-independent HashSet, as the
-    // SequenceNumber uses the PartialOrd impl of the inner i64 for ordering,
+    // SequenceNumber uses the PartialOrd impl of the inner u64 for ordering,
     // resulting in incorrect output when compared to an ordered set of cast as
     // u64.
     //

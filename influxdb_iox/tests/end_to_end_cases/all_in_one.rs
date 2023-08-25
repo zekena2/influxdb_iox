@@ -33,8 +33,14 @@ async fn smoke() {
 
     // run query
     let sql = format!("select * from {table_name}");
-    let (batches, _schema) =
-        run_sql(sql, namespace, all_in_one.querier_grpc_connection(), None).await;
+    let (batches, _schema) = run_sql(
+        sql,
+        namespace,
+        all_in_one.querier_grpc_connection(),
+        None,
+        false,
+    )
+    .await;
 
     let expected = [
         "+------+------+--------------------------------+-----+",
@@ -78,10 +84,16 @@ async fn ephemeral_mode() {
     );
 
     // run query
-    // do not select time becasue it changes every time
+    // do not select time because it changes every time
     let sql = format!("select tag1, tag2, val from {table_name}");
-    let (batches, _schema) =
-        run_sql(sql, namespace, all_in_one.querier_grpc_connection(), None).await;
+    let (batches, _schema) = run_sql(
+        sql,
+        namespace,
+        all_in_one.querier_grpc_connection(),
+        None,
+        false,
+    )
+    .await;
 
     let expected = [
         "+------+------+-----+",

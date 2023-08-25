@@ -14,6 +14,9 @@ use futures::{stream::FuturesOrdered, StreamExt};
 use http::Response;
 use hyper::Body;
 use influxdb_iox_client::{
+    catalog::generated_types::{
+        catalog_service_client::CatalogServiceClient, GetPartitionsByTableIdRequest,
+    },
     connection::{Connection, GrpcConnection},
     schema::generated_types::{schema_service_client::SchemaServiceClient, GetSchemaRequest},
 };
@@ -334,6 +337,17 @@ impl MiniCluster {
         self.ingesters = restarted;
     }
 
+    /// Gracefully stop all ingesters and wait for them to exit.
+    ///
+    /// If the shutdown does not complete within
+    /// [`GRACEFUL_SERVER_STOP_TIMEOUT`] it is killed.
+    ///
+    /// [`GRACEFUL_SERVER_STOP_TIMEOUT`]:
+    ///     crate::server_fixture::GRACEFUL_SERVER_STOP_TIMEOUT
+    pub fn gracefully_stop_ingesters(&mut self) {
+        self.ingesters = vec![];
+    }
+
     /// Restart querier.
     ///
     /// This will break all currently connected clients!
@@ -424,6 +438,46 @@ impl MiniCluster {
         TableId::new(id)
     }
 
+    /// Get all partition keys for the given table.
+    pub async fn partition_keys(
+        &self,
+        table_name: &str,
+        namespace_name: Option<String>,
+    ) -> Vec<String> {
+        let namespace_name = namespace_name.unwrap_or(self.namespace().to_string());
+
+        let c = self
+            .router
+            .as_ref()
+            .expect("no router instance running")
+            .router_grpc_connection()
+            .into_grpc_connection();
+
+        let table_id = SchemaServiceClient::new(c.clone())
+            .get_schema(GetSchemaRequest {
+                namespace: namespace_name.clone(),
+            })
+            .await
+            .expect("failed to query for namespace ID")
+            .into_inner()
+            .schema
+            .unwrap()
+            .tables
+            .get(table_name)
+            .expect("table not found")
+            .id;
+
+        CatalogServiceClient::new(c)
+            .get_partitions_by_table_id(GetPartitionsByTableIdRequest { table_id })
+            .await
+            .expect("failed to query for partitions")
+            .into_inner()
+            .partitions
+            .into_iter()
+            .map(|p| p.key)
+            .collect()
+    }
+
     /// Writes the line protocol to the write_base/api/v2/write endpoint on the router into the
     /// org/bucket
     pub async fn write_to_router(
@@ -470,36 +524,59 @@ impl MiniCluster {
             .await?
             .into_inner();
 
-        let (msg, app_metadata) = next_message(&mut performed_query).await.unwrap();
-        assert!(matches!(msg, DecodedPayload::None), "{msg:?}");
-
-        let schema = next_message(&mut performed_query)
-            .await
-            .map(|(msg, _)| unwrap_schema(msg));
-
-        let mut record_batches = vec![];
-        while let Some((msg, _md)) = next_message(&mut performed_query).await {
-            let batch = unwrap_record_batch(msg);
-            record_batches.push(batch);
+        let mut partitions = vec![];
+        let mut current_partition = None;
+        while let Some((msg, app_metadata)) = next_message(&mut performed_query).await {
+            match msg {
+                DecodedPayload::None => {
+                    if let Some(p) = std::mem::take(&mut current_partition) {
+                        partitions.push(p);
+                    }
+                    current_partition = Some(IngesterResponsePartition {
+                        app_metadata,
+                        schema: None,
+                        record_batches: vec![],
+                    });
+                }
+                DecodedPayload::Schema(schema) => {
+                    let current_partition =
+                        current_partition.as_mut().expect("schema w/o partition");
+                    assert!(
+                        current_partition.schema.is_none(),
+                        "got two schemas for a single partition"
+                    );
+                    current_partition.schema = Some(schema);
+                }
+                DecodedPayload::RecordBatch(batch) => {
+                    let current_partition =
+                        current_partition.as_mut().expect("batch w/o partition");
+                    assert!(current_partition.schema.is_some(), "batch w/o schema");
+                    current_partition.record_batches.push(batch);
+                }
+            }
         }
 
-        Ok(IngesterResponse {
-            app_metadata,
-            schema,
-            record_batches,
-        })
+        if let Some(p) = current_partition {
+            partitions.push(p);
+        }
+
+        Ok(IngesterResponse { partitions })
     }
 
-    /// Ask all of the ingesters to persist their data.
+    /// Ask all of the ingesters to persist their data for the cluster namespace.
     pub async fn persist_ingesters(&self) {
+        self.persist_ingesters_by_namespace(None).await;
+    }
+
+    /// Ask all of the ingesters to persist their data for a specified namespace, or the cluster
+    /// namespace if none specified.
+    pub async fn persist_ingesters_by_namespace(&self, namespace: Option<String>) {
+        let namespace = namespace.unwrap_or_else(|| self.namespace().into());
         for ingester in &self.ingesters {
             let mut ingester_client =
                 influxdb_iox_client::ingester::Client::new(ingester.ingester_grpc_connection());
 
-            ingester_client
-                .persist(self.namespace().into())
-                .await
-                .unwrap();
+            ingester_client.persist(namespace.clone()).await.unwrap();
         }
     }
 
@@ -578,6 +655,11 @@ impl MiniCluster {
 /// Gathers data from ingester Flight queries
 #[derive(Debug)]
 pub struct IngesterResponse {
+    pub partitions: Vec<IngesterResponsePartition>,
+}
+
+#[derive(Debug)]
+pub struct IngesterResponsePartition {
     pub app_metadata: IngesterQueryResponseMetadata,
     pub schema: Option<SchemaRef>,
     pub record_batches: Vec<RecordBatch>,
@@ -696,18 +778,4 @@ async fn next_message(
     let app_metadata: IngesterQueryResponseMetadata = Message::decode(app_metadata).unwrap();
 
     Some((payload, app_metadata))
-}
-
-fn unwrap_schema(msg: DecodedPayload) -> SchemaRef {
-    match msg {
-        DecodedPayload::Schema(s) => s,
-        _ => panic!("Unexpected message type: {msg:?}"),
-    }
-}
-
-fn unwrap_record_batch(msg: DecodedPayload) -> RecordBatch {
-    match msg {
-        DecodedPayload::RecordBatch(b) => b,
-        _ => panic!("Unexpected message type: {msg:?}"),
-    }
 }

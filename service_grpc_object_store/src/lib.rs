@@ -7,12 +7,17 @@
     missing_debug_implementations,
     missing_docs,
     clippy::explicit_iter_loop,
+    // See https://github.com/influxdata/influxdb_iox/pull/1671
     clippy::future_not_send,
     clippy::use_self,
     clippy::clone_on_ref_ptr,
     clippy::todo,
-    clippy::dbg_macro
+    clippy::dbg_macro,
+    unused_crate_dependencies
 )]
+
+// Workaround for "unused crate" lint false positives.
+use workspace_hack as _;
 
 use futures::{stream::BoxStream, StreamExt};
 use generated_types::influxdata::iox::object_store::v1::*;
@@ -70,7 +75,7 @@ impl object_store_service_server::ObjectStoreService for ObjectStoreService {
         let path = ParquetFilePath::new(
             parquet_file.namespace_id,
             parquet_file.table_id,
-            parquet_file.partition_id,
+            &parquet_file.partition_id.clone(),
             parquet_file.object_store_id,
         );
         let path = path.object_store_path();
@@ -123,7 +128,7 @@ mod tests {
             let p1params = ParquetFileParams {
                 namespace_id: namespace.id,
                 table_id: table.id,
-                partition_id: partition.id,
+                partition_id: partition.transition_partition_id(),
                 object_store_id: Uuid::new_v4(),
                 min_time: Timestamp::new(1),
                 max_time: Timestamp::new(5),
@@ -144,7 +149,7 @@ mod tests {
         let path = ParquetFilePath::new(
             p1.namespace_id,
             p1.table_id,
-            p1.partition_id,
+            &p1.partition_id.clone(),
             p1.object_store_id,
         );
         let path = path.object_store_path();

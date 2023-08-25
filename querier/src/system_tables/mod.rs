@@ -3,6 +3,7 @@ use arrow::{datatypes::SchemaRef, error::Result as ArrowResult, record_batch::Re
 use async_trait::async_trait;
 use data_types::NamespaceId;
 use datafusion::error::DataFusionError;
+use datafusion::physical_plan::{DisplayAs, DisplayFormatType};
 use datafusion::{
     catalog::schema::SchemaProvider,
     datasource::TableProvider,
@@ -15,6 +16,7 @@ use datafusion::{
     },
     prelude::Expr,
 };
+use std::collections::HashMap;
 use std::{
     any::Any,
     pin::Pin,
@@ -28,19 +30,26 @@ pub const SYSTEM_SCHEMA: &str = "system";
 
 const QUERIES_TABLE: &str = "queries";
 
-const ALL_SYSTEM_TABLES: &[&str] = &[QUERIES_TABLE];
-
 pub struct SystemSchemaProvider {
-    queries: Arc<dyn TableProvider>,
+    tables: HashMap<&'static str, Arc<dyn TableProvider>>,
 }
 
 impl SystemSchemaProvider {
-    pub fn new(query_log: Arc<QueryLog>, namespace_id: NamespaceId) -> Self {
-        let queries = Arc::new(SystemTableProvider {
-            table: Arc::new(queries::QueriesTable::new(query_log, Some(namespace_id))),
-        });
+    pub fn new(
+        query_log: Arc<QueryLog>,
+        namespace_id: NamespaceId,
+        include_debug_info: bool,
+    ) -> Self {
+        let mut tables: HashMap<&'static str, Arc<dyn TableProvider>> = HashMap::new();
 
-        Self { queries }
+        if include_debug_info {
+            let queries = Arc::new(SystemTableProvider {
+                table: Arc::new(queries::QueriesTable::new(query_log, Some(namespace_id))),
+            });
+            tables.insert(QUERIES_TABLE, queries);
+        }
+
+        Self { tables }
     }
 }
 
@@ -51,23 +60,21 @@ impl SchemaProvider for SystemSchemaProvider {
     }
 
     fn table_names(&self) -> Vec<String> {
-        ALL_SYSTEM_TABLES
-            .iter()
-            .map(|name| name.to_string())
-            .collect()
+        let mut names = self
+            .tables
+            .keys()
+            .map(|s| (*s).to_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
     }
 
     async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
-        match name {
-            QUERIES_TABLE => Some(Arc::clone(&self.queries)),
-            _ => None,
-        }
+        self.tables.get(name).cloned()
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        ALL_SYSTEM_TABLES
-            .iter()
-            .any(|&system_table| system_table == name)
+        self.tables.contains_key(name)
     }
 }
 
@@ -134,9 +141,7 @@ struct SystemTableExecutionPlan<T> {
 
 impl<T> std::fmt::Debug for SystemTableExecutionPlan<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SystemTableExecutionPlan")
-            .field("projection", &self.projection)
-            .finish()
+        self.fmt_as(DisplayFormatType::Default, f)
     }
 }
 
@@ -183,6 +188,17 @@ impl<T: IoxSystemTable + 'static> ExecutionPlan for SystemTableExecutionPlan<T> 
 
     fn statistics(&self) -> Statistics {
         Statistics::default()
+    }
+}
+
+impl<T> DisplayAs for SystemTableExecutionPlan<T> {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => f
+                .debug_struct("SystemTableExecutionPlan")
+                .field("projection", &self.projection)
+                .finish(),
+        }
     }
 }
 

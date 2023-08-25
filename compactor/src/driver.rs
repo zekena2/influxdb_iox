@@ -1,10 +1,15 @@
 use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 
+use chrono::Utc;
+use compactor_scheduler::CompactionJob;
 use data_types::{CompactionLevel, ParquetFile, ParquetFileParams, PartitionId};
 use futures::{stream, StreamExt, TryStreamExt};
+use iox_query::exec::query_tracing::send_metrics_to_tracing;
 use observability_deps::tracing::info;
 use parquet_file::ParquetFilePath;
 use tokio::sync::watch::Sender;
+use trace::span::Span;
+use trace::span::SpanRecorder;
 use tracker::InstrumentedAsyncSemaphore;
 
 use crate::{
@@ -15,7 +20,7 @@ use crate::{
         Components,
     },
     error::{DynError, ErrorKind, SimpleError},
-    file_classification::{FileClassification, FilesForProgress, FilesToSplitOrCompact},
+    file_classification::{FileClassification, FilesForProgress},
     partition_info::PartitionInfo,
     PlanIR, RoundInfo,
 };
@@ -23,19 +28,29 @@ use crate::{
 /// Tries to compact all eligible partitions, up to
 /// partition_concurrency at a time.
 pub async fn compact(
+    trace_collector: Option<Arc<dyn trace::TraceCollector>>,
     partition_concurrency: NonZeroUsize,
     partition_timeout: Duration,
     df_semaphore: Arc<InstrumentedAsyncSemaphore>,
     components: &Arc<Components>,
 ) {
     components
-        .partition_stream
+        .compaction_job_stream
         .stream()
-        .map(|partition_id| {
+        .map(|job| {
             let components = Arc::clone(components);
 
+            // A root span is created for each compaction job (a.k.a. partition).
+            // Later this can be linked to the
+            // scheduler's span via something passed through compaction_job_stream.
+            let root_span: Option<Span> = trace_collector
+                .as_ref()
+                .map(|collector| Span::root("compaction", Arc::clone(collector)));
+            let span = SpanRecorder::new(root_span);
+
             compact_partition(
-                partition_id,
+                span,
+                job,
                 partition_timeout,
                 Arc::clone(&df_semaphore),
                 components,
@@ -47,12 +62,15 @@ pub async fn compact(
 }
 
 async fn compact_partition(
-    partition_id: PartitionId,
+    mut span: SpanRecorder,
+    job: CompactionJob,
     partition_timeout: Duration,
     df_semaphore: Arc<InstrumentedAsyncSemaphore>,
     components: Arc<Components>,
 ) {
-    info!(partition_id = partition_id.get(), "compact partition",);
+    let partition_id = job.partition_id;
+    info!(partition_id = partition_id.get(), timeout = ?partition_timeout, "compact partition",);
+    span.set_metadata("partition_id", partition_id.get().to_string());
     let scratchpad = components.scratchpad_gen.pad();
 
     let res = timeout_with_progress_checking(partition_timeout, |transmit_progress_signal| {
@@ -60,13 +78,14 @@ async fn compact_partition(
         let scratchpad = Arc::clone(&scratchpad);
         async {
             try_compact_partition(
-                partition_id,
+                span,
+                job.clone(),
                 df_semaphore,
                 components,
                 scratchpad,
                 transmit_progress_signal,
             )
-            .await
+            .await // errors detected in the CompactionJob update_job_status(), will be handled in the timeout_with_progress_checking
         }
     })
     .await;
@@ -74,7 +93,7 @@ async fn compact_partition(
     let res = match res {
         // If `try_compact_partition` timed out and didn't make any progress, something is wrong
         // with this partition and it should get added to the `skipped_compactions` table by
-        // sending a timeout error to the `partition_done_sink`.
+        // sending a timeout error to the `compaction_job_done_sink`.
         TimeoutWithProgress::NoWorkTimeOutError => Err(Box::new(SimpleError::new(
             ErrorKind::Timeout,
             "timeout without making any progress",
@@ -84,17 +103,16 @@ async fn compact_partition(
         TimeoutWithProgress::SomeWorkTryAgain => Ok(()),
         // If `try_compact_partition` finished before the timeout, return the `Result` that it
         // returned. If an error was returned, there could be something wrong with the partiton;
-        // let the `partition_done_sink` decide if the error means the partition should be added
+        // let the `compaction_job_done_sink` decide if the error means the partition should be added
         // to the `skipped_compactions` table or not.
         TimeoutWithProgress::Completed(res) => res,
     };
-    components
-        .partition_done_sink
-        .record(partition_id, res)
-        .await;
+
+    // TODO: how handle errors detected in the CompactionJob ending actions?
+    let _ = components.compaction_job_done_sink.record(job, res).await;
 
     scratchpad.clean().await;
-    info!(partition_id = partition_id.get(), "compacted partition",);
+    info!(partition_id = partition_id.get(), "compaction job done",);
 }
 
 /// Main function to compact files of a single partition.
@@ -184,22 +202,33 @@ async fn compact_partition(
 ///   . If there are no L0s files in the partition, the first round can just compact L1s and L2s to L2s
 ///   . Round 2 happens or not depends on the stop condition
 async fn try_compact_partition(
-    partition_id: PartitionId,
+    span: SpanRecorder,
+    job: CompactionJob,
     df_semaphore: Arc<InstrumentedAsyncSemaphore>,
     components: Arc<Components>,
     scratchpad_ctx: Arc<dyn Scratchpad>,
     transmit_progress_signal: Sender<bool>,
 ) -> Result<(), DynError> {
+    let partition_id = job.partition_id;
     let mut files = components.partition_files_source.fetch(partition_id).await;
     let partition_info = components.partition_info_source.fetch(partition_id).await?;
     let transmit_progress_signal = Arc::new(transmit_progress_signal);
 
     // loop for each "Round", consider each file in the partition
+    // for partitions with a lot of compaction work to do, keeping the work divided into multiple rounds,
+    // with mutliple calls to execute_branch is important to frequently clean the scratchpad and prevent
+    // high memory use.
     loop {
-        let round_info = components
-            .round_info_source
-            .calculate(&partition_info, &files)
-            .await?;
+        let round_span = span.child("round");
+
+        if files.is_empty() {
+            // This should be unreachable, but can happen when someone is manually activiting partitions for compaction.
+            info!(
+                partition_id = partition_info.partition_id.get(),
+                "that's odd - no files to compact in partition"
+            );
+            return Ok(());
+        }
 
         // This is the stop condition which will be different for different version of compaction
         // and describe where the filter is created at version_specific_partition_filters function
@@ -211,13 +240,14 @@ async fn try_compact_partition(
             return Ok(());
         }
 
-        let (files_now, files_later) = components.round_split.split(files, round_info);
-
-        // Each branch must not overlap with each other
-        let branches = components
-            .divide_initial
-            .divide(files_now, round_info)
-            .into_iter();
+        let (round_info, branches, files_later) = components
+            .round_info_source
+            .calculate(
+                Arc::<Components>::clone(&components),
+                &partition_info,
+                files,
+            )
+            .await?;
 
         files = files_later;
 
@@ -236,10 +266,14 @@ async fn try_compact_partition(
                 let df_semaphore = Arc::clone(&df_semaphore);
                 let transmit_progress_signal = Arc::clone(&transmit_progress_signal);
                 let scratchpad = Arc::clone(&scratchpad_ctx);
+                let job = job.clone();
+                let branch_span = round_span.child("branch");
+                let round_info = round_info.clone();
 
                 async move {
                     execute_branch(
-                        partition_id,
+                        branch_span,
+                        job,
                         branch,
                         df_semaphore,
                         components,
@@ -262,7 +296,8 @@ async fn try_compact_partition(
 /// Compact or split given files
 #[allow(clippy::too_many_arguments)]
 async fn execute_branch(
-    partition_id: PartitionId,
+    span: SpanRecorder,
+    job: CompactionJob,
     branch: Vec<ParquetFile>,
     df_semaphore: Arc<InstrumentedAsyncSemaphore>,
     components: Arc<Components>,
@@ -277,8 +312,6 @@ async fn execute_branch(
     // files. Check that the catalog state for the files in this set is the same before committing and, if not,
     // throw away the compaction work we've done.
     let saved_parquet_file_state = SavedParquetFileState::from(&branch);
-
-    let input_paths: Vec<ParquetFilePath> = branch.iter().map(ParquetFilePath::from).collect();
 
     // Identify the target level and files that should be
     // compacted together, upgraded, and kept for next round of
@@ -306,88 +339,128 @@ async fn execute_branch(
     }
 
     let FilesForProgress {
-        upgrade,
+        mut upgrade,
         split_or_compact,
     } = files_to_make_progress_on;
 
-    // Compact
-    let created_file_params = run_plans(
+    let paths = split_or_compact.file_input_paths();
+    let object_store_ids = scratchpad_ctx.uuids(&paths);
+    let plans = components.ir_planner.create_plans(
+        Arc::clone(&partition_info),
+        target_level,
         split_or_compact.clone(),
-        &partition_info,
-        &components,
-        target_level,
-        Arc::clone(&df_semaphore),
-        Arc::<dyn Scratchpad>::clone(&scratchpad_ctx),
-    )
-    .await?;
+        object_store_ids,
+        paths,
+    );
 
-    // upload files to real object store
-    let created_file_params = upload_files_to_object_store(
-        created_file_params,
-        Arc::<dyn Scratchpad>::clone(&scratchpad_ctx),
-    )
-    .await;
+    let mut files_next: Vec<ParquetFile> = Vec::new();
 
-    for file_param in &created_file_params {
-        info!(
-            partition_id = partition_info.partition_id.get(),
-            uuid = file_param.object_store_id.to_string(),
-            "uploaded file to objectstore",
-        );
+    // The number of plans is often small (1), but can be thousands, especially in vertical splitting
+    // scenarios when the partition is highly backlogged.  So we chunk the plans into groups to control
+    // memory usage (all files for all plans in a chunk are loaded to the scratchpad at once), and to
+    // allow incremental catalog & progress updates.  But the chunk size should still be large enough
+    // to facilitate concurrency in plan execution, which can be accomplished with a small multiple on
+    // the concurrency limit.
+    let mut chunks = plans.into_iter().peekable();
+    while chunks.peek().is_some() {
+        // 4x run_plans' concurrency limit will allow adequate concurrency.
+        let chunk: Vec<PlanIR> = chunks
+            .by_ref()
+            .take(df_semaphore.total_permits() * 4)
+            .collect();
+
+        let files_to_delete = chunk
+            .iter()
+            .flat_map(|plan| plan.input_parquet_files())
+            .collect();
+
+        // Compact & Split
+        let created_file_params = run_plans(
+            span.child("run_plans"),
+            chunk,
+            &partition_info,
+            &components,
+            Arc::clone(&df_semaphore),
+            Arc::<dyn Scratchpad>::clone(&scratchpad_ctx),
+        )
+        .await?;
+
+        // upload files to real object store
+        let upload_span = span.child("upload_objects");
+        let created_file_params = upload_files_to_object_store(
+            created_file_params,
+            Arc::<dyn Scratchpad>::clone(&scratchpad_ctx),
+        )
+        .await;
+        drop(upload_span);
+
+        for file_param in &created_file_params {
+            info!(
+                partition_id = partition_info.partition_id.get(),
+                uuid = file_param.object_store_id.to_string(),
+                bytes = file_param.file_size_bytes,
+                "uploaded file to objectstore",
+            );
+        }
+
+        let created_file_paths: Vec<ParquetFilePath> = created_file_params
+            .iter()
+            .map(ParquetFilePath::from)
+            .collect();
+
+        // conditionally (if not shaddow mode) remove the newly created files from the scratchpad.
+        scratchpad_ctx
+            .clean_written_from_scratchpad(&created_file_paths)
+            .await;
+
+        // Update the catalog to reflect the newly created files, soft delete the compacted
+        // files and update the upgraded files
+        let (created_files, upgraded_files) = update_catalog(
+            Arc::clone(&components),
+            job.clone(),
+            &saved_parquet_file_state,
+            files_to_delete,
+            upgrade,
+            created_file_params,
+            target_level,
+        )
+        .await?;
+
+        // we only need to upgrade files on the first iteration, so empty the upgrade list for next loop.
+        upgrade = Vec::new();
+
+        // Report to `timeout_with_progress_checking` that some progress has been made; stop
+        // if sending this signal fails because something has gone terribly wrong for the other
+        // end of the channel to not be listening anymore.
+        if let Err(e) = transmit_progress_signal.send(true) {
+            return Err(Box::new(e));
+        }
+
+        // track this chunk files to return later
+        files_next.extend(created_files);
+        files_next.extend(upgraded_files);
     }
 
-    // clean scratchpad
-    scratchpad_ctx.clean_from_scratchpad(&input_paths).await;
-
-    // Update the catalog to reflect the newly created files, soft delete the compacted
-    // files and update the upgraded files
-    let files_to_delete = split_or_compact.into_files();
-    let (created_files, upgraded_files) = update_catalog(
-        Arc::clone(&components),
-        partition_id,
-        saved_parquet_file_state,
-        files_to_delete,
-        upgrade,
-        created_file_params,
-        target_level,
-    )
-    .await;
-
-    // Report to `timeout_with_progress_checking` that some progress has been made; stop
-    // if sending this signal fails because something has gone terribly wrong for the other
-    // end of the channel to not be listening anymore.
-    if let Err(e) = transmit_progress_signal.send(true) {
-        return Err(Box::new(e));
-    }
-
-    // Extend created files, upgraded files and files_to_keep to files_next
-    let mut files_next = created_files;
-    files_next.extend(upgraded_files);
     files_next.extend(files_to_keep);
-
     Ok(files_next)
 }
 
 /// Compact or split given files
 async fn run_plans(
-    split_or_compact: FilesToSplitOrCompact,
+    span: SpanRecorder,
+    plans: Vec<PlanIR>,
     partition_info: &Arc<PartitionInfo>,
     components: &Arc<Components>,
-    target_level: CompactionLevel,
     df_semaphore: Arc<InstrumentedAsyncSemaphore>,
     scratchpad_ctx: Arc<dyn Scratchpad>,
 ) -> Result<Vec<ParquetFileParams>, DynError> {
-    // stage files
-    let input_uuids_inpad = scratchpad_ctx
-        .load_to_scratchpad(&split_or_compact.file_input_paths())
-        .await;
+    let paths: Vec<ParquetFilePath> = plans.iter().flat_map(|plan| plan.input_paths()).collect();
 
-    let plans = components.ir_planner.create_plans(
-        Arc::clone(partition_info),
-        target_level,
-        split_or_compact,
-        input_uuids_inpad,
-    );
+    // stage files.  This could move to execute_plan to reduce peak scratchpad memory use, but that would
+    // cost some concurrency in object downloads.
+    let download_span = span.child("download_objects");
+    let _ = scratchpad_ctx.load_to_scratchpad(&paths).await;
+    drop(download_span);
 
     info!(
         partition_id = partition_info.partition_id.get(),
@@ -403,10 +476,12 @@ async fn run_plans(
     )
     .map(|plan_ir| {
         execute_plan(
+            span.child("execute_plan"),
             plan_ir,
             partition_info,
             components,
             Arc::clone(&df_semaphore),
+            Arc::<dyn Scratchpad>::clone(&scratchpad_ctx),
         )
     })
     .buffer_unordered(df_semaphore.total_permits())
@@ -417,11 +492,17 @@ async fn run_plans(
 }
 
 async fn execute_plan(
+    mut span: SpanRecorder,
     plan_ir: PlanIR,
     partition_info: &Arc<PartitionInfo>,
     components: &Arc<Components>,
     df_semaphore: Arc<InstrumentedAsyncSemaphore>,
+    scratchpad_ctx: Arc<dyn Scratchpad>,
 ) -> Result<Vec<ParquetFileParams>, DynError> {
+    span.set_metadata("input_files", plan_ir.input_files().len().to_string());
+    span.set_metadata("input_bytes", plan_ir.input_bytes().to_string());
+    span.set_metadata("reason", plan_ir.reason());
+
     let create = {
         // Adjust concurrency based on the column count in the partition.
         let permits = compute_permits(df_semaphore.total_permits(), partition_info.column_count());
@@ -446,10 +527,13 @@ async fn execute_plan(
         // We guard the DataFusion planning (that doesn't perform any IO) via the semaphore as well in case
         // DataFusion ever starts to pre-allocate buffers during the physical planning. To the best of our
         // knowledge, this is currently (2023-01-25) not the case but if this ever changes, then we are prepared.
+        let permit_span = span.child("acquire_permit");
         let permit = df_semaphore
             .acquire_many(permits, None)
             .await
             .expect("semaphore not closed");
+        drop(permit_span);
+
         info!(
             partition_id = partition_info.partition_id.get(),
             column_count = partition_info.column_count(),
@@ -459,11 +543,14 @@ async fn execute_plan(
             "job semaphore acquired",
         );
 
+        let df_span = span.child_span("data_fusion");
         let plan = components
             .df_planner
             .plan(&plan_ir, Arc::clone(partition_info))
             .await?;
-        let streams = components.df_plan_exec.exec(plan);
+        let streams = components.df_plan_exec.exec(Arc::<
+            dyn datafusion::physical_plan::ExecutionPlan,
+        >::clone(&plan));
         let job = components.parquet_files_sink.stream_into_file_sink(
             streams,
             Arc::clone(partition_info),
@@ -474,7 +561,18 @@ async fn execute_plan(
         // TODO: react to OOM and try to divide branch
         let res = job.await;
 
+        if let Some(span) = &df_span {
+            send_metrics_to_tracing(Utc::now(), span, plan.as_ref(), true);
+        };
+
         drop(permit);
+        drop(df_span);
+
+        // inputs can be removed from the scratchpad as soon as we're done with compaction.
+        scratchpad_ctx
+            .clean_from_scratchpad(&plan_ir.input_paths())
+            .await;
+
         info!(
             partition_id = partition_info.partition_id.get(),
             plan_id, "job semaphore released",
@@ -483,6 +581,16 @@ async fn execute_plan(
         res?
     };
 
+    span.set_metadata("output_files", create.len().to_string());
+    span.set_metadata(
+        "output_bytes",
+        create
+            .iter()
+            .map(|f| f.file_size_bytes as usize)
+            .sum::<usize>()
+            .to_string(),
+    );
+
     Ok(create)
 }
 
@@ -490,7 +598,7 @@ async fn upload_files_to_object_store(
     created_file_params: Vec<ParquetFileParams>,
     scratchpad_ctx: Arc<dyn Scratchpad>,
 ) -> Vec<ParquetFileParams> {
-    // Ipload files to real object store
+    // Upload files to real object store
     let output_files: Vec<ParquetFilePath> = created_file_params.iter().map(|p| p.into()).collect();
     let output_uuids = scratchpad_ctx.make_public(&output_files).await;
 
@@ -518,31 +626,32 @@ async fn fetch_and_save_parquet_file_state(
 /// Return created and upgraded files
 async fn update_catalog(
     components: Arc<Components>,
-    partition_id: PartitionId,
-    saved_parquet_file_state: SavedParquetFileState,
+    job: CompactionJob,
+    saved_parquet_file_state: &SavedParquetFileState,
     files_to_delete: Vec<ParquetFile>,
     files_to_upgrade: Vec<ParquetFile>,
     file_params_to_create: Vec<ParquetFileParams>,
     target_level: CompactionLevel,
-) -> (Vec<ParquetFile>, Vec<ParquetFile>) {
+) -> Result<(Vec<ParquetFile>, Vec<ParquetFile>), DynError> {
+    let partition_id = job.partition_id;
     let current_parquet_file_state =
         fetch_and_save_parquet_file_state(&components, partition_id).await;
 
     // Right now this only logs; in the future we might decide not to commit these changes
     let _ignore = components
         .changed_files_filter
-        .apply(&saved_parquet_file_state, &current_parquet_file_state);
+        .apply(saved_parquet_file_state, &current_parquet_file_state);
 
     let created_ids = components
         .commit
         .commit(
-            partition_id,
+            job,
             &files_to_delete,
             &files_to_upgrade,
             &file_params_to_create,
             target_level,
         )
-        .await;
+        .await?;
 
     // Update created ids to their corresponding file params
     let created_file_params = file_params_to_create
@@ -560,7 +669,7 @@ async fn update_catalog(
         })
         .collect::<Vec<_>>();
 
-    (created_file_params, upgraded_files)
+    Ok((created_file_params, upgraded_files))
 }
 
 // SINGLE_THREADED_COLUMN_COUNT is the number of columns requiring a partition be compacted single threaded.

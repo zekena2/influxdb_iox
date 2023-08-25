@@ -6,14 +6,15 @@ use crate::{
 };
 use arrow::datatypes::{DataType, Fields, Schema as ArrowSchema, SchemaRef};
 use datafusion::{
-    datasource::{listing::PartitionedFile, object_store::ObjectStoreUrl},
+    datasource::{
+        listing::PartitionedFile,
+        object_store::ObjectStoreUrl,
+        physical_plan::{FileScanConfig, ParquetExec},
+    },
     physical_expr::PhysicalSortExpr,
     physical_plan::{
-        empty::EmptyExec,
-        expressions::Column,
-        file_format::{FileScanConfig, ParquetExec},
-        union::UnionExec,
-        ColumnStatistics, ExecutionPlan, Statistics,
+        empty::EmptyExec, expressions::Column, union::UnionExec, ColumnStatistics, ExecutionPlan,
+        Statistics,
     },
     scalar::ScalarValue,
 };
@@ -198,10 +199,13 @@ pub fn chunks_to_physical_nodes(
         // ensure that chunks are actually ordered by chunk order
         chunks.sort_by_key(|(_meta, c)| c.order());
 
-        let num_rows = chunks
-            .iter()
-            .map(|(_meta, c)| c.summary().total_count() as usize)
-            .sum::<usize>();
+        let num_rows = chunks.iter().map(|(_meta, c)| c.stats().num_rows).fold(
+            Some(0usize),
+            |accu, x| match (accu, x) {
+                (Some(accu), Some(x)) => Some(accu + x),
+                _ => None,
+            },
+        );
         let chunk_order_min = chunks
             .iter()
             .map(|(_meta, c)| c.order().get())
@@ -265,7 +269,7 @@ pub fn chunks_to_physical_nodes(
         };
 
         let statistics = Statistics {
-            num_rows: Some(num_rows),
+            num_rows,
             total_byte_size: None,
             column_statistics: Some(
                 schema
@@ -297,6 +301,9 @@ pub fn chunks_to_physical_nodes(
             // Also see https://github.com/apache/arrow-datafusion/issues/5614
             is_exact: false,
         };
+
+        // No sort order is represented by an empty Vec
+        let output_ordering = vec![output_ordering.unwrap_or_default()];
 
         let base_config = FileScanConfig {
             object_store_url,
@@ -347,7 +354,6 @@ mod tests {
     use crate::{
         chunk_order_field,
         test::{format_execution_plan, TestChunk},
-        QueryChunkMeta,
     };
 
     use super::*;

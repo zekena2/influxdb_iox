@@ -1,4 +1,5 @@
 use arrow::datatypes::SchemaRef;
+use datafusion::physical_expr::execution_props::ExecutionProps;
 use influxdb_influxql_parser::show_field_keys::ShowFieldKeysStatement;
 use influxdb_influxql_parser::show_measurements::ShowMeasurementsStatement;
 use influxdb_influxql_parser::show_tag_keys::ShowTagKeysStatement;
@@ -16,7 +17,9 @@ use datafusion::datasource::provider_as_source;
 use datafusion::execution::context::{SessionState, TaskContext};
 use datafusion::logical_expr::{AggregateUDF, LogicalPlan, ScalarUDF, TableSource};
 use datafusion::physical_expr::PhysicalSortExpr;
-use datafusion::physical_plan::{Partitioning, SendableRecordBatchStream};
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, Partitioning, SendableRecordBatchStream,
+};
 use datafusion::{
     error::{DataFusionError, Result},
     physical_plan::ExecutionPlan,
@@ -61,6 +64,10 @@ impl<'a> SchemaProvider for ContextSchemaProvider<'a> {
     fn table_schema(&self, name: &str) -> Option<Schema> {
         self.tables.get(name).map(|(_, s)| s.clone())
     }
+
+    fn execution_props(&self) -> &ExecutionProps {
+        self.state.execution_props()
+    }
 }
 
 /// A physical operator that overrides the `schema` API,
@@ -73,7 +80,7 @@ struct SchemaExec {
 
 impl Debug for SchemaExec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SchemaExec")
+        self.fmt_as(DisplayFormatType::Default, f)
     }
 }
 
@@ -95,7 +102,7 @@ impl ExecutionPlan for SchemaExec {
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        unimplemented!()
+        vec![Arc::clone(&self.input)]
     }
 
     fn with_new_children(
@@ -115,6 +122,16 @@ impl ExecutionPlan for SchemaExec {
 
     fn statistics(&self) -> Statistics {
         self.input.statistics()
+    }
+}
+
+impl DisplayAs for SchemaExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "SchemaExec")
+            }
+        }
     }
 }
 

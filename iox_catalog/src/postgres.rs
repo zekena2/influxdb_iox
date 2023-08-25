@@ -1,38 +1,50 @@
 //! A Postgres backed implementation of the Catalog
 
+use crate::interface::{verify_sort_key_length, MAX_PARQUET_FILES_SELECTED_ONCE_FOR_DELETE};
 use crate::{
     interface::{
         self, CasFailure, Catalog, ColumnRepo, ColumnTypeMismatchSnafu, Error, NamespaceRepo,
         ParquetFileRepo, PartitionRepo, RepoCollection, Result, SoftDeletedRows, TableRepo,
-        MAX_PARQUET_FILES_SELECTED_ONCE,
+        MAX_PARQUET_FILES_SELECTED_ONCE_FOR_RETENTION,
     },
     kafkaless_transition::{
         SHARED_QUERY_POOL, SHARED_QUERY_POOL_ID, SHARED_TOPIC_ID, SHARED_TOPIC_NAME,
         TRANSITION_SHARD_ID, TRANSITION_SHARD_INDEX,
     },
     metrics::MetricDecorator,
+    migrate::IOxMigrator,
     DEFAULT_MAX_COLUMNS_PER_TABLE, DEFAULT_MAX_TABLES,
 };
 use async_trait::async_trait;
+use data_types::SortedColumnSet;
 use data_types::{
-    Column, ColumnType, CompactionLevel, Namespace, NamespaceId, NamespaceName, ParquetFile,
-    ParquetFileId, ParquetFileParams, Partition, PartitionId, PartitionKey, SkippedCompaction,
-    Table, TableId, Timestamp,
+    partition_template::{
+        NamespacePartitionTemplateOverride, TablePartitionTemplateOverride, TemplatePart,
+    },
+    Column, ColumnType, CompactionLevel, Namespace, NamespaceId, NamespaceName,
+    NamespaceServiceProtectionLimitsOverride, ParquetFile, ParquetFileId, ParquetFileParams,
+    Partition, PartitionHashId, PartitionId, PartitionKey, SkippedCompaction, Table, TableId,
+    Timestamp, TransitionPartitionId,
 };
 use iox_time::{SystemProvider, TimeProvider};
+use metric::{Attributes, Instrument, MetricKind};
 use observability_deps::tracing::{debug, info, warn};
+use once_cell::sync::Lazy;
+use parking_lot::{RwLock, RwLockWriteGuard};
 use snafu::prelude::*;
 use sqlx::{
-    migrate::Migrator,
     postgres::{PgConnectOptions, PgPoolOptions},
     types::Uuid,
     Acquire, ConnectOptions, Executor, Postgres, Row,
 };
 use sqlx_hotswap_pool::HotSwapPool;
+use std::borrow::Cow;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{collections::HashMap, fmt::Display, str::FromStr, sync::Arc, time::Duration};
 
-static MIGRATOR: Migrator = sqlx::migrate!();
+static MIGRATOR: Lazy<IOxMigrator> =
+    Lazy::new(|| IOxMigrator::try_from(&sqlx::migrate!()).expect("valid migration"));
 
 /// Postgres connection options.
 #[derive(Debug, Clone)]
@@ -105,19 +117,13 @@ pub struct PostgresCatalog {
     options: PostgresConnectionOptions,
 }
 
-// struct to get return value from "select count(id) ..." query
-#[derive(sqlx::FromRow)]
-struct Count {
-    count: i64,
-}
-
 impl PostgresCatalog {
     /// Connect to the catalog store.
     pub async fn connect(
         options: PostgresConnectionOptions,
         metrics: Arc<metric::Registry>,
     ) -> Result<Self> {
-        let pool = new_pool(&options)
+        let pool = new_pool(&options, Arc::clone(&metrics))
             .await
             .map_err(|e| Error::SqlxError { source: e })?;
 
@@ -131,6 +137,11 @@ impl PostgresCatalog {
 
     fn schema_name(&self) -> &str {
         &self.options.schema_name
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_pool(self) -> HotSwapPool<Postgres> {
+        self.pool
     }
 }
 
@@ -305,6 +316,7 @@ DO NOTHING;
         ))
     }
 
+    #[cfg(test)]
     fn metrics(&self) -> Arc<metric::Registry> {
         Arc::clone(&self.metrics)
     }
@@ -314,17 +326,122 @@ DO NOTHING;
     }
 }
 
+/// Adapter to connect sqlx pools with our metrics system.
+#[derive(Debug, Clone, Default)]
+struct PoolMetrics {
+    /// Actual shared state.
+    state: Arc<PoolMetricsInner>,
+}
+
+/// Inner state of [`PoolMetrics`] that is wrapped into an [`Arc`].
+#[derive(Debug, Default)]
+struct PoolMetricsInner {
+    /// Next pool ID.
+    pool_id_gen: AtomicU64,
+
+    /// Set of known pools and their ID labels.
+    ///
+    /// Note: The pool is internally ref-counted via an [`Arc`]. Holding a reference does NOT prevent it from being closed.
+    pools: RwLock<Vec<(Arc<str>, sqlx::Pool<Postgres>)>>,
+}
+
+impl PoolMetrics {
+    /// Create new pool metrics.
+    fn new(metrics: Arc<metric::Registry>) -> Self {
+        metrics.register_instrument("iox_catalog_postgres", Self::default)
+    }
+
+    /// Register a new pool.
+    fn register_pool(&self, pool: sqlx::Pool<Postgres>) {
+        let id = self
+            .state
+            .pool_id_gen
+            .fetch_add(1, Ordering::SeqCst)
+            .to_string()
+            .into();
+        let mut pools = self.state.pools.write();
+        pools.push((id, pool));
+    }
+
+    /// Remove closed pools from given list.
+    fn clean_pools(pools: &mut Vec<(Arc<str>, sqlx::Pool<Postgres>)>) {
+        pools.retain(|(_id, p)| !p.is_closed());
+    }
+}
+
+impl Instrument for PoolMetrics {
+    fn report(&self, reporter: &mut dyn metric::Reporter) {
+        let mut pools = self.state.pools.write();
+        Self::clean_pools(&mut pools);
+        let pools = RwLockWriteGuard::downgrade(pools);
+
+        reporter.start_metric(
+            "sqlx_postgres_pools",
+            "Number of pools that sqlx uses",
+            MetricKind::U64Gauge,
+        );
+        reporter.report_observation(
+            &Attributes::from([]),
+            metric::Observation::U64Gauge(pools.len() as u64),
+        );
+        reporter.finish_metric();
+
+        reporter.start_metric(
+            "sqlx_postgres_connections",
+            "Number of connections within the postgres connection pool that sqlx uses",
+            MetricKind::U64Gauge,
+        );
+        for (id, p) in pools.iter() {
+            reporter.report_observation(
+                &Attributes::from([
+                    ("pool_id", Cow::Owned(id.as_ref().to_owned())),
+                    ("state", Cow::Borrowed("active")),
+                ]),
+                metric::Observation::U64Gauge(p.size() as u64),
+            );
+            reporter.report_observation(
+                &Attributes::from([
+                    ("pool_id", Cow::Owned(id.as_ref().to_owned())),
+                    ("state", Cow::Borrowed("idle")),
+                ]),
+                metric::Observation::U64Gauge(p.num_idle() as u64),
+            );
+            reporter.report_observation(
+                &Attributes::from([
+                    ("pool_id", Cow::Owned(id.as_ref().to_owned())),
+                    ("state", Cow::Borrowed("max")),
+                ]),
+                metric::Observation::U64Gauge(p.options().get_max_connections() as u64),
+            );
+            reporter.report_observation(
+                &Attributes::from([
+                    ("pool_id", Cow::Owned(id.as_ref().to_owned())),
+                    ("state", Cow::Borrowed("min")),
+                ]),
+                metric::Observation::U64Gauge(p.options().get_min_connections() as u64),
+            );
+        }
+
+        reporter.finish_metric();
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 /// Creates a new [`sqlx::Pool`] from a database config and an explicit DSN.
 ///
 /// This function doesn't support the IDPE specific `dsn-file://` uri scheme.
 async fn new_raw_pool(
     options: &PostgresConnectionOptions,
     parsed_dsn: &str,
+    metrics: PoolMetrics,
 ) -> Result<sqlx::Pool<Postgres>, sqlx::Error> {
     // sqlx exposes some options as pool options, while other options are available as connection options.
-    let mut connect_options = PgConnectOptions::from_str(parsed_dsn)?;
-    // the default is INFO, which is frankly surprising.
-    connect_options.log_statements(log::LevelFilter::Trace);
+    let connect_options = PgConnectOptions::from_str(parsed_dsn)?
+        // the default is INFO, which is frankly surprising.
+        .log_statements(log::LevelFilter::Trace);
 
     let app_name = options.app_name.clone();
     let app_name2 = options.app_name.clone(); // just to log below
@@ -370,6 +487,7 @@ async fn new_raw_pool(
     // name for cross-correlation between Conductor logs & database connections.
     info!(application_name=%app_name2, "connected to config store");
 
+    metrics.register_pool(pool.clone());
     Ok(pool)
 }
 
@@ -399,9 +517,11 @@ pub fn parse_dsn(dsn: &str) -> Result<String, sqlx::Error> {
 /// is successfull (see [`sqlx::pool::PoolOptions::test_before_acquire`]).
 async fn new_pool(
     options: &PostgresConnectionOptions,
+    metrics: Arc<metric::Registry>,
 ) -> Result<HotSwapPool<Postgres>, sqlx::Error> {
     let parsed_dsn = parse_dsn(&options.dsn)?;
-    let pool = HotSwapPool::new(new_raw_pool(options, &parsed_dsn).await?);
+    let metrics = PoolMetrics::new(metrics);
+    let pool = HotSwapPool::new(new_raw_pool(options, &parsed_dsn, metrics.clone()).await?);
     let polling_interval = options.hotswap_poll_interval;
 
     if let Some(dsn_file) = get_dsn_file_path(&options.dsn) {
@@ -425,12 +545,13 @@ async fn new_pool(
                     current_dsn: &str,
                     dsn_file: &str,
                     pool: &HotSwapPool<Postgres>,
+                    metrics: PoolMetrics,
                 ) -> Result<Option<String>, sqlx::Error> {
                     let new_dsn = std::fs::read_to_string(dsn_file)?;
                     if new_dsn == current_dsn {
                         Ok(None)
                     } else {
-                        let new_pool = new_raw_pool(options, &new_dsn).await?;
+                        let new_pool = new_raw_pool(options, &new_dsn, metrics).await?;
                         let old_pool = pool.replace(new_pool);
                         info!("replaced hotswap pool");
                         info!(?old_pool, "closing old DB connection pool");
@@ -443,7 +564,7 @@ async fn new_pool(
                     }
                 }
 
-                match try_update(&options, &current_dsn, &dsn_file, &pool).await {
+                match try_update(&options, &current_dsn, &dsn_file, &pool, metrics.clone()).await {
                     Ok(None) => {}
                     Ok(Some(new_dsn)) => {
                         current_dsn = new_dsn;
@@ -498,25 +619,89 @@ impl RepoCollection for PostgresTxn {
     }
 }
 
+async fn insert_column_with_connection<'q, E>(
+    executor: E,
+    name: &str,
+    table_id: TableId,
+    column_type: ColumnType,
+) -> Result<Column>
+where
+    E: Executor<'q, Database = Postgres>,
+{
+    let rec = sqlx::query_as::<_, Column>(
+            r#"
+INSERT INTO column_name ( name, table_id, column_type )
+SELECT $1, table_id, $3 FROM (
+    SELECT max_columns_per_table, namespace.id, table_name.id as table_id, COUNT(column_name.*) AS count
+    FROM namespace LEFT JOIN table_name ON namespace.id = table_name.namespace_id
+                   LEFT JOIN column_name ON table_name.id = column_name.table_id
+    WHERE table_name.id = $2
+    GROUP BY namespace.max_columns_per_table, namespace.id, table_name.id
+) AS get_count WHERE count < max_columns_per_table
+ON CONFLICT ON CONSTRAINT column_name_unique
+DO UPDATE SET name = column_name.name
+RETURNING *;
+        "#,
+        )
+        .bind(name) // $1
+        .bind(table_id) // $2
+        .bind(column_type) // $3
+        .fetch_one(executor)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::RowNotFound => Error::ColumnCreateLimitError {
+                column_name: name.to_string(),
+                table_id,
+            },
+            _ => {
+            if is_fk_violation(&e) {
+                Error::ForeignKeyViolation { source: e }
+            } else {
+                Error::SqlxError { source: e }
+            }
+        }})?;
+
+    ensure!(
+        rec.column_type == column_type,
+        ColumnTypeMismatchSnafu {
+            name,
+            existing: rec.column_type,
+            new: column_type,
+        }
+    );
+
+    Ok(rec)
+}
+
 #[async_trait]
 impl NamespaceRepo for PostgresTxn {
     async fn create(
         &mut self,
-        name: &NamespaceName,
+        name: &NamespaceName<'_>,
+        partition_template: Option<NamespacePartitionTemplateOverride>,
         retention_period_ns: Option<i64>,
+        service_protection_limits: Option<NamespaceServiceProtectionLimitsOverride>,
     ) -> Result<Namespace> {
+        let max_tables = service_protection_limits.and_then(|l| l.max_tables);
+        let max_columns_per_table = service_protection_limits.and_then(|l| l.max_columns_per_table);
+
         let rec = sqlx::query_as::<_, Namespace>(
             r#"
-                INSERT INTO namespace ( name, topic_id, query_pool_id, retention_period_ns, max_tables )
-                VALUES ( $1, $2, $3, $4, $5 )
-                RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at;
+INSERT INTO namespace (
+    name, topic_id, query_pool_id, retention_period_ns, max_tables, max_columns_per_table, partition_template
+)
+VALUES ( $1, $2, $3, $4, $5, $6, $7 )
+RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at,
+          partition_template;
             "#,
         )
         .bind(name.as_str()) // $1
         .bind(SHARED_TOPIC_ID) // $2
         .bind(SHARED_QUERY_POOL_ID) // $3
         .bind(retention_period_ns) // $4
-        .bind(DEFAULT_MAX_TABLES); // $5
+        .bind(max_tables.unwrap_or(DEFAULT_MAX_TABLES)) // $5
+        .bind(max_columns_per_table.unwrap_or(DEFAULT_MAX_COLUMNS_PER_TABLE)) // $6
+        .bind(partition_template); // $7
 
         let rec = rec.fetch_one(&mut self.inner).await.map_err(|e| {
             if is_unique_violation(&e) {
@@ -530,10 +715,6 @@ impl NamespaceRepo for PostgresTxn {
             }
         })?;
 
-        // Ensure the column default values match the code values.
-        debug_assert_eq!(rec.max_tables, DEFAULT_MAX_TABLES);
-        debug_assert_eq!(rec.max_columns_per_table, DEFAULT_MAX_COLUMNS_PER_TABLE);
-
         Ok(rec)
     }
 
@@ -541,7 +722,8 @@ impl NamespaceRepo for PostgresTxn {
         let rec = sqlx::query_as::<_, Namespace>(
             format!(
                 r#"
-SELECT id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at
+SELECT id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at,
+       partition_template
 FROM namespace
 WHERE {v};
                 "#,
@@ -564,7 +746,8 @@ WHERE {v};
         let rec = sqlx::query_as::<_, Namespace>(
             format!(
                 r#"
-SELECT id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at
+SELECT id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at,
+       partition_template
 FROM namespace
 WHERE id=$1 AND {v};
                 "#,
@@ -593,7 +776,8 @@ WHERE id=$1 AND {v};
         let rec = sqlx::query_as::<_, Namespace>(
             format!(
                 r#"
-SELECT id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at
+SELECT id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at,
+       partition_template
 FROM namespace
 WHERE name=$1 AND {v};
                 "#,
@@ -633,7 +817,8 @@ WHERE name=$1 AND {v};
 UPDATE namespace
 SET max_tables = $1
 WHERE name = $2
-RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at;
+RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at,
+          partition_template;
         "#,
         )
         .bind(new_max)
@@ -657,7 +842,8 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
 UPDATE namespace
 SET max_columns_per_table = $1
 WHERE name = $2
-RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at;
+RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at,
+          partition_template;
         "#,
         )
         .bind(new_max)
@@ -685,7 +871,8 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
 UPDATE namespace
 SET retention_period_ns = $1
 WHERE name = $2
-RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at;
+RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at,
+          partition_template;
         "#,
         )
         .bind(retention_period_ns) // $1
@@ -706,7 +893,19 @@ RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, dele
 
 #[async_trait]
 impl TableRepo for PostgresTxn {
-    async fn create_or_get(&mut self, name: &str, namespace_id: NamespaceId) -> Result<Table> {
+    async fn create(
+        &mut self,
+        name: &str,
+        partition_template: TablePartitionTemplateOverride,
+        namespace_id: NamespaceId,
+    ) -> Result<Table> {
+        let mut tx = self
+            .inner
+            .pool
+            .begin()
+            .await
+            .map_err(|e| Error::StartTransaction { source: e })?;
+
         // A simple insert statement becomes quite complicated in order to avoid checking the table
         // limits in a select and then conditionally inserting (which would be racey).
         //
@@ -716,23 +915,22 @@ impl TableRepo for PostgresTxn {
         // By using SELECT rather than VALUES it will insert zero rows if it finds a null in the
         // subquery, i.e. if count >= max_tables. fetch_one() will return a RowNotFound error if
         // nothing was inserted. Not pretty!
-        let rec = sqlx::query_as::<_, Table>(
+        let table = sqlx::query_as::<_, Table>(
             r#"
-INSERT INTO table_name ( name, namespace_id )
-SELECT $1, id FROM (
+INSERT INTO table_name ( name, namespace_id, partition_template )
+SELECT $1, id, $2 FROM (
     SELECT namespace.id AS id, max_tables, COUNT(table_name.*) AS count
     FROM namespace LEFT JOIN table_name ON namespace.id = table_name.namespace_id
-    WHERE namespace.id = $2
+    WHERE namespace.id = $3
     GROUP BY namespace.max_tables, table_name.namespace_id, namespace.id
 ) AS get_count WHERE count < max_tables
-ON CONFLICT ON CONSTRAINT table_name_unique
-DO UPDATE SET name = table_name.name
 RETURNING *;
         "#,
         )
         .bind(name) // $1
-        .bind(namespace_id) // $2
-        .fetch_one(&mut self.inner)
+        .bind(partition_template) // $2
+        .bind(namespace_id) // $3
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| match e {
             sqlx::Error::RowNotFound => Error::TableCreateLimitError {
@@ -740,7 +938,12 @@ RETURNING *;
                 namespace_id,
             },
             _ => {
-                if is_fk_violation(&e) {
+                if is_unique_violation(&e) {
+                    Error::TableNameExists {
+                        name: name.to_string(),
+                        namespace_id,
+                    }
+                } else if is_fk_violation(&e) {
                     Error::ForeignKeyViolation { source: e }
                 } else {
                     Error::SqlxError { source: e }
@@ -748,7 +951,22 @@ RETURNING *;
             }
         })?;
 
-        Ok(rec)
+        // Partitioning is only supported for tags, so create tag columns for all `TagValue`
+        // partition template parts. It's important this happens within the table creation
+        // transaction so that there isn't a possibility of a concurrent write creating these
+        // columns with an unsupported type.
+        for template_part in table.partition_template.parts() {
+            if let TemplatePart::TagValue(tag_name) = template_part {
+                insert_column_with_connection(&mut *tx, tag_name, table.id, ColumnType::Tag)
+                    .await?;
+            }
+        }
+
+        tx.commit()
+            .await
+            .map_err(|source| Error::FailedToCommit { source })?;
+
+        Ok(table)
     }
 
     async fn get_by_id(&mut self, table_id: TableId) -> Result<Option<Table>> {
@@ -832,49 +1050,7 @@ impl ColumnRepo for PostgresTxn {
         table_id: TableId,
         column_type: ColumnType,
     ) -> Result<Column> {
-        let rec = sqlx::query_as::<_, Column>(
-            r#"
-INSERT INTO column_name ( name, table_id, column_type )
-SELECT $1, table_id, $3 FROM (
-    SELECT max_columns_per_table, namespace.id, table_name.id as table_id, COUNT(column_name.*) AS count
-    FROM namespace LEFT JOIN table_name ON namespace.id = table_name.namespace_id
-                   LEFT JOIN column_name ON table_name.id = column_name.table_id
-    WHERE table_name.id = $2
-    GROUP BY namespace.max_columns_per_table, namespace.id, table_name.id
-) AS get_count WHERE count < max_columns_per_table
-ON CONFLICT ON CONSTRAINT column_name_unique
-DO UPDATE SET name = column_name.name
-RETURNING *;
-        "#,
-        )
-        .bind(name) // $1
-        .bind(table_id) // $2
-        .bind(column_type) // $3
-        .fetch_one(&mut self.inner)
-        .await
-        .map_err(|e| match e {
-            sqlx::Error::RowNotFound => Error::ColumnCreateLimitError {
-                column_name: name.to_string(),
-                table_id,
-            },
-            _ => {
-            if is_fk_violation(&e) {
-                Error::ForeignKeyViolation { source: e }
-            } else {
-                Error::SqlxError { source: e }
-            }
-        }})?;
-
-        ensure!(
-            rec.column_type == column_type,
-            ColumnTypeMismatchSnafu {
-                name,
-                existing: rec.column_type,
-                new: column_type,
-            }
-        );
-
-        Ok(rec)
+        insert_column_with_connection(&mut self.inner, name, table_id, column_type).await
     }
 
     async fn list_by_namespace_id(&mut self, namespace_id: NamespaceId) -> Result<Vec<Column>> {
@@ -979,24 +1155,23 @@ RETURNING *;
 #[async_trait]
 impl PartitionRepo for PostgresTxn {
     async fn create_or_get(&mut self, key: PartitionKey, table_id: TableId) -> Result<Partition> {
-        // Note: since sort_key is now an array, we must explicitly insert '{}' which is an empty
-        // array rather than NULL which sqlx will throw `UnexpectedNullError` while is is doing
-        // `ColumnDecode`
+        let hash_id = PartitionHashId::new(table_id, &key);
 
         let v = sqlx::query_as::<_, Partition>(
             r#"
 INSERT INTO partition
-    ( partition_key, shard_id, table_id, sort_key)
+    (partition_key, shard_id, table_id, hash_id, sort_key, sort_key_ids)
 VALUES
-    ( $1, $2, $3, '{}')
+    ( $1, $2, $3, $4, '{}', '{}')
 ON CONFLICT ON CONSTRAINT partition_key_unique
 DO UPDATE SET partition_key = partition.partition_key
-RETURNING id, table_id, partition_key, sort_key, new_file_at;
+RETURNING id, hash_id, table_id, partition_key, sort_key, sort_key_ids, new_file_at;
         "#,
         )
         .bind(key) // $1
         .bind(TRANSITION_SHARD_ID) // $2
         .bind(table_id) // $3
+        .bind(&hash_id) // $4
         .fetch_one(&mut self.inner)
         .await
         .map_err(|e| {
@@ -1013,7 +1188,7 @@ RETURNING id, table_id, partition_key, sort_key, new_file_at;
     async fn get_by_id(&mut self, partition_id: PartitionId) -> Result<Option<Partition>> {
         let rec = sqlx::query_as::<_, Partition>(
             r#"
-SELECT id, table_id, partition_key, sort_key, new_file_at
+SELECT id, hash_id, table_id, partition_key, sort_key, sort_key_ids, new_file_at
 FROM partition
 WHERE id = $1;
         "#,
@@ -1031,10 +1206,69 @@ WHERE id = $1;
         Ok(Some(partition))
     }
 
+    async fn get_by_id_batch(&mut self, partition_ids: Vec<PartitionId>) -> Result<Vec<Partition>> {
+        let ids: Vec<_> = partition_ids.iter().map(|p| p.get()).collect();
+
+        sqlx::query_as::<_, Partition>(
+            r#"
+SELECT id, hash_id, table_id, partition_key, sort_key, sort_key_ids, new_file_at
+FROM partition
+WHERE id = ANY($1);
+        "#,
+        )
+        .bind(&ids[..]) // $1
+        .fetch_all(&mut self.inner)
+        .await
+        .map_err(|e| Error::SqlxError { source: e })
+    }
+
+    async fn get_by_hash_id(
+        &mut self,
+        partition_hash_id: &PartitionHashId,
+    ) -> Result<Option<Partition>> {
+        let rec = sqlx::query_as::<_, Partition>(
+            r#"
+SELECT id, hash_id, table_id, partition_key, sort_key, sort_key_ids, new_file_at
+FROM partition
+WHERE hash_id = $1;
+        "#,
+        )
+        .bind(partition_hash_id) // $1
+        .fetch_one(&mut self.inner)
+        .await;
+
+        if let Err(sqlx::Error::RowNotFound) = rec {
+            return Ok(None);
+        }
+
+        let partition = rec.map_err(|e| Error::SqlxError { source: e })?;
+
+        Ok(Some(partition))
+    }
+
+    async fn get_by_hash_id_batch(
+        &mut self,
+        partition_ids: &[&PartitionHashId],
+    ) -> Result<Vec<Partition>> {
+        let ids: Vec<_> = partition_ids.iter().map(|p| p.as_bytes()).collect();
+
+        sqlx::query_as::<_, Partition>(
+            r#"
+SELECT id, hash_id, table_id, partition_key, sort_key, sort_key_ids, new_file_at
+FROM partition
+WHERE hash_id = ANY($1);
+        "#,
+        )
+        .bind(&ids[..]) // $1
+        .fetch_all(&mut self.inner)
+        .await
+        .map_err(|e| Error::SqlxError { source: e })
+    }
+
     async fn list_by_table_id(&mut self, table_id: TableId) -> Result<Vec<Partition>> {
         sqlx::query_as::<_, Partition>(
             r#"
-SELECT id, table_id, partition_key, sort_key, new_file_at
+SELECT id, hash_id, table_id, partition_key, sort_key, sort_key_ids, new_file_at
 FROM partition
 WHERE table_id = $1;
             "#,
@@ -1065,24 +1299,43 @@ WHERE table_id = $1;
     /// round trips to service a transaction in the happy path).
     async fn cas_sort_key(
         &mut self,
-        partition_id: PartitionId,
+        partition_id: &TransitionPartitionId,
         old_sort_key: Option<Vec<String>>,
         new_sort_key: &[&str],
+        new_sort_key_ids: &SortedColumnSet,
     ) -> Result<Partition, CasFailure<Vec<String>>> {
+        verify_sort_key_length(new_sort_key, new_sort_key_ids);
+
         let old_sort_key = old_sort_key.unwrap_or_default();
-        let res = sqlx::query_as::<_, Partition>(
-            r#"
+        // This `match` will go away when all partitions have hash IDs in the database.
+        let query = match partition_id {
+            TransitionPartitionId::Deterministic(hash_id) => sqlx::query_as::<_, Partition>(
+                r#"
 UPDATE partition
-SET sort_key = $1
-WHERE id = $2 AND sort_key = $3
-RETURNING id, table_id, partition_key, sort_key, new_file_at;
+SET sort_key = $1, sort_key_ids = $4
+WHERE hash_id = $2 AND sort_key = $3
+RETURNING id, hash_id, table_id, partition_key, sort_key, sort_key_ids, new_file_at;
         "#,
-        )
-        .bind(new_sort_key) // $1
-        .bind(partition_id) // $2
-        .bind(&old_sort_key) // $3
-        .fetch_one(&mut self.inner)
-        .await;
+            )
+            .bind(new_sort_key) // $1
+            .bind(hash_id) // $2
+            .bind(&old_sort_key) // $3
+            .bind(new_sort_key_ids), // $4
+            TransitionPartitionId::Deprecated(id) => sqlx::query_as::<_, Partition>(
+                r#"
+UPDATE partition
+SET sort_key = $1, sort_key_ids = $4
+WHERE id = $2 AND sort_key = $3
+RETURNING id, hash_id, table_id, partition_key, sort_key, sort_key_ids, new_file_at;
+        "#,
+            )
+            .bind(new_sort_key) // $1
+            .bind(id) // $2
+            .bind(&old_sort_key) // $3
+            .bind(new_sort_key_ids), // $4
+        };
+
+        let res = query.fetch_one(&mut self.inner).await;
 
         let partition = match res {
             Ok(v) => v,
@@ -1099,11 +1352,11 @@ RETURNING id, table_id, partition_key, sort_key, new_file_at;
                 // NOTE: this is racy, but documented - this might return "Sort
                 // key differs! Old key: <old sort key you provided>"
                 return Err(CasFailure::ValueMismatch(
-                    PartitionRepo::get_by_id(self, partition_id)
+                    crate::partition_lookup(self, partition_id)
                         .await
                         .map_err(CasFailure::QueryError)?
                         .ok_or(CasFailure::QueryError(Error::PartitionNotFound {
-                            id: partition_id,
+                            id: partition_id.clone(),
                         }))?
                         .sort_key,
                 ));
@@ -1115,6 +1368,7 @@ RETURNING id, table_id, partition_key, sort_key, new_file_at;
             ?partition_id,
             ?old_sort_key,
             ?new_sort_key,
+            ?new_sort_key_ids,
             "partition sort key cas successful"
         );
 
@@ -1162,24 +1416,24 @@ skipped_at = EXCLUDED.skipped_at;
         Ok(())
     }
 
-    async fn get_in_skipped_compaction(
+    async fn get_in_skipped_compactions(
         &mut self,
-        partition_id: PartitionId,
-    ) -> Result<Option<SkippedCompaction>> {
+        partition_ids: &[PartitionId],
+    ) -> Result<Vec<SkippedCompaction>> {
         let rec = sqlx::query_as::<_, SkippedCompaction>(
-            r#"SELECT * FROM skipped_compactions WHERE partition_id = $1;"#,
+            r#"SELECT * FROM skipped_compactions WHERE partition_id = ANY($1);"#,
         )
-        .bind(partition_id) // $1
-        .fetch_one(&mut self.inner)
+        .bind(partition_ids) // $1
+        .fetch_all(&mut self.inner)
         .await;
 
         if let Err(sqlx::Error::RowNotFound) = rec {
-            return Ok(None);
+            return Ok(Vec::new());
         }
 
-        let skipped_partition_record = rec.map_err(|e| Error::SqlxError { source: e })?;
+        let skipped_partition_records = rec.map_err(|e| Error::SqlxError { source: e })?;
 
-        Ok(Some(skipped_partition_record))
+        Ok(skipped_partition_records)
     }
 
     async fn list_skipped_compactions(&mut self) -> Result<Vec<SkippedCompaction>> {
@@ -1211,11 +1465,19 @@ RETURNING *
     }
 
     async fn most_recent_n(&mut self, n: usize) -> Result<Vec<Partition>> {
-        sqlx::query_as(r#"SELECT * FROM partition ORDER BY id DESC LIMIT $1;"#)
-            .bind(n as i64) // $1
-            .fetch_all(&mut self.inner)
-            .await
-            .map_err(|e| Error::SqlxError { source: e })
+        sqlx::query_as(
+    // TODO: Carol has confirmed the persisted_sequence_number is not needed anywhere so let us remove it
+    // but in a seperate PR to ensure we don't break anything
+            r#"
+SELECT id, hash_id, table_id, partition_key, sort_key, sort_key_ids, persisted_sequence_number, new_file_at
+FROM partition
+ORDER BY id DESC
+LIMIT $1;"#,
+        )
+        .bind(n as i64) // $1
+        .fetch_all(&mut self.inner)
+        .await
+        .map_err(|e| Error::SqlxError { source: e })
     }
 
     async fn partitions_new_file_between(
@@ -1242,20 +1504,51 @@ RETURNING *
             .await
             .map_err(|e| Error::SqlxError { source: e })
     }
+
+    async fn list_old_style(&mut self) -> Result<Vec<Partition>> {
+        // Correctness: the main caller of this function, the partition bloom
+        // filter, relies on all partitions being made available to it.
+        //
+        // This function MUST return the full set of old partitions to the
+        // caller - do NOT apply a LIMIT to this query.
+        //
+        // The load this query saves vastly outsizes the load this query causes.
+        sqlx::query_as(
+            r#"
+SELECT id, hash_id, table_id, partition_key, sort_key, sort_key_ids, persisted_sequence_number,
+       new_file_at
+FROM partition
+WHERE hash_id IS NULL
+ORDER BY id DESC;"#,
+        )
+        .fetch_all(&mut self.inner)
+        .await
+        .map_err(|e| Error::SqlxError { source: e })
+    }
 }
 
 #[async_trait]
 impl ParquetFileRepo for PostgresTxn {
     async fn create(&mut self, parquet_file_params: ParquetFileParams) -> Result<ParquetFile> {
         let executor = &mut self.inner;
-        create_parquet_file(executor, parquet_file_params).await
+        let id = create_parquet_file(executor, &parquet_file_params).await?;
+        Ok(ParquetFile::from_params(parquet_file_params, id))
     }
 
-    async fn flag_for_delete(&mut self, id: ParquetFileId) -> Result<()> {
-        let marked_at = Timestamp::from(self.time_provider.now());
-        let executor = &mut self.inner;
-
-        flag_for_delete(executor, id, marked_at).await
+    async fn list_all(&mut self) -> Result<Vec<ParquetFile>> {
+        sqlx::query_as::<_, ParquetFile>(
+            r#"
+SELECT parquet_file.id, parquet_file.namespace_id, parquet_file.table_id,
+       parquet_file.partition_id, parquet_file.partition_hash_id, parquet_file.object_store_id,
+       parquet_file.min_time, parquet_file.max_time, parquet_file.to_delete,
+       parquet_file.file_size_bytes, parquet_file.row_count, parquet_file.compaction_level,
+       parquet_file.created_at, parquet_file.column_set, parquet_file.max_l0_created_at
+FROM parquet_file;
+             "#,
+        )
+        .fetch_all(&mut self.inner)
+        .await
+        .map_err(|e| Error::SqlxError { source: e })
     }
 
     async fn flag_for_delete_by_retention(&mut self) -> Result<Vec<ParquetFileId>> {
@@ -1279,7 +1572,7 @@ RETURNING id;
             "#,
         )
         .bind(flagged_at) // $1
-        .bind(MAX_PARQUET_FILES_SELECTED_ONCE) // $2
+        .bind(MAX_PARQUET_FILES_SELECTED_ONCE_FOR_RETENTION) // $2
         .fetch_all(&mut self.inner)
         .await
         .map_err(|e| Error::SqlxError { source: e })?;
@@ -1294,12 +1587,11 @@ RETURNING id;
     ) -> Result<Vec<ParquetFile>> {
         sqlx::query_as::<_, ParquetFile>(
             r#"
-SELECT parquet_file.id, parquet_file.namespace_id,
-       parquet_file.table_id, parquet_file.partition_id, parquet_file.object_store_id,
-       parquet_file.min_time,
-       parquet_file.max_time, parquet_file.to_delete, parquet_file.file_size_bytes,
-       parquet_file.row_count, parquet_file.compaction_level, parquet_file.created_at,
-       parquet_file.column_set, parquet_file.max_l0_created_at
+SELECT parquet_file.id, parquet_file.namespace_id, parquet_file.table_id,
+       parquet_file.partition_id, parquet_file.partition_hash_id, parquet_file.object_store_id,
+       parquet_file.min_time, parquet_file.max_time, parquet_file.to_delete,
+       parquet_file.file_size_bytes, parquet_file.row_count, parquet_file.compaction_level,
+       parquet_file.created_at, parquet_file.column_set, parquet_file.max_l0_created_at
 FROM parquet_file
 INNER JOIN table_name on table_name.id = parquet_file.table_id
 WHERE table_name.namespace_id = $1
@@ -1315,29 +1607,11 @@ WHERE table_name.namespace_id = $1
     async fn list_by_table_not_to_delete(&mut self, table_id: TableId) -> Result<Vec<ParquetFile>> {
         sqlx::query_as::<_, ParquetFile>(
             r#"
-SELECT id, namespace_id, table_id, partition_id, object_store_id,
-       min_time, max_time, to_delete, file_size_bytes,
-       row_count, compaction_level, created_at, column_set, max_l0_created_at
+SELECT id, namespace_id, table_id, partition_id, partition_hash_id, object_store_id,
+       min_time, max_time, to_delete, file_size_bytes, row_count, compaction_level, created_at,
+       column_set, max_l0_created_at
 FROM parquet_file
 WHERE table_id = $1 AND to_delete IS NULL;
-             "#,
-        )
-        .bind(table_id) // $1
-        .fetch_all(&mut self.inner)
-        .await
-        .map_err(|e| Error::SqlxError { source: e })
-    }
-
-    async fn list_by_table(&mut self, table_id: TableId) -> Result<Vec<ParquetFile>> {
-        // Deliberately doesn't use `SELECT *` to avoid the performance hit of fetching the large
-        // `parquet_metadata` column!!
-        sqlx::query_as::<_, ParquetFile>(
-            r#"
-SELECT id, shard_id, namespace_id, table_id, partition_id, object_store_id,
-       max_sequence_number, min_time, max_time, to_delete, file_size_bytes,
-       row_count, compaction_level, created_at, column_set, max_l0_created_at
-FROM parquet_file
-WHERE table_id = $1;
              "#,
         )
         .bind(table_id) // $1
@@ -1362,7 +1636,7 @@ RETURNING id;
              "#,
         )
         .bind(older_than) // $1
-        .bind(MAX_PARQUET_FILES_SELECTED_ONCE) // $2
+        .bind(MAX_PARQUET_FILES_SELECTED_ONCE_FOR_DELETE) // $2
         .fetch_all(&mut self.inner)
         .await
         .map_err(|e| Error::SqlxError { source: e })?;
@@ -1373,53 +1647,42 @@ RETURNING id;
 
     async fn list_by_partition_not_to_delete(
         &mut self,
-        partition_id: PartitionId,
+        partition_id: &TransitionPartitionId,
     ) -> Result<Vec<ParquetFile>> {
-        sqlx::query_as::<_, ParquetFile>(
-            r#"
-SELECT id, namespace_id, table_id, partition_id, object_store_id,
-       min_time, max_time, to_delete, file_size_bytes,
-       row_count, compaction_level, created_at, column_set, max_l0_created_at
+        // This `match` will go away when all partitions have hash IDs in the database.
+        let query = match partition_id {
+            TransitionPartitionId::Deterministic(hash_id) => sqlx::query_as::<_, ParquetFile>(
+                r#"
+SELECT parquet_file.id, namespace_id, parquet_file.table_id, partition_id, partition_hash_id,
+       object_store_id, min_time, max_time, parquet_file.to_delete, file_size_bytes, row_count,
+       compaction_level, created_at, column_set, max_l0_created_at
 FROM parquet_file
-WHERE parquet_file.partition_id = $1
+INNER JOIN partition
+ON partition.id = parquet_file.partition_id OR partition.hash_id = parquet_file.partition_hash_id
+WHERE partition.hash_id = $1
   AND parquet_file.to_delete IS NULL;
         "#,
-        )
-        .bind(partition_id) // $1
-        .fetch_all(&mut self.inner)
-        .await
-        .map_err(|e| Error::SqlxError { source: e })
-    }
+            )
+            .bind(hash_id), // $1
+            TransitionPartitionId::Deprecated(id) => sqlx::query_as::<_, ParquetFile>(
+                r#"
+SELECT parquet_file.id, namespace_id, parquet_file.table_id, partition_id, partition_hash_id,
+       object_store_id, min_time, max_time, parquet_file.to_delete, file_size_bytes, row_count,
+       compaction_level, created_at, column_set, max_l0_created_at
+FROM parquet_file
+INNER JOIN partition
+ON partition.id = parquet_file.partition_id OR partition.hash_id = parquet_file.partition_hash_id
+WHERE partition.id = $1
+  AND parquet_file.to_delete IS NULL;
+        "#,
+            )
+            .bind(id), // $1
+        };
 
-    async fn update_compaction_level(
-        &mut self,
-        parquet_file_ids: &[ParquetFileId],
-        compaction_level: CompactionLevel,
-    ) -> Result<Vec<ParquetFileId>> {
-        let executor = &mut self.inner;
-        update_compaction_level(executor, parquet_file_ids, compaction_level).await
-    }
-
-    async fn exist(&mut self, id: ParquetFileId) -> Result<bool> {
-        let read_result = sqlx::query_as::<_, Count>(
-            r#"SELECT count(1) as count FROM parquet_file WHERE id = $1;"#,
-        )
-        .bind(id) // $1
-        .fetch_one(&mut self.inner)
-        .await
-        .map_err(|e| Error::SqlxError { source: e })?;
-
-        Ok(read_result.count > 0)
-    }
-
-    async fn count(&mut self) -> Result<i64> {
-        let read_result =
-            sqlx::query_as::<_, Count>(r#"SELECT count(1) as count FROM parquet_file;"#)
-                .fetch_one(&mut self.inner)
-                .await
-                .map_err(|e| Error::SqlxError { source: e })?;
-
-        Ok(read_result.count)
+        query
+            .fetch_all(&mut self.inner)
+            .await
+            .map_err(|e| Error::SqlxError { source: e })
     }
 
     async fn get_by_object_store_id(
@@ -1428,9 +1691,9 @@ WHERE parquet_file.partition_id = $1
     ) -> Result<Option<ParquetFile>> {
         let rec = sqlx::query_as::<_, ParquetFile>(
             r#"
-SELECT id, namespace_id, table_id, partition_id, object_store_id,
-       min_time, max_time, to_delete, file_size_bytes,
-       row_count, compaction_level, created_at, column_set, max_l0_created_at
+SELECT id, namespace_id, table_id, partition_id, partition_hash_id, object_store_id, min_time,
+       max_time, to_delete, file_size_bytes, row_count, compaction_level, created_at, column_set,
+       max_l0_created_at
 FROM parquet_file
 WHERE object_store_id = $1;
              "#,
@@ -1447,16 +1710,36 @@ WHERE object_store_id = $1;
 
         Ok(Some(parquet_file))
     }
+
+    async fn exists_by_object_store_id_batch(
+        &mut self,
+        object_store_ids: Vec<Uuid>,
+    ) -> Result<Vec<Uuid>> {
+        sqlx::query(
+            // sqlx's readme suggests using PG's ANY operator instead of IN; see link below.
+            // https://github.com/launchbadge/sqlx/blob/main/FAQ.md#how-can-i-do-a-select--where-foo-in--query
+            r#"
+SELECT object_store_id
+FROM parquet_file
+WHERE object_store_id = ANY($1);
+             "#,
+        )
+        .bind(object_store_ids) // $1
+        .map(|pgr| pgr.get::<Uuid, _>("object_store_id"))
+        .fetch_all(&mut self.inner)
+        .await
+        .map_err(|e| Error::SqlxError { source: e })
+    }
+
     async fn create_upgrade_delete(
         &mut self,
-        _partition_id: PartitionId,
-        delete: &[ParquetFile],
-        upgrade: &[ParquetFile],
+        delete: &[ParquetFileId],
+        upgrade: &[ParquetFileId],
         create: &[ParquetFileParams],
         target_level: CompactionLevel,
     ) -> Result<Vec<ParquetFileId>> {
-        let delete_set: HashSet<_> = delete.iter().map(|d| d.id.get()).collect();
-        let upgrade_set: HashSet<_> = upgrade.iter().map(|u| u.id.get()).collect();
+        let delete_set: HashSet<_> = delete.iter().map(|d| d.get()).collect();
+        let upgrade_set: HashSet<_> = upgrade.iter().map(|u| u.get()).collect();
 
         assert!(
             delete_set.is_disjoint(&upgrade_set),
@@ -1470,19 +1753,15 @@ WHERE object_store_id = $1;
             .await
             .map_err(|e| Error::StartTransaction { source: e })?;
 
-        let upgrade = upgrade.iter().map(|f| f.id).collect::<Vec<_>>();
-
         let marked_at = Timestamp::from(self.time_provider.now());
-        for file in delete {
-            flag_for_delete(&mut tx, file.id, marked_at).await?;
-        }
+        flag_for_delete(&mut *tx, delete, marked_at).await?;
 
-        update_compaction_level(&mut tx, &upgrade, target_level).await?;
+        update_compaction_level(&mut *tx, upgrade, target_level).await?;
 
         let mut ids = Vec::with_capacity(create.len());
         for file in create {
-            let pf = create_parquet_file(&mut tx, file.clone()).await?;
-            ids.push(pf.id);
+            let id = create_parquet_file(&mut *tx, file).await?;
+            ids.push(id);
         }
 
         tx.commit()
@@ -1496,8 +1775,8 @@ WHERE object_store_id = $1;
 // They are also used by the respective create/flag_for_delete/update_compaction_level methods.
 async fn create_parquet_file<'q, E>(
     executor: E,
-    parquet_file_params: ParquetFileParams,
-) -> Result<ParquetFile>
+    parquet_file_params: &ParquetFileParams,
+) -> Result<ParquetFileId>
 where
     E: Executor<'q, Database = Postgres>,
 {
@@ -1516,35 +1795,42 @@ where
         max_l0_created_at,
     } = parquet_file_params;
 
-    let query = sqlx::query_as::<_, ParquetFile>(
+    let (partition_id, partition_hash_id) = match partition_id {
+        TransitionPartitionId::Deterministic(hash_id) => (None, Some(hash_id)),
+        TransitionPartitionId::Deprecated(id) => (Some(id), None),
+    };
+
+    let partition_hash_id_ref = &partition_hash_id.as_ref();
+    let query = sqlx::query_scalar::<_, ParquetFileId>(
         r#"
 INSERT INTO parquet_file (
-    shard_id, table_id, partition_id, object_store_id,
+    shard_id, table_id, partition_id, partition_hash_id, object_store_id,
     min_time, max_time, file_size_bytes,
     row_count, compaction_level, created_at, namespace_id, column_set, max_l0_created_at )
-VALUES ( $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13 )
-RETURNING
-    id, table_id, partition_id, object_store_id,
-    min_time, max_time, to_delete, file_size_bytes,
-    row_count, compaction_level, created_at, namespace_id, column_set, max_l0_created_at;
+VALUES ( $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14 )
+RETURNING id;
         "#,
     )
     .bind(TRANSITION_SHARD_ID) // $1
     .bind(table_id) // $2
     .bind(partition_id) // $3
-    .bind(object_store_id) // $4
-    .bind(min_time) // $5
-    .bind(max_time) // $6
-    .bind(file_size_bytes) // $7
-    .bind(row_count) // $8
-    .bind(compaction_level) // $9
-    .bind(created_at) // $10
-    .bind(namespace_id) // $11
-    .bind(column_set) // $12
-    .bind(max_l0_created_at); // $13
-    let parquet_file = query.fetch_one(executor).await.map_err(|e| {
+    .bind(partition_hash_id_ref) // $4
+    .bind(object_store_id) // $5
+    .bind(min_time) // $6
+    .bind(max_time) // $7
+    .bind(file_size_bytes) // $8
+    .bind(row_count) // $9
+    .bind(compaction_level) // $10
+    .bind(created_at) // $11
+    .bind(namespace_id) // $12
+    .bind(column_set) // $13
+    .bind(max_l0_created_at); // $14
+
+    let parquet_file_id = query.fetch_one(executor).await.map_err(|e| {
         if is_unique_violation(&e) {
-            Error::FileExists { object_store_id }
+            Error::FileExists {
+                object_store_id: *object_store_id,
+            }
         } else if is_fk_violation(&e) {
             Error::ForeignKeyViolation { source: e }
         } else {
@@ -1552,16 +1838,20 @@ RETURNING
         }
     })?;
 
-    Ok(parquet_file)
+    Ok(parquet_file_id)
 }
 
-async fn flag_for_delete<'q, E>(executor: E, id: ParquetFileId, marked_at: Timestamp) -> Result<()>
+async fn flag_for_delete<'q, E>(
+    executor: E,
+    ids: &[ParquetFileId],
+    marked_at: Timestamp,
+) -> Result<()>
 where
     E: Executor<'q, Database = Postgres>,
 {
-    let query = sqlx::query(r#"UPDATE parquet_file SET to_delete = $1 WHERE id = $2;"#)
+    let query = sqlx::query(r#"UPDATE parquet_file SET to_delete = $1 WHERE id = ANY($2);"#)
         .bind(marked_at) // $1
-        .bind(id); // $2
+        .bind(ids); // $2
     query
         .execute(executor)
         .await
@@ -1574,30 +1864,25 @@ async fn update_compaction_level<'q, E>(
     executor: E,
     parquet_file_ids: &[ParquetFileId],
     compaction_level: CompactionLevel,
-) -> Result<Vec<ParquetFileId>>
+) -> Result<()>
 where
     E: Executor<'q, Database = Postgres>,
 {
-    // If I try to do `.bind(parquet_file_ids)` directly, I get a compile error from sqlx.
-    // See https://github.com/launchbadge/sqlx/issues/1744
-    let ids: Vec<_> = parquet_file_ids.iter().map(|p| p.get()).collect();
     let query = sqlx::query(
         r#"
 UPDATE parquet_file
 SET compaction_level = $1
-WHERE id = ANY($2)
-RETURNING id;
+WHERE id = ANY($2);
         "#,
     )
     .bind(compaction_level) // $1
-    .bind(&ids[..]); // $2
-    let updated = query
-        .fetch_all(executor)
+    .bind(parquet_file_ids); // $2
+    query
+        .execute(executor)
         .await
         .map_err(|e| Error::SqlxError { source: e })?;
 
-    let updated = updated.into_iter().map(|row| row.get("id")).collect();
-    Ok(updated)
+    Ok(())
 }
 
 /// The error code returned by Postgres for a unique constraint violation.
@@ -1633,35 +1918,32 @@ fn is_fk_violation(e: &sqlx::Error) -> bool {
     false
 }
 
+/// Test helpers postgres testing.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_utils {
     use super::*;
-    use crate::test_helpers::{arbitrary_namespace, arbitrary_table};
-    use assert_matches::assert_matches;
-    use data_types::{ColumnId, ColumnSet};
-    use metric::{Attributes, DurationHistogram, Metric};
     use rand::Rng;
     use sqlx::migrate::MigrateDatabase;
-    use std::{env, io::Write, sync::Arc, time::Instant};
-    use tempfile::NamedTempFile;
 
-    // Helper macro to skip tests if TEST_INTEGRATION and TEST_INFLUXDB_IOX_CATALOG_DSN environment
-    // variables are not set.
+    pub const TEST_DSN_ENV: &str = "TEST_INFLUXDB_IOX_CATALOG_DSN";
+
+    /// Helper macro to skip tests if TEST_INTEGRATION and TEST_INFLUXDB_IOX_CATALOG_DSN environment
+    /// variables are not set.
     macro_rules! maybe_skip_integration {
         ($panic_msg:expr) => {{
             dotenvy::dotenv().ok();
 
-            let required_vars = ["TEST_INFLUXDB_IOX_CATALOG_DSN"];
+            let required_vars = [crate::postgres::test_utils::TEST_DSN_ENV];
             let unset_vars: Vec<_> = required_vars
                 .iter()
-                .filter_map(|&name| match env::var(name) {
+                .filter_map(|&name| match std::env::var(name) {
                     Ok(_) => None,
                     Err(_) => Some(name),
                 })
                 .collect();
             let unset_var_names = unset_vars.join(", ");
 
-            let force = env::var("TEST_INTEGRATION");
+            let force = std::env::var("TEST_INTEGRATION");
 
             if force.is_ok() && !unset_var_names.is_empty() {
                 panic!(
@@ -1692,19 +1974,9 @@ mod tests {
         };
     }
 
-    fn assert_metric_hit(metrics: &metric::Registry, name: &'static str) {
-        let histogram = metrics
-            .get_instrument::<Metric<DurationHistogram>>("catalog_op_duration")
-            .expect("failed to read metric")
-            .get_observer(&Attributes::from(&[("op", name), ("result", "success")]))
-            .expect("failed to get observer")
-            .fetch();
+    pub(crate) use maybe_skip_integration;
 
-        let hit_count = histogram.sample_count();
-        assert!(hit_count > 0, "metric did not record any calls");
-    }
-
-    async fn create_db(dsn: &str) {
+    pub async fn create_db(dsn: &str) {
         // Create the catalog database if it doesn't exist
         if !Postgres::database_exists(dsn).await.unwrap() {
             // Ignore failure if another test has already created the database
@@ -1712,7 +1984,7 @@ mod tests {
         }
     }
 
-    async fn setup_db() -> PostgresCatalog {
+    pub async fn setup_db_no_migration() -> PostgresCatalog {
         // create a random schema for this particular pool
         let schema_name = {
             // use scope to make it clear to clippy / rust that `rng` is
@@ -1759,9 +2031,80 @@ mod tests {
             .await
             .expect("failed to grant privileges to schema");
 
+        pg
+    }
+
+    pub async fn setup_db() -> PostgresCatalog {
+        let pg = setup_db_no_migration().await;
         // Run the migrations against this random schema.
         pg.setup().await.expect("failed to initialise database");
         pg
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        postgres::test_utils::{
+            create_db, maybe_skip_integration, setup_db, setup_db_no_migration,
+        },
+        test_helpers::{arbitrary_namespace, arbitrary_parquet_file_params, arbitrary_table},
+    };
+    use assert_matches::assert_matches;
+    use data_types::partition_template::TemplatePart;
+    use generated_types::influxdata::iox::partition_template::v1 as proto;
+    use metric::{Attributes, DurationHistogram, Metric, Observation, RawReporter};
+    use std::{io::Write, ops::Deref, sync::Arc, time::Instant};
+    use tempfile::NamedTempFile;
+    use test_helpers::maybe_start_logging;
+
+    fn assert_metric_hit(metrics: &metric::Registry, name: &'static str) {
+        let histogram = metrics
+            .get_instrument::<Metric<DurationHistogram>>("catalog_op_duration")
+            .expect("failed to read metric")
+            .get_observer(&Attributes::from(&[("op", name), ("result", "success")]))
+            .expect("failed to get observer")
+            .fetch();
+
+        let hit_count = histogram.sample_count();
+        assert!(hit_count > 0, "metric did not record any calls");
+    }
+
+    /// Small no-op test just to print out the migrations.
+    ///
+    /// This is helpful to look up migration checksums and debug parsing of the migration files.
+    #[test]
+    fn print_migrations() {
+        println!("{:#?}", MIGRATOR.deref());
+    }
+
+    #[tokio::test]
+    async fn test_migration() {
+        maybe_skip_integration!();
+        maybe_start_logging();
+
+        let postgres = setup_db_no_migration().await;
+
+        // 1st setup
+        postgres.setup().await.unwrap();
+
+        // 2nd setup
+        postgres.setup().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_migration_generic() {
+        use crate::migrate::test_utils::test_migration;
+
+        maybe_skip_integration!();
+        maybe_start_logging();
+
+        test_migration(&MIGRATOR, || async {
+            setup_db_no_migration().await.into_pool()
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -1825,22 +2168,192 @@ mod tests {
         let namespace = arbitrary_namespace(&mut *repos, "ns4").await;
         let table_id = arbitrary_table(&mut *repos, "table", &namespace).await.id;
 
-        let key = "bananas";
+        let key = PartitionKey::from("bananas");
+
+        let hash_id = PartitionHashId::new(table_id, &key);
 
         let a = repos
             .partitions()
-            .create_or_get(key.into(), table_id)
+            .create_or_get(key.clone(), table_id)
             .await
             .expect("should create OK");
+
+        assert_eq!(a.hash_id().unwrap(), &hash_id);
+        // Test: sort_key_ids from partition_create_or_get_idempotent
+        assert!(a.sort_key_ids().unwrap().is_empty());
 
         // Call create_or_get for the same (key, table_id) pair, to ensure the write is idempotent.
         let b = repos
             .partitions()
-            .create_or_get(key.into(), table_id)
+            .create_or_get(key.clone(), table_id)
             .await
             .expect("idempotent write should succeed");
 
         assert_eq!(a, b);
+
+        // Check that the hash_id is saved in the database and is returned when queried.
+        let table_partitions = postgres
+            .repositories()
+            .await
+            .partitions()
+            .list_by_table_id(table_id)
+            .await
+            .unwrap();
+        assert_eq!(table_partitions.len(), 1);
+        assert_eq!(table_partitions[0].hash_id().unwrap(), &hash_id);
+
+        // Test: sort_key_ids from partition_create_or_get_idempotent
+        assert!(table_partitions[0].sort_key_ids().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn existing_partitions_without_hash_id() {
+        maybe_skip_integration!();
+
+        let postgres = setup_db().await;
+        let pool = postgres.pool.clone();
+        let postgres: Arc<dyn Catalog> = Arc::new(postgres);
+        let mut repos = postgres.repositories().await;
+
+        let namespace = arbitrary_namespace(&mut *repos, "ns4").await;
+        let table = arbitrary_table(&mut *repos, "table", &namespace).await;
+        let table_id = table.id;
+        let key = PartitionKey::from("francis-scott-key-key");
+
+        // Create a partition record in the database that has `NULL` for its `hash_id`
+        // value, which is what records existing before the migration adding that column will have.
+        sqlx::query(
+            r#"
+INSERT INTO partition
+    (partition_key, shard_id, table_id, sort_key, sort_key_ids)
+VALUES
+    ( $1, $2, $3, '{}', '{}')
+ON CONFLICT ON CONSTRAINT partition_key_unique
+DO UPDATE SET partition_key = partition.partition_key
+RETURNING id, hash_id, table_id, partition_key, sort_key, sort_key_ids, new_file_at;
+        "#,
+        )
+        .bind(&key) // $1
+        .bind(TRANSITION_SHARD_ID) // $2
+        .bind(table_id) // $3
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // Check that the hash_id being null in the database doesn't break querying for partitions.
+        let table_partitions = repos.partitions().list_by_table_id(table_id).await.unwrap();
+        assert_eq!(table_partitions.len(), 1);
+        let partition = &table_partitions[0];
+        assert!(partition.hash_id().is_none());
+
+        // Call create_or_get for the same (key, table_id) pair, to ensure the write is idempotent
+        // and that the hash_id still doesn't get set.
+        let inserted_again = repos
+            .partitions()
+            .create_or_get(key, table_id)
+            .await
+            .expect("idempotent write should succeed");
+
+        // Test: sort_key_ids from freshly insert with empty value
+        assert!(inserted_again.sort_key_ids().unwrap().is_empty());
+
+        assert_eq!(partition, &inserted_again);
+
+        // Create a Parquet file record in this partition to ensure we don't break new data
+        // ingestion for old-style partitions
+        let parquet_file_params = arbitrary_parquet_file_params(&namespace, &table, partition);
+        let parquet_file = repos
+            .parquet_files()
+            .create(parquet_file_params)
+            .await
+            .unwrap();
+        assert_matches!(
+            parquet_file.partition_id,
+            TransitionPartitionId::Deprecated(_)
+        );
+
+        // Add a partition record WITH a hash ID
+        repos
+            .partitions()
+            .create_or_get(PartitionKey::from("Something else"), table_id)
+            .await
+            .unwrap();
+
+        // Ensure we can list only the old-style partitions
+        let old_style_partitions = repos.partitions().list_old_style().await.unwrap();
+        assert_eq!(old_style_partitions.len(), 1);
+        assert_eq!(old_style_partitions[0].id, partition.id);
+    }
+
+    // todo: remove this test once we're sure all partitions have a sort_key_ids
+    #[tokio::test]
+    async fn existing_partitions_without_sort_key_ids() {
+        maybe_skip_integration!();
+
+        let postgres = setup_db().await;
+        let pool = postgres.pool.clone();
+        let postgres: Arc<dyn Catalog> = Arc::new(postgres);
+        let mut repos = postgres.repositories().await;
+
+        let namespace = arbitrary_namespace(&mut *repos, "ns-sort-key-ids").await;
+        let table = arbitrary_table(&mut *repos, "table", &namespace).await;
+        let table_id = table.id;
+        let key = PartitionKey::from("test-sort-key-ids");
+
+        // Create a partition record in the database that has `NULL` for its `sort_key_ids`
+        // value, which is what records existing before the migration adding that column will have.
+        // NOTE: the sort_key_ids should NOT be added in the INSERT INTO statement below but it SHOULD
+        // be returned in the RETURNING statement.
+        sqlx::query(
+            r#"
+INSERT INTO partition
+    (partition_key, shard_id, table_id, sort_key)
+VALUES
+    ( $1, $2, $3, '{}')
+ON CONFLICT ON CONSTRAINT partition_key_unique
+DO UPDATE SET partition_key = partition.partition_key
+RETURNING id, hash_id, table_id, partition_key, sort_key, sort_key_ids, new_file_at;
+        "#,
+        )
+        .bind(&key) // $1
+        .bind(TRANSITION_SHARD_ID) // $2
+        .bind(table_id) // $3
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // Check that the sort_key_ids is null in the database doesn't break querying for partitions.
+        let table_partitions = repos.partitions().list_by_table_id(table_id).await.unwrap();
+        assert_eq!(table_partitions.len(), 1);
+        let partition = &table_partitions[0];
+        // Test: sort_key_ids from freshly insert
+        assert!(partition.sort_key_ids.is_none());
+
+        // Call create_or_get for the same (key, table_id) pair, to ensure the write is idempotent
+        // and that the sort_key_ids still doesn't get set.
+        let inserted_again = repos
+            .partitions()
+            .create_or_get(key, table_id)
+            .await
+            .expect("idempotent write should succeed");
+
+        // Test: sort_key_ids from insert again
+        assert!(inserted_again.sort_key_ids.is_none());
+
+        assert_eq!(partition, &inserted_again);
+
+        // Create a Parquet file record in this partition to ensure we don't break new data
+        // ingestion for old-style partitions that have NULL sort_key_ids
+        let parquet_file_params = arbitrary_parquet_file_params(&namespace, &table, partition);
+        let parquet_file = repos
+            .parquet_files()
+            .create(parquet_file_params)
+            .await
+            .unwrap();
+        assert_matches!(
+            parquet_file.partition_id,
+            TransitionPartitionId::Deprecated(_)
+        );
     }
 
     #[test]
@@ -1884,7 +2397,8 @@ mod tests {
             hotswap_poll_interval: POLLING_INTERVAL,
             ..Default::default()
         };
-        let pool = new_pool(&options).await.expect("connect");
+        let metrics = Arc::new(metric::Registry::new());
+        let pool = new_pool(&options, metrics).await.expect("connect");
         eprintln!("got a pool");
 
         // ensure the application name is set as expected
@@ -2094,42 +2608,20 @@ mod tests {
         let postgres: Arc<dyn Catalog> = Arc::new(postgres);
         let mut repos = postgres.repositories().await;
         let namespace = arbitrary_namespace(&mut *repos, "ns4").await;
-        let namespace_id = namespace.id;
-        let table_id = arbitrary_table(&mut *repos, "table", &namespace).await.id;
-
+        let table = arbitrary_table(&mut *repos, "table", &namespace).await;
         let key = "bananas";
-
-        let partition_id = repos
+        let partition = repos
             .partitions()
-            .create_or_get(key.into(), table_id)
+            .create_or_get(key.into(), table.id)
             .await
-            .expect("should create OK")
-            .id;
+            .unwrap();
 
-        // parquet file to create- all we care about here is the size, the rest is to satisfy DB
-        // constraints
-        let time_provider = Arc::new(SystemProvider::new());
-        let time_now = Timestamp::from(time_provider.now());
-        let mut p1 = ParquetFileParams {
-            namespace_id,
-            table_id,
-            partition_id,
-            object_store_id: Uuid::new_v4(),
-            min_time: Timestamp::new(1),
-            max_time: Timestamp::new(5),
-            file_size_bytes: 1337,
-            row_count: 0,
-            compaction_level: CompactionLevel::Initial, // level of file of new writes
-            created_at: time_now,
-            column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
-            max_l0_created_at: time_now,
-        };
-        let f1 = repos
-            .parquet_files()
-            .create(p1.clone())
-            .await
-            .expect("create parquet file should succeed");
-        // insert the same again with a different size; we should then have 3x1337 as total file size
+        // parquet file to create- all we care about here is the size
+        let mut p1 = arbitrary_parquet_file_params(&namespace, &table, &partition);
+        p1.file_size_bytes = 1337;
+        let f1 = repos.parquet_files().create(p1.clone()).await.unwrap();
+        // insert the same again with a different size; we should then have 3x1337 as total file
+        // size
         p1.object_store_id = Uuid::new_v4();
         p1.file_size_bytes *= 2;
         let _f2 = repos
@@ -2149,7 +2641,7 @@ mod tests {
         // flag f1 for deletion and assert that the total file size is reduced accordingly.
         repos
             .parquet_files()
-            .flag_for_delete(f1.id)
+            .create_upgrade_delete(&[f1.id], &[], &[], CompactionLevel::Initial)
             .await
             .expect("flag parquet file for deletion should succeed");
         let total_file_size_bytes: i64 =
@@ -2157,14 +2649,15 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .expect("fetch total file size failed");
-        // we marked the first file of size 1337 for deletion leaving only the second that was 2x that
+        // we marked the first file of size 1337 for deletion leaving only the second that was 2x
+        // that
         assert_eq!(total_file_size_bytes, 1337 * 2);
 
         // actually deleting shouldn't change the total
-        let now = Timestamp::from(time_provider.now());
+        let older_than = p1.created_at + 1;
         repos
             .parquet_files()
-            .delete_old_ids_only(now)
+            .delete_old_ids_only(older_than)
             .await
             .expect("parquet file deletion should succeed");
         let total_file_size_bytes: i64 =
@@ -2173,5 +2666,463 @@ mod tests {
                 .await
                 .expect("fetch total file size failed");
         assert_eq!(total_file_size_bytes, 1337 * 2);
+    }
+
+    #[tokio::test]
+    async fn namespace_partition_template_null_is_the_default_in_the_database() {
+        maybe_skip_integration!();
+
+        let postgres = setup_db().await;
+        let pool = postgres.pool.clone();
+        let postgres: Arc<dyn Catalog> = Arc::new(postgres);
+        let mut repos = postgres.repositories().await;
+
+        let namespace_name = "apples";
+
+        // Create a namespace record in the database that has `NULL` for its `partition_template`
+        // value, which is what records existing before the migration adding that column will have.
+        let insert_null_partition_template_namespace = sqlx::query(
+            r#"
+INSERT INTO namespace (
+    name, topic_id, query_pool_id, retention_period_ns, max_tables, partition_template
+)
+VALUES ( $1, $2, $3, $4, $5, NULL )
+RETURNING id, name, retention_period_ns, max_tables, max_columns_per_table, deleted_at,
+          partition_template;
+            "#,
+        )
+        .bind(namespace_name) // $1
+        .bind(SHARED_TOPIC_ID) // $2
+        .bind(SHARED_QUERY_POOL_ID) // $3
+        .bind(None::<Option<i64>>) // $4
+        .bind(DEFAULT_MAX_TABLES); // $5
+
+        insert_null_partition_template_namespace
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        let lookup_namespace = repos
+            .namespaces()
+            .get_by_name(namespace_name, SoftDeletedRows::ExcludeDeleted)
+            .await
+            .unwrap()
+            .unwrap();
+        // When fetching this namespace from the database, the `FromRow` impl should set its
+        // `partition_template` to the default.
+        assert_eq!(
+            lookup_namespace.partition_template,
+            NamespacePartitionTemplateOverride::default()
+        );
+
+        // When creating a namespace through the catalog functions without specifying a custom
+        // partition template,
+        let created_without_custom_template = repos
+            .namespaces()
+            .create(
+                &"lemons".try_into().unwrap(),
+                None, // no partition template
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // it should have the default template in the application,
+        assert_eq!(
+            created_without_custom_template.partition_template,
+            NamespacePartitionTemplateOverride::default()
+        );
+
+        // and store NULL in the database record.
+        let record = sqlx::query("SELECT name, partition_template FROM namespace WHERE id = $1;")
+            .bind(created_without_custom_template.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let name: String = record.try_get("name").unwrap();
+        assert_eq!(created_without_custom_template.name, name);
+        let partition_template: Option<NamespacePartitionTemplateOverride> =
+            record.try_get("partition_template").unwrap();
+        assert!(partition_template.is_none());
+
+        // When explicitly setting a template that happens to be equal to the application default,
+        // assume it's important that it's being specially requested and store it rather than NULL.
+        let namespace_custom_template_name = "kumquats";
+        let custom_partition_template_equal_to_default =
+            NamespacePartitionTemplateOverride::try_from(proto::PartitionTemplate {
+                parts: vec![proto::TemplatePart {
+                    part: Some(proto::template_part::Part::TimeFormat(
+                        "%Y-%m-%d".to_owned(),
+                    )),
+                }],
+            })
+            .unwrap();
+        let namespace_custom_template = repos
+            .namespaces()
+            .create(
+                &namespace_custom_template_name.try_into().unwrap(),
+                Some(custom_partition_template_equal_to_default.clone()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            namespace_custom_template.partition_template,
+            custom_partition_template_equal_to_default
+        );
+        let record = sqlx::query("SELECT name, partition_template FROM namespace WHERE id = $1;")
+            .bind(namespace_custom_template.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let name: String = record.try_get("name").unwrap();
+        assert_eq!(namespace_custom_template.name, name);
+        let partition_template: Option<NamespacePartitionTemplateOverride> =
+            record.try_get("partition_template").unwrap();
+        assert_eq!(
+            partition_template.unwrap(),
+            custom_partition_template_equal_to_default
+        );
+    }
+
+    #[tokio::test]
+    async fn table_partition_template_null_is_the_default_in_the_database() {
+        maybe_skip_integration!();
+
+        let postgres = setup_db().await;
+        let pool = postgres.pool.clone();
+        let postgres: Arc<dyn Catalog> = Arc::new(postgres);
+        let mut repos = postgres.repositories().await;
+
+        let namespace_default_template_name = "oranges";
+        let namespace_default_template = repos
+            .namespaces()
+            .create(
+                &namespace_default_template_name.try_into().unwrap(),
+                None, // no partition template
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let namespace_custom_template_name = "limes";
+        let namespace_custom_template = repos
+            .namespaces()
+            .create(
+                &namespace_custom_template_name.try_into().unwrap(),
+                Some(
+                    NamespacePartitionTemplateOverride::try_from(proto::PartitionTemplate {
+                        parts: vec![proto::TemplatePart {
+                            part: Some(proto::template_part::Part::TimeFormat("year-%Y".into())),
+                        }],
+                    })
+                    .unwrap(),
+                ),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // In a namespace that also has a NULL template, create a table record in the database that
+        // has `NULL` for its `partition_template` value, which is what records existing before the
+        // migration adding that column will have.
+        let table_name = "null_template";
+        let insert_null_partition_template_table = sqlx::query(
+            r#"
+INSERT INTO table_name ( name, namespace_id, partition_template )
+VALUES ( $1, $2, NULL )
+RETURNING *;
+            "#,
+        )
+        .bind(table_name) // $1
+        .bind(namespace_default_template.id); // $2
+
+        insert_null_partition_template_table
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        let lookup_table = repos
+            .tables()
+            .get_by_namespace_and_name(namespace_default_template.id, table_name)
+            .await
+            .unwrap()
+            .unwrap();
+        // When fetching this table from the database, the `FromRow` impl should set its
+        // `partition_template` to the system default (because the namespace didn't have a template
+        // either).
+        assert_eq!(
+            lookup_table.partition_template,
+            TablePartitionTemplateOverride::default()
+        );
+
+        // In a namespace that has a custom template, create a table record in the database that
+        // has `NULL` for its `partition_template` value.
+        //
+        // THIS ACTUALLY SHOULD BE IMPOSSIBLE because:
+        //
+        // * Namespaces have to exist before tables
+        // * `partition_tables` are immutable on both namespaces and tables
+        // * When the migration adding the `partition_table` column is deployed, namespaces can
+        //   begin to be created with `partition_templates`
+        // * *Then* tables can be created with `partition_templates` or not
+        // * When tables don't get a custom table partition template but their namespace has one,
+        //   their database record will get the namespace partition template.
+        //
+        // In other words, table `partition_template` values in the database is allowed to possibly
+        // be `NULL` IFF their namespace's `partition_template` is `NULL`.
+        //
+        // That said, this test creates this hopefully-impossible scenario to ensure that the
+        // defined, expected behavior if a table record somehow exists in the database with a `NULL`
+        // `partition_template` value is that it will have the application default partition
+        // template *even if the namespace `partition_template` is not null*.
+        let table_name = "null_template";
+        let insert_null_partition_template_table = sqlx::query(
+            r#"
+INSERT INTO table_name ( name, namespace_id, partition_template )
+VALUES ( $1, $2, NULL )
+RETURNING *;
+            "#,
+        )
+        .bind(table_name) // $1
+        .bind(namespace_custom_template.id); // $2
+
+        insert_null_partition_template_table
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        let lookup_table = repos
+            .tables()
+            .get_by_namespace_and_name(namespace_custom_template.id, table_name)
+            .await
+            .unwrap()
+            .unwrap();
+        // When fetching this table from the database, the `FromRow` impl should set its
+        // `partition_template` to the system default *even though the namespace has a
+        // template*, because this should be impossible as detailed above.
+        assert_eq!(
+            lookup_table.partition_template,
+            TablePartitionTemplateOverride::default()
+        );
+
+        // # Table template false, namespace template true
+        //
+        // When creating a table through the catalog functions *without* a custom table template in
+        // a namespace *with* a custom partition template,
+        let table_no_template_with_namespace_template = repos
+            .tables()
+            .create(
+                "pomelo",
+                TablePartitionTemplateOverride::try_new(
+                    None, // no custom partition template
+                    &namespace_custom_template.partition_template,
+                )
+                .unwrap(),
+                namespace_custom_template.id,
+            )
+            .await
+            .unwrap();
+
+        // it should have the namespace's template
+        assert_eq!(
+            table_no_template_with_namespace_template.partition_template,
+            TablePartitionTemplateOverride::try_new(
+                None,
+                &namespace_custom_template.partition_template
+            )
+            .unwrap()
+        );
+
+        // and store that value in the database record.
+        let record = sqlx::query("SELECT name, partition_template FROM table_name WHERE id = $1;")
+            .bind(table_no_template_with_namespace_template.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let name: String = record.try_get("name").unwrap();
+        assert_eq!(table_no_template_with_namespace_template.name, name);
+        let partition_template: Option<TablePartitionTemplateOverride> =
+            record.try_get("partition_template").unwrap();
+        assert_eq!(
+            partition_template.unwrap(),
+            TablePartitionTemplateOverride::try_new(
+                None,
+                &namespace_custom_template.partition_template
+            )
+            .unwrap()
+        );
+
+        // # Table template true, namespace template false
+        //
+        // When creating a table through the catalog functions *with* a custom table template in
+        // a namespace *without* a custom partition template,
+        let custom_table_template = proto::PartitionTemplate {
+            parts: vec![proto::TemplatePart {
+                part: Some(proto::template_part::Part::TagValue("chemical".into())),
+            }],
+        };
+        let table_with_template_no_namespace_template = repos
+            .tables()
+            .create(
+                "tangerine",
+                TablePartitionTemplateOverride::try_new(
+                    Some(custom_table_template), // with custom partition template
+                    &namespace_default_template.partition_template,
+                )
+                .unwrap(),
+                namespace_default_template.id,
+            )
+            .await
+            .unwrap();
+
+        // it should have the custom table template
+        let table_template_parts: Vec<_> = table_with_template_no_namespace_template
+            .partition_template
+            .parts()
+            .collect();
+        assert_eq!(table_template_parts.len(), 1);
+        assert_matches!(
+            table_template_parts[0],
+            TemplatePart::TagValue(tag) if tag == "chemical"
+        );
+
+        // and store that value in the database record.
+        let record = sqlx::query("SELECT name, partition_template FROM table_name WHERE id = $1;")
+            .bind(table_with_template_no_namespace_template.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let name: String = record.try_get("name").unwrap();
+        assert_eq!(table_with_template_no_namespace_template.name, name);
+        let partition_template = record
+            .try_get::<Option<TablePartitionTemplateOverride>, _>("partition_template")
+            .unwrap()
+            .unwrap();
+        let table_template_parts: Vec<_> = partition_template.parts().collect();
+        assert_eq!(table_template_parts.len(), 1);
+        assert_matches!(
+            table_template_parts[0],
+            TemplatePart::TagValue(tag) if tag == "chemical"
+        );
+
+        // # Table template true, namespace template true
+        //
+        // When creating a table through the catalog functions *with* a custom table template in
+        // a namespace *with* a custom partition template,
+        let custom_table_template = proto::PartitionTemplate {
+            parts: vec![proto::TemplatePart {
+                part: Some(proto::template_part::Part::TagValue("vegetable".into())),
+            }],
+        };
+        let table_with_template_with_namespace_template = repos
+            .tables()
+            .create(
+                "nectarine",
+                TablePartitionTemplateOverride::try_new(
+                    Some(custom_table_template), // with custom partition template
+                    &namespace_custom_template.partition_template,
+                )
+                .unwrap(),
+                namespace_custom_template.id,
+            )
+            .await
+            .unwrap();
+
+        // it should have the custom table template
+        let table_template_parts: Vec<_> = table_with_template_with_namespace_template
+            .partition_template
+            .parts()
+            .collect();
+        assert_eq!(table_template_parts.len(), 1);
+        assert_matches!(
+            table_template_parts[0],
+            TemplatePart::TagValue(tag) if tag == "vegetable"
+        );
+
+        // and store that value in the database record.
+        let record = sqlx::query("SELECT name, partition_template FROM table_name WHERE id = $1;")
+            .bind(table_with_template_with_namespace_template.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let name: String = record.try_get("name").unwrap();
+        assert_eq!(table_with_template_with_namespace_template.name, name);
+        let partition_template = record
+            .try_get::<Option<TablePartitionTemplateOverride>, _>("partition_template")
+            .unwrap()
+            .unwrap();
+        let table_template_parts: Vec<_> = partition_template.parts().collect();
+        assert_eq!(table_template_parts.len(), 1);
+        assert_matches!(
+            table_template_parts[0],
+            TemplatePart::TagValue(tag) if tag == "vegetable"
+        );
+
+        // # Table template false, namespace template false
+        //
+        // When creating a table through the catalog functions *without* a custom table template in
+        // a namespace *without* a custom partition template,
+        let table_no_template_no_namespace_template = repos
+            .tables()
+            .create(
+                "grapefruit",
+                TablePartitionTemplateOverride::try_new(
+                    None, // no custom partition template
+                    &namespace_default_template.partition_template,
+                )
+                .unwrap(),
+                namespace_default_template.id,
+            )
+            .await
+            .unwrap();
+
+        // it should have the default template in the application,
+        assert_eq!(
+            table_no_template_no_namespace_template.partition_template,
+            TablePartitionTemplateOverride::default()
+        );
+
+        // and store NULL in the database record.
+        let record = sqlx::query("SELECT name, partition_template FROM table_name WHERE id = $1;")
+            .bind(table_no_template_no_namespace_template.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let name: String = record.try_get("name").unwrap();
+        assert_eq!(table_no_template_no_namespace_template.name, name);
+        let partition_template: Option<TablePartitionTemplateOverride> =
+            record.try_get("partition_template").unwrap();
+        assert!(partition_template.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_metrics() {
+        maybe_skip_integration!();
+
+        let postgres = setup_db_no_migration().await;
+
+        let mut reporter = RawReporter::default();
+        postgres.metrics.report(&mut reporter);
+        assert_eq!(
+            reporter
+                .metric("sqlx_postgres_connections")
+                .unwrap()
+                .observation(&[("pool_id", "0"), ("state", "min")])
+                .unwrap(),
+            &Observation::U64Gauge(1),
+        );
+        assert_eq!(
+            reporter
+                .metric("sqlx_postgres_connections")
+                .unwrap()
+                .observation(&[("pool_id", "0"), ("state", "max")])
+                .unwrap(),
+            &Observation::U64Gauge(3),
+        );
     }
 }

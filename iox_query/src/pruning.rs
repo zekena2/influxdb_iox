@@ -1,22 +1,21 @@
 //! Implementation of statistics based pruning
 
-use crate::{QueryChunk, QueryChunkMeta};
+use crate::QueryChunk;
 use arrow::{
-    array::{
-        ArrayRef, BooleanArray, DictionaryArray, Float64Array, Int64Array, StringArray, UInt64Array,
-    },
-    datatypes::{DataType, Int32Type, TimeUnit},
+    array::{ArrayRef, UInt64Array},
+    datatypes::{DataType, SchemaRef},
 };
-use data_types::{StatValues, Statistics, TableSummary};
 use datafusion::{
-    physical_expr::execution_props::ExecutionProps, physical_optimizer::pruning::PruningStatistics,
-    prelude::Column,
+    physical_expr::execution_props::ExecutionProps,
+    physical_optimizer::pruning::PruningStatistics,
+    physical_plan::{ColumnStatistics, Statistics},
+    prelude::{col, lit_timestamp_nano, Column, Expr},
+    scalar::ScalarValue,
 };
 use datafusion_util::create_pruning_predicate;
 use observability_deps::tracing::{debug, trace, warn};
-use predicate::Predicate;
 use query_functions::group_by::Aggregate;
-use schema::Schema;
+use schema::{Schema, TIME_COLUMN_NAME};
 use std::sync::Arc;
 
 /// Reason why a chunk could not be pruned.
@@ -75,22 +74,25 @@ pub trait PruningObserver {
 pub fn prune_chunks(
     table_schema: &Schema,
     chunks: &[Arc<dyn QueryChunk>],
-    predicate: &Predicate,
+    filters: &[Expr],
 ) -> Result<Vec<bool>, NotPrunedReason> {
     let num_chunks = chunks.len();
-    debug!(num_chunks, %predicate, "Pruning chunks");
-    let summaries: Vec<_> = chunks.iter().map(|c| c.summary()).collect();
-    prune_summaries(table_schema, &summaries, predicate)
+    debug!(num_chunks, ?filters, "Pruning chunks");
+    let summaries: Vec<_> = chunks
+        .iter()
+        .map(|c| (c.stats(), c.schema().as_arrow()))
+        .collect();
+    prune_summaries(table_schema, &summaries, filters)
 }
 
 /// Given a `Vec` of pruning summaries, return a `Vec<bool>` where `false` indicates that the
 /// predicate can be proven to evaluate to `false` for every single row.
 pub fn prune_summaries(
     table_schema: &Schema,
-    summaries: &[Arc<TableSummary>],
-    predicate: &Predicate,
+    summaries: &[(Arc<Statistics>, SchemaRef)],
+    filters: &[Expr],
 ) -> Result<Vec<bool>, NotPrunedReason> {
-    let filter_expr = match predicate.filter_expr() {
+    let filter_expr = match filters.iter().cloned().reduce(|a, b| a.and(b)) {
         Some(expr) => expr,
         None => {
             debug!("No expression on predicate");
@@ -129,7 +131,7 @@ pub fn prune_summaries(
 /// interface required for pruning
 struct ChunkPruningStatistics<'a> {
     table_schema: &'a Schema,
-    summaries: &'a [Arc<TableSummary>],
+    summaries: &'a [(Arc<Statistics>, SchemaRef)],
 }
 
 impl<'a> ChunkPruningStatistics<'a> {
@@ -144,10 +146,12 @@ impl<'a> ChunkPruningStatistics<'a> {
     fn column_summaries<'b: 'a, 'c: 'a>(
         &'c self,
         column: &'b Column,
-    ) -> impl Iterator<Item = Option<Statistics>> + 'a {
-        self.summaries
-            .iter()
-            .map(|summary| Some(summary.column(&column.name)?.stats.clone()))
+    ) -> impl Iterator<Item = Option<&'a ColumnStatistics>> + 'a {
+        self.summaries.iter().map(|(stats, schema)| {
+            let stats = stats.column_statistics.as_ref()?;
+            let idx = schema.index_of(&column.name).ok()?;
+            Some(&stats[idx])
+        })
     }
 }
 
@@ -171,7 +175,7 @@ impl<'a> PruningStatistics for ChunkPruningStatistics<'a> {
     fn null_counts(&self, column: &Column) -> Option<ArrayRef> {
         let null_counts = self
             .column_summaries(column)
-            .map(|x| x.and_then(|s| s.null_count()));
+            .map(|x| x.and_then(|s| s.null_count.map(|x| x as u64)));
 
         Some(Arc::new(UInt64Array::from_iter(null_counts)))
     }
@@ -179,84 +183,44 @@ impl<'a> PruningStatistics for ChunkPruningStatistics<'a> {
 
 /// Collects an [`ArrayRef`] containing the aggregate statistic corresponding to
 /// `aggregate` for each of the provided [`Statistics`]
-fn collect_pruning_stats(
+fn collect_pruning_stats<'a>(
     data_type: &DataType,
-    statistics: impl Iterator<Item = Option<Statistics>>,
+    statistics: impl Iterator<Item = Option<&'a ColumnStatistics>>,
     aggregate: Aggregate,
 ) -> Option<ArrayRef> {
-    match data_type {
-        DataType::Int64 | DataType::Timestamp(TimeUnit::Nanosecond, None) => {
-            let values = statistics.map(|s| match s {
-                Some(Statistics::I64(v)) => get_aggregate(v, aggregate),
-                _ => None,
-            });
-            Some(Arc::new(Int64Array::from_iter(values)))
-        }
-        DataType::UInt64 => {
-            let values = statistics.map(|s| match s {
-                Some(Statistics::U64(v)) => get_aggregate(v, aggregate),
-                _ => None,
-            });
-            Some(Arc::new(UInt64Array::from_iter(values)))
-        }
-        DataType::Float64 => {
-            let values = statistics.map(|s| match s {
-                Some(Statistics::F64(v)) => get_aggregate(v, aggregate),
-                _ => None,
-            });
-            Some(Arc::new(Float64Array::from_iter(values)))
-        }
-        DataType::Boolean => {
-            let values = statistics.map(|s| match s {
-                Some(Statistics::Bool(v)) => get_aggregate(v, aggregate),
-                _ => None,
-            });
-            Some(Arc::new(BooleanArray::from_iter(values)))
-        }
-        DataType::Utf8 => {
-            let values = statistics.map(|s| match s {
-                Some(Statistics::String(v)) => get_aggregate(v, aggregate),
-                _ => None,
-            });
-            Some(Arc::new(StringArray::from_iter(values)))
-        }
-        DataType::Dictionary(key, value)
-            if key.as_ref() == &DataType::Int32 && value.as_ref() == &DataType::Utf8 =>
-        {
-            let values = statistics.map(|s| match s {
-                Some(Statistics::String(v)) => get_aggregate(v, aggregate),
-                _ => None,
-            });
+    let null = ScalarValue::try_from(data_type).ok()?;
 
-            // DictionaryArray can only be built from string references (`str`), not from owned strings (`String`), so
-            // we need to collect the strings first
-            let values: Vec<_> = values.collect();
-            let values = values.iter().map(|s| s.as_deref());
-            Some(Arc::new(DictionaryArray::<Int32Type>::from_iter(values)))
-        }
+    ScalarValue::iter_to_array(statistics.map(|stats| {
+        stats
+            .and_then(|stats| get_aggregate(stats, aggregate).cloned())
+            .unwrap_or_else(|| null.clone())
+    }))
+    .ok()
+}
+
+/// Returns the aggregate statistic corresponding to `aggregate` from `stats`
+fn get_aggregate(stats: &ColumnStatistics, aggregate: Aggregate) -> Option<&ScalarValue> {
+    match aggregate {
+        Aggregate::Min => stats.min_value.as_ref(),
+        Aggregate::Max => stats.max_value.as_ref(),
         _ => None,
     }
 }
 
-/// Returns the aggregate statistic corresponding to `aggregate` from `stats`
-fn get_aggregate<T>(stats: StatValues<T>, aggregate: Aggregate) -> Option<T> {
-    match aggregate {
-        Aggregate::Min => stats.min,
-        Aggregate::Max => stats.max,
-        _ => None,
-    }
+/// Retention time expression, "time > retention_time".
+pub fn retention_expr(retention_time: i64) -> Expr {
+    col(TIME_COLUMN_NAME).gt(lit_timestamp_nano(retention_time))
 }
 
 #[cfg(test)]
 mod test {
-    use std::sync::Arc;
+    use std::{ops::Not, sync::Arc};
 
     use datafusion::prelude::{col, lit};
     use datafusion_util::lit_dict;
-    use predicate::Predicate;
     use schema::merge::SchemaMerger;
 
-    use crate::{test::TestChunk, QueryChunk, QueryChunkMeta};
+    use crate::{test::TestChunk, QueryChunk};
 
     use super::*;
 
@@ -265,8 +229,7 @@ mod test {
         test_helpers::maybe_start_logging();
         let c1 = Arc::new(TestChunk::new("chunk1"));
 
-        let predicate = Predicate::new();
-        let result = prune_chunks(&c1.schema().clone(), &[c1], &predicate);
+        let result = prune_chunks(&c1.schema().clone(), &[c1], &[]);
 
         assert_eq!(result, Err(NotPrunedReason::NoExpressionOnPredicate));
     }
@@ -282,9 +245,9 @@ mod test {
             Some(10.0),
         ));
 
-        let predicate = Predicate::new().with_expr(col("column1").gt(lit(100.0f64)));
+        let filters = vec![col("column1").gt(lit(100.0f64))];
 
-        let result = prune_chunks(&c1.schema().clone(), &[c1], &predicate);
+        let result = prune_chunks(&c1.schema().clone(), &[c1], &filters);
         assert_eq!(result.expect("pruning succeeds"), vec![false]);
     }
 
@@ -300,9 +263,9 @@ mod test {
             Some(10),
         ));
 
-        let predicate = Predicate::new().with_expr(col("column1").gt(lit(100i64)));
+        let filters = vec![col("column1").gt(lit(100i64))];
 
-        let result = prune_chunks(&c1.schema().clone(), &[c1], &predicate);
+        let result = prune_chunks(&c1.schema().clone(), &[c1], &filters);
 
         assert_eq!(result.expect("pruning succeeds"), vec![false]);
     }
@@ -319,9 +282,9 @@ mod test {
             Some(10),
         ));
 
-        let predicate = Predicate::new().with_expr(col("column1").gt(lit(100u64)));
+        let filters = vec![col("column1").gt(lit(100u64))];
 
-        let result = prune_chunks(&c1.schema().clone(), &[c1], &predicate);
+        let result = prune_chunks(&c1.schema().clone(), &[c1], &filters);
         assert_eq!(result.expect("pruning succeeds"), vec![false]);
     }
 
@@ -336,9 +299,9 @@ mod test {
             Some(false),
         ));
 
-        let predicate = Predicate::new().with_expr(col("column1"));
+        let filters = vec![col("column1")];
 
-        let result = prune_chunks(&c1.schema().clone(), &[c1], &predicate);
+        let result = prune_chunks(&c1.schema().clone(), &[c1], &filters);
         assert_eq!(result.expect("pruning succeeds"), vec![false; 1]);
     }
 
@@ -356,9 +319,9 @@ mod test {
             ),
         );
 
-        let predicate = Predicate::new().with_expr(col("column1").gt(lit("z")));
+        let filters = vec![col("column1").gt(lit("z"))];
 
-        let result = prune_chunks(&c1.schema().clone(), &[c1], &predicate);
+        let result = prune_chunks(&c1.schema().clone(), &[c1], &filters);
         assert_eq!(result.expect("pruning succeeds"), vec![false]);
     }
 
@@ -373,9 +336,9 @@ mod test {
             Some(10.0),
         ));
 
-        let predicate = Predicate::new().with_expr(col("column1").lt(lit(100.0f64)));
+        let filters = vec![col("column1").lt(lit(100.0f64))];
 
-        let result = prune_chunks(&c1.schema().clone(), &[c1], &predicate);
+        let result = prune_chunks(&c1.schema().clone(), &[c1], &filters);
         assert_eq!(result.expect("pruning succeeds"), vec![true]);
     }
 
@@ -391,9 +354,9 @@ mod test {
             Some(10),
         ));
 
-        let predicate = Predicate::new().with_expr(col("column1").lt(lit(100i64)));
+        let filters = vec![col("column1").lt(lit(100i64))];
 
-        let result = prune_chunks(&c1.schema().clone(), &[c1], &predicate);
+        let result = prune_chunks(&c1.schema().clone(), &[c1], &filters);
         assert_eq!(result.expect("pruning succeeds"), vec![true]);
     }
 
@@ -409,9 +372,9 @@ mod test {
             Some(10),
         ));
 
-        let predicate = Predicate::new().with_expr(col("column1").lt(lit(100u64)));
+        let filters = vec![col("column1").lt(lit(100u64))];
 
-        let result = prune_chunks(&c1.schema().clone(), &[c1], &predicate);
+        let result = prune_chunks(&c1.schema().clone(), &[c1], &filters);
         assert_eq!(result.expect("pruning succeeds"), vec![true]);
     }
 
@@ -427,9 +390,9 @@ mod test {
             Some(true),
         ));
 
-        let predicate = Predicate::new().with_expr(col("column1"));
+        let filters = vec![col("column1")];
 
-        let result = prune_chunks(&c1.schema().clone(), &[c1], &predicate);
+        let result = prune_chunks(&c1.schema().clone(), &[c1], &filters);
         assert_eq!(result.expect("pruning succeeds"), vec![true]);
     }
 
@@ -447,9 +410,9 @@ mod test {
             ),
         );
 
-        let predicate = Predicate::new().with_expr(col("column1").lt(lit("z")));
+        let filters = vec![col("column1").lt(lit("z"))];
 
-        let result = prune_chunks(&c1.schema().clone(), &[c1], &predicate);
+        let result = prune_chunks(&c1.schema().clone(), &[c1], &filters);
         assert_eq!(result.expect("pruning succeeds"), vec![true]);
     }
 
@@ -486,15 +449,15 @@ mod test {
             TestChunk::new("chunk3").with_i64_field_column_with_stats("column1", None, None),
         ) as Arc<dyn QueryChunk>;
 
-        let c4 = Arc::new(TestChunk::new("chunk4").with_i64_field_column_no_stats("column1"))
+        let c4 = Arc::new(TestChunk::new("chunk4").with_i64_field_column("column1"))
             as Arc<dyn QueryChunk>;
 
-        let predicate = Predicate::new().with_expr(col("column1").gt(lit(100i64)));
+        let filters = vec![col("column1").gt(lit(100i64))];
 
         let chunks = vec![c1, c2, c3, c4];
         let schema = merge_schema(&chunks);
 
-        let result = prune_chunks(&schema, &chunks, &predicate);
+        let result = prune_chunks(&schema, &chunks, &filters);
 
         assert_eq!(
             result.expect("pruning succeeds"),
@@ -547,12 +510,12 @@ mod test {
             Some(20),
         )) as Arc<dyn QueryChunk>;
 
-        let predicate = Predicate::new().with_expr(col("column1").gt(lit(100i64)));
+        let filters = vec![col("column1").gt(lit(100i64))];
 
         let chunks = vec![c1, c2, c3, c4, c5, c6];
         let schema = merge_schema(&chunks);
 
-        let result = prune_chunks(&schema, &chunks, &predicate);
+        let result = prune_chunks(&schema, &chunks, &filters);
 
         assert_eq!(
             result.expect("pruning succeeds"),
@@ -585,12 +548,12 @@ mod test {
             Some(4),
         )) as Arc<dyn QueryChunk>;
 
-        let predicate = Predicate::new().with_expr(col("column1").gt(lit(100i64)));
+        let filters = vec![col("column1").gt(lit(100i64))];
 
         let chunks = vec![c1, c2, c3];
         let schema = merge_schema(&chunks);
 
-        let result = prune_chunks(&schema, &chunks, &predicate);
+        let result = prune_chunks(&schema, &chunks, &filters);
 
         assert_eq!(result.expect("pruning succeeds"), vec![false, true, true]);
     }
@@ -638,17 +601,15 @@ mod test {
             ),
         ) as Arc<dyn QueryChunk>;
 
-        let predicate = Predicate::new().with_expr(
-            col("column1")
-                .is_null()
-                .not()
-                .and(col("column1").eq(lit_dict("bar"))),
-        );
+        let filters = vec![col("column1")
+            .is_null()
+            .not()
+            .and(col("column1").eq(lit_dict("bar")))];
 
         let chunks = vec![c1, c2, c3];
         let schema = merge_schema(&chunks);
 
-        let result = prune_chunks(&schema, &chunks, &predicate);
+        let result = prune_chunks(&schema, &chunks, &filters);
 
         assert_eq!(result.expect("pruning succeeds"), vec![true, false, false]);
     }
@@ -691,25 +652,23 @@ mod test {
         let c5 = Arc::new(
             TestChunk::new("chunk5")
                 .with_i64_field_column_with_stats("column1", Some(0), Some(10))
-                .with_i64_field_column_no_stats("column2"),
+                .with_i64_field_column("column2"),
         ) as Arc<dyn QueryChunk>;
 
         let c6 = Arc::new(
             TestChunk::new("chunk6")
-                .with_i64_field_column_no_stats("column1")
+                .with_i64_field_column("column1")
                 .with_i64_field_column_with_stats("column2", Some(0), Some(4)),
         ) as Arc<dyn QueryChunk>;
 
-        let predicate = Predicate::new().with_expr(
-            col("column1")
-                .gt(lit(100i64))
-                .and(col("column2").lt(lit(5i64))),
-        );
+        let filters = vec![col("column1")
+            .gt(lit(100i64))
+            .and(col("column2").lt(lit(5i64)))];
 
         let chunks = vec![c1, c2, c3, c4, c5, c6];
         let schema = merge_schema(&chunks);
 
-        let result = prune_chunks(&schema, &chunks, &predicate);
+        let result = prune_chunks(&schema, &chunks, &filters);
 
         assert_eq!(
             result.expect("Pruning succeeds"),

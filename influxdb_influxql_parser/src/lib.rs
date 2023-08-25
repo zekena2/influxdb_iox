@@ -7,12 +7,17 @@
     missing_copy_implementations,
     missing_docs,
     clippy::explicit_iter_loop,
+    // See https://github.com/influxdata/influxdb_iox/pull/1671
     clippy::future_not_send,
     clippy::use_self,
     clippy::clone_on_ref_ptr,
     clippy::todo,
-    clippy::dbg_macro
+    clippy::dbg_macro,
+    unused_crate_dependencies
 )]
+
+// Workaround for "unused crate" lint false positives.
+use workspace_hack as _;
 
 use crate::common::{statement_terminator, ws0};
 use crate::internal::Error as InternalError;
@@ -46,6 +51,8 @@ pub mod show_tag_values;
 pub mod simple_from_clause;
 pub mod statement;
 pub mod string;
+pub mod time_range;
+pub mod timestamp;
 pub mod visit;
 pub mod visit_mut;
 
@@ -62,10 +69,7 @@ pub fn parse_statements(input: &str) -> ParseResult {
 
     loop {
         // Consume whitespace from the input
-        i = match ws0(i) {
-            Ok((i1, _)) => i1,
-            _ => unreachable!("ws0 is infallible"),
-        };
+        (i, _) = ws0(i).expect("ws0 is infallible");
 
         if eof::<_, nom::error::Error<_>>(i).is_ok() {
             return Ok(res);

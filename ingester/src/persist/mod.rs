@@ -16,8 +16,7 @@ mod tests {
     use std::{sync::Arc, time::Duration};
 
     use assert_matches::assert_matches;
-    use data_types::{CompactionLevel, ParquetFile};
-    use dml::DmlOperation;
+    use data_types::{CompactionLevel, ParquetFile, SortedColumnSet};
     use futures::TryStreamExt;
     use iox_catalog::{
         interface::{get_schema_by_id, Catalog, SoftDeletedRows},
@@ -41,6 +40,7 @@ mod tests {
             post_write::mock::MockPostWriteObserver,
             BufferTree,
         },
+        dml_payload::IngestOp,
         dml_sink::DmlSink,
         ingest_state::IngestState,
         persist::handle::PersistHandle,
@@ -48,7 +48,7 @@ mod tests {
         test_util::{
             make_write_op, populate_catalog, ARBITRARY_NAMESPACE_NAME,
             ARBITRARY_NAMESPACE_NAME_PROVIDER, ARBITRARY_PARTITION_KEY, ARBITRARY_TABLE_NAME,
-            ARBITRARY_TABLE_NAME_PROVIDER,
+            ARBITRARY_TABLE_PROVIDER,
         },
     };
 
@@ -67,7 +67,7 @@ mod tests {
         // Init the buffer tree
         let buf = BufferTree::new(
             Arc::clone(&*ARBITRARY_NAMESPACE_NAME_PROVIDER),
-            Arc::clone(&*ARBITRARY_TABLE_NAME_PROVIDER),
+            Arc::clone(&*ARBITRARY_TABLE_PROVIDER),
             Arc::new(CatalogPartitionResolver::new(Arc::clone(&catalog))),
             Arc::new(MockPostWriteObserver::default()),
             Arc::new(metric::Registry::default()),
@@ -83,6 +83,7 @@ mod tests {
                 r#"{},region=Asturias temp=35 4242424242"#,
                 &*ARBITRARY_TABLE_NAME
             ),
+            None,
         );
 
         let mut repos = catalog
@@ -98,7 +99,7 @@ mod tests {
         validate_or_insert_schema(
             write
                 .tables()
-                .map(|(_id, data)| (&***ARBITRARY_TABLE_NAME, data)),
+                .map(|(_id, data)| (&***ARBITRARY_TABLE_NAME, data.partitioned_data().data())),
             &schema,
             &mut *repos,
         )
@@ -108,7 +109,7 @@ mod tests {
         drop(repos); // Don't you love this testing-only deadlock bug? #3859
 
         // Apply the write
-        buf.apply(DmlOperation::Write(write))
+        buf.apply(IngestOp::Write(write))
             .await
             .expect("failed to apply write to buffer");
 
@@ -189,7 +190,7 @@ mod tests {
         // Generate a partition with data
         let partition = partition_with_write(Arc::clone(&catalog)).await;
         let table_id = partition.lock().table_id();
-        let partition_id = partition.lock().partition_id();
+        let partition_id = partition.lock().partition_id().clone();
         let namespace_id = partition.lock().namespace_id();
         assert_matches!(partition.lock().sort_key(), SortKeyState::Provided(None));
 
@@ -220,7 +221,7 @@ mod tests {
         assert_matches!(&completion_observer.calls().as_slice(), &[n] => {
             assert_eq!(n.namespace_id(), namespace_id);
             assert_eq!(n.table_id(), table_id);
-            assert_eq!(n.partition_id(), partition_id);
+            assert_eq!(n.partition_id(), &partition_id);
             assert_eq!(n.sequence_numbers().len(), 1);
         });
 
@@ -242,12 +243,12 @@ mod tests {
             .repositories()
             .await
             .parquet_files()
-            .list_by_partition_not_to_delete(partition_id)
+            .list_by_partition_not_to_delete(&partition_id)
             .await
             .expect("query for parquet files failed");
 
         // Validate a single file was inserted with the expected properties.
-        let (object_store_id, file_size_bytes) = assert_matches!(&*files, &[ParquetFile {
+        let (object_store_id, file_size_bytes) = assert_matches!(&*files, [ParquetFile {
                 namespace_id: got_namespace_id,
                 table_id: got_table_id,
                 partition_id: got_partition_id,
@@ -262,12 +263,12 @@ mod tests {
             {
                 assert_eq!(created_at.get(), max_l0_created_at.get());
 
-                assert_eq!(got_namespace_id, namespace_id);
-                assert_eq!(got_table_id, table_id);
-                assert_eq!(got_partition_id, partition_id);
+                assert_eq!(got_namespace_id, &namespace_id);
+                assert_eq!(got_table_id, &table_id);
+                assert_eq!(got_partition_id, &partition_id);
 
-                assert_eq!(row_count, 1);
-                assert_eq!(compaction_level, CompactionLevel::Initial);
+                assert_eq!(*row_count, 1);
+                assert_eq!(compaction_level, &CompactionLevel::Initial);
 
                 (object_store_id, file_size_bytes)
             }
@@ -291,7 +292,7 @@ mod tests {
             }] => {
                 let want_path = format!("{object_store_id}.parquet");
                 assert!(location.as_ref().ends_with(&want_path));
-                assert_eq!(size, file_size_bytes as usize);
+                assert_eq!(size, *file_size_bytes as usize);
             }
         )
     }
@@ -325,7 +326,7 @@ mod tests {
         // Generate a partition with data
         let partition = partition_with_write(Arc::clone(&catalog)).await;
         let table_id = partition.lock().table_id();
-        let partition_id = partition.lock().partition_id();
+        let partition_id = partition.lock().partition_id().clone();
         let namespace_id = partition.lock().namespace_id();
         assert_matches!(partition.lock().sort_key(), SortKeyState::Provided(None));
 
@@ -337,17 +338,25 @@ mod tests {
 
         // Update the sort key in the catalog, causing the persist job to
         // discover the change during the persist.
-        catalog
+        let updated_partition = catalog
             .repositories()
             .await
             .partitions()
             .cas_sort_key(
-                partition_id,
+                &partition_id,
                 None,
-                &["bananas", "are", "good", "for", "you"],
+                // must use column names that exist in the partition data
+                &["region"],
+                // column id of region
+                &SortedColumnSet::from([2]),
             )
             .await
             .expect("failed to set catalog sort key");
+        // Test: sort_key_ids after updating
+        assert_eq!(
+            updated_partition.sort_key_ids(),
+            Some(&SortedColumnSet::from([2]))
+        );
 
         // Enqueue the persist job
         let notify = handle.enqueue(Arc::clone(&partition), data).await;
@@ -365,7 +374,7 @@ mod tests {
         assert_matches!(&completion_observer.calls().as_slice(), &[n] => {
             assert_eq!(n.namespace_id(), namespace_id);
             assert_eq!(n.table_id(), table_id);
-            assert_eq!(n.partition_id(), partition_id);
+            assert_eq!(n.partition_id(), &partition_id);
             assert_eq!(n.sequence_numbers().len(), 1);
         });
 
@@ -379,10 +388,11 @@ mod tests {
         // mark_persisted() was called.
         assert_eq!(partition.lock().completed_persistence_count(), 1);
 
-        // Assert the sort key was also updated, adding the new columns to the
+        // Assert the sort key was also updated, adding the new columns (time) to the
         // end of the concurrently updated catalog sort key.
         assert_matches!(partition.lock().sort_key(), SortKeyState::Provided(Some(p)) => {
-            assert_eq!(p.to_columns().collect::<Vec<_>>(), &["bananas", "are", "good", "for", "you", "region", "time"]);
+            // Before there is only ["region"] (manual sort key update above). Now ["region", "time"]
+            assert_eq!(p.to_columns().collect::<Vec<_>>(), &["region", "time"]);
         });
 
         // Ensure a file was made visible in the catalog
@@ -390,12 +400,12 @@ mod tests {
             .repositories()
             .await
             .parquet_files()
-            .list_by_partition_not_to_delete(partition_id)
+            .list_by_partition_not_to_delete(&partition_id)
             .await
             .expect("query for parquet files failed");
 
         // Validate a single file was inserted with the expected properties.
-        let (object_store_id, file_size_bytes) = assert_matches!(&*files, &[ParquetFile {
+        let (object_store_id, file_size_bytes) = assert_matches!(&*files, [ParquetFile {
                 namespace_id: got_namespace_id,
                 table_id: got_table_id,
                 partition_id: got_partition_id,
@@ -410,12 +420,12 @@ mod tests {
             {
                 assert_eq!(created_at.get(), max_l0_created_at.get());
 
-                assert_eq!(got_namespace_id, namespace_id);
-                assert_eq!(got_table_id, table_id);
-                assert_eq!(got_partition_id, partition_id);
+                assert_eq!(got_namespace_id, &namespace_id);
+                assert_eq!(got_table_id, &table_id);
+                assert_eq!(got_partition_id, &partition_id);
 
-                assert_eq!(row_count, 1);
-                assert_eq!(compaction_level, CompactionLevel::Initial);
+                assert_eq!(*row_count, 1);
+                assert_eq!(compaction_level, &CompactionLevel::Initial);
 
                 (object_store_id, file_size_bytes)
             }
@@ -436,13 +446,14 @@ mod tests {
         assert_eq!(files.len(), 2, "expected two uploaded files");
 
         // Ensure the catalog record points at a valid file in object storage.
-        let want_path = ParquetFilePath::new(namespace_id, table_id, partition_id, object_store_id)
-            .object_store_path();
+        let want_path =
+            ParquetFilePath::new(namespace_id, table_id, &partition_id, *object_store_id)
+                .object_store_path();
         let file = files
             .into_iter()
             .find(|f| f.location == want_path)
             .expect("did not find final file in object storage");
 
-        assert_eq!(file.size, file_size_bytes as usize);
+        assert_eq!(file.size, *file_size_bytes as usize);
     }
 }

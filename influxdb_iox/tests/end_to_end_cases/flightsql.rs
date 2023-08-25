@@ -1,8 +1,8 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::path::PathBuf;
 
 use arrow::{
     array::as_generic_binary_array,
-    datatypes::{DataType, Fields, Schema, SchemaRef, TimeUnit},
+    datatypes::{DataType, Schema, TimeUnit},
     record_batch::RecordBatch,
 };
 use arrow_flight::{
@@ -1174,15 +1174,24 @@ async fn flightsql_get_xdbc_type_info() {
             })),
             Step::Custom(Box::new(move |state: &mut StepTestState| {
                 async move {
+                    // test filter by type
                     let mut client = flightsql_client(state.cluster());
-                    // TODO chunchun: search by data_type test case
                     let data_type: Option<i32> = Some(6);
 
-                    let err = client.get_xdbc_type_info(data_type).await.unwrap_err();
+                    let stream = client.get_xdbc_type_info(data_type).await.unwrap();
+                    let batches = collect_stream(stream).await;
 
-                    assert_matches!(err, FlightError::Tonic(..));
-                    assert_contains!(err.to_string(), "GetXdbcTypeInfo does not yet support filtering by data_type");
-
+                    insta::assert_yaml_snapshot!(
+                        batches_to_sorted_lines(&batches),
+                        @r###"
+                    ---
+                    - +-----------+-----------+-------------+----------------+----------------+---------------+----------+----------------+------------+--------------------+------------------+----------------+-----------------+---------------+---------------+---------------+------------------+----------------+--------------------+
+                    - "| type_name | data_type | column_size | literal_prefix | literal_suffix | create_params | nullable | case_sensitive | searchable | unsigned_attribute | fixed_prec_scale | auto_increment | local_type_name | minimum_scale | maximum_scale | sql_data_type | datetime_subcode | num_prec_radix | interval_precision |"
+                    - +-----------+-----------+-------------+----------------+----------------+---------------+----------+----------------+------------+--------------------+------------------+----------------+-----------------+---------------+---------------+---------------+------------------+----------------+--------------------+
+                    - "| FLOAT     | 6         | 24          |                |                |               | 1        | false          | 3          | false              | false            | false          | FLOAT           |               |               | 6             |                  | 2              |                    |"
+                    - +-----------+-----------+-------------+----------------+----------------+---------------+----------+----------------+------------+--------------------+------------------+----------------+-----------------+---------------+---------------+---------------+------------------+----------------+--------------------+
+                    "###
+                    );
                 }
                 .boxed()
             })),
@@ -1234,7 +1243,7 @@ async fn flightsql_jdbc() {
                     // jdbc:arrow-flight-sql://localhost:8082?useEncryption=false&iox-namespace-name=26f7e5a4b7be365b_917b97a92e883afc
                     let jdbc_addr = querier_addr.replace("http://", "jdbc:arrow-flight-sql://");
                     let jdbc_url =
-                        format!("{jdbc_addr}?useEncryption=false&iox-namespace-name={namespace}");
+                        format!("{jdbc_addr}?useEncryption=false&iox-namespace-name={namespace}&iox-debug=true");
                     println!("jdbc_url {jdbc_url}");
                     jdbc_tests(&jdbc_url, table_name).await;
                 }
@@ -1299,7 +1308,7 @@ async fn flightsql_jdbc_authz_token() {
                     // jdbc:arrow-flight-sql://localhost:8082?useEncryption=false&iox-namespace-name=26f7e5a4b7be365b_917b97a92e883afc
                     let jdbc_addr = querier_addr.replace("http://", "jdbc:arrow-flight-sql://");
                     let jdbc_url =
-                        format!("{jdbc_addr}?useEncryption=false&iox-namespace-name={namespace}&token={token}");
+                        format!("{jdbc_addr}?useEncryption=false&iox-namespace-name={namespace}&token={token}&iox-debug=true");
                     println!("jdbc_url {jdbc_url}");
                     jdbc_tests(&jdbc_url, table_name).await;
                 }
@@ -1368,7 +1377,7 @@ async fn flightsql_jdbc_authz_handshake() {
                     // jdbc:arrow-flight-sql://localhost:8082?useEncryption=false&iox-namespace-name=26f7e5a4b7be365b_917b97a92e883afc
                     let jdbc_addr = querier_addr.replace("http://", "jdbc:arrow-flight-sql://");
                     let jdbc_url =
-                        format!("{jdbc_addr}?useEncryption=false&iox-namespace-name={namespace}&user=&password={token}");
+                        format!("{jdbc_addr}?useEncryption=false&iox-namespace-name={namespace}&user=&password={token}&iox-debug=true");
                     println!("jdbc_url {jdbc_url}");
                     jdbc_tests(&jdbc_url, table_name).await;
                 }
@@ -1526,6 +1535,7 @@ async fn flightsql_schema_matches() {
                     let cases = vec![
                         CommandStatementQuery {
                             query: format!("select * from {table_name}"),
+                            transaction_id: None,
                         }
                         .as_any(),
                         CommandGetSqlInfo { info: vec![] }.as_any(),
@@ -1591,10 +1601,7 @@ async fn assert_schema(client: &mut FlightClient, cmd: Any) {
     let mut saw_data = false;
     while let Some(batch) = result_stream.try_next().await.unwrap() {
         saw_data = true;
-        // strip metadata (GetFlightInfo doesn't include metadata for
-        // some reason) before comparison
-        // https://github.com/influxdata/influxdb_iox/issues/7282
-        let batch_schema = strip_metadata(&batch.schema());
+        let batch_schema = batch.schema();
         assert_eq!(
             batch_schema.as_ref(),
             &flight_info_schema,
@@ -1602,26 +1609,12 @@ async fn assert_schema(client: &mut FlightClient, cmd: Any) {
         );
         // The stream itself also may report a schema
         if let Some(stream_schema) = result_stream.schema() {
-            // strip metadata (GetFlightInfo doesn't include metadata for
-            // some reason) before comparison
-            // https://github.com/influxdata/influxdb_iox/issues/7282
-            let stream_schema = strip_metadata(stream_schema);
             assert_eq!(stream_schema.as_ref(), &flight_info_schema);
         }
     }
     // verify we have seen at least one RecordBatch
     // (all FlightSQL endpoints return at least one)
     assert!(saw_data);
-}
-
-fn strip_metadata(schema: &Schema) -> SchemaRef {
-    let stripped_fields: Fields = schema
-        .fields()
-        .iter()
-        .map(|f| f.as_ref().clone().with_metadata(HashMap::new()))
-        .collect();
-
-    Arc::new(Schema::new(stripped_fields))
 }
 
 #[tokio::test]
@@ -1869,6 +1862,7 @@ fn flightsql_client_helper(cluster: &MiniCluster, header_name: &str) -> FlightSq
     // Add namespace to client headers until it is fully supported by FlightSQL
     let namespace = cluster.namespace();
     client.add_header(header_name, namespace).unwrap();
+    client.add_header("iox-debug", "true").unwrap();
 
     client
 }

@@ -2,10 +2,11 @@ use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use datafusion::{
+    datasource::physical_plan::ParquetExec,
     error::DataFusionError,
     physical_plan::{
-        empty::EmptyExec, file_format::ParquetExec, union::UnionExec, visit_execution_plan,
-        ExecutionPlan, ExecutionPlanVisitor,
+        empty::EmptyExec, union::UnionExec, visit_execution_plan, ExecutionPlan,
+        ExecutionPlanVisitor,
     },
 };
 use observability_deps::tracing::debug;
@@ -166,9 +167,7 @@ impl ExecutionPlanVisitor for ExtractChunksVisitor {
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        provider::chunks_to_physical_nodes, test::TestChunk, util::df_physical_expr, QueryChunkMeta,
-    };
+    use crate::{provider::chunks_to_physical_nodes, test::TestChunk, util::df_physical_expr};
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use data_types::ChunkId;
     use datafusion::{

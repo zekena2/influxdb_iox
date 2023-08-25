@@ -1,17 +1,20 @@
-crate::maybe_pub!(
-    pub use super::wal_replay::*;
-);
+use gossip::{GossipHandle, NopDispatcher, TopicInterests};
+
+/// This needs to be pub for the benchmarks but should not be used outside the crate.
+#[cfg(feature = "benches")]
+pub use wal_replay::*;
 
 mod graceful_shutdown;
 mod wal_replay;
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use arrow_flight::flight_service_server::FlightService;
 use backoff::BackoffConfig;
 use futures::{future::Shared, Future, FutureExt};
 use generated_types::influxdata::iox::{
     catalog::v1::catalog_service_server::CatalogService,
+    gossip::Topic,
     ingester::v1::{persist_service_server::PersistService, write_service_server::WriteService},
 };
 use iox_catalog::interface::Catalog;
@@ -21,23 +24,25 @@ use parquet_file::storage::ParquetStorage;
 use thiserror::Error;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
+use tracker::DiskSpaceMetrics;
 use wal::Wal;
 
 use crate::{
     buffer_tree::{
         namespace::name_resolver::{NamespaceNameProvider, NamespaceNameResolver},
         partition::resolver::{
-            CatalogPartitionResolver, CoalescePartitionResolver, PartitionCache, PartitionProvider,
+            CatalogPartitionResolver, CoalescePartitionResolver, OldPartitionBloomFilter,
+            PartitionCache, PartitionProvider,
         },
-        table::name_resolver::{TableNameProvider, TableNameResolver},
+        table::metadata_resolver::{TableProvider, TableResolver},
         BufferTree,
     },
     dml_sink::{instrumentation::DmlSinkInstrumentation, tracing::DmlSinkTracing},
     ingest_state::IngestState,
     ingester_id::IngesterId,
     persist::{
-        completion_observer::NopObserver, file_metrics::ParquetFileInstrumentation,
-        handle::PersistHandle, hot_partitions::HotPartitionPersister,
+        file_metrics::ParquetFileInstrumentation, handle::PersistHandle,
+        hot_partitions::HotPartitionPersister,
     },
     query::{
         exec_instrumentation::QueryExecInstrumentation,
@@ -45,7 +50,9 @@ use crate::{
     },
     server::grpc::GrpcDelegate,
     timestamp_oracle::TimestampOracle,
-    wal::{rotate_task::periodic_rotation, wal_sink::WalSink},
+    wal::{
+        reference_tracker::WalReferenceHandle, rotate_task::periodic_rotation, wal_sink::WalSink,
+    },
 };
 
 use self::graceful_shutdown::graceful_shutdown_handler;
@@ -98,9 +105,17 @@ pub struct IngesterGuard<T> {
     /// Aborted on drop.
     rotation_task: tokio::task::JoinHandle<()>,
 
+    /// The handle of the periodic disk metric task.
+    ///
+    /// Aborted on drop.
+    disk_metric_task: tokio::task::JoinHandle<()>,
+
     /// The task handle executing the graceful shutdown once triggered.
     graceful_shutdown_handler: tokio::task::JoinHandle<()>,
     shutdown_complete: Shared<oneshot::Receiver<()>>,
+
+    /// An optional handle to the gossip sub-system, if running.
+    gossip_handle: Option<GossipHandle>,
 }
 
 impl<T> IngesterGuard<T>
@@ -124,8 +139,30 @@ where
 impl<T> Drop for IngesterGuard<T> {
     fn drop(&mut self) {
         self.rotation_task.abort();
+        self.disk_metric_task.abort();
         self.graceful_shutdown_handler.abort();
     }
+}
+
+/// Configuration parameters for the optional gossip sub-system.
+#[derive(Debug, Default)]
+pub enum GossipConfig {
+    /// Disable the gossip sub-system.
+    #[default]
+    Disabled,
+
+    /// Enable the gossip sub-system, listening on the specified `bind_addr` and
+    /// using `peers` as the initial peer seed list.
+    Enabled {
+        /// UDP socket address to use for gossip communication.
+        bind_addr: SocketAddr,
+        /// Initial peer seed list in the form of either:
+        ///
+        ///   - "dns.address.example:port"
+        ///   - "10.0.0.1:port"
+        ///
+        peers: Vec<String>,
+    },
 }
 
 /// Errors that occur during initialisation of an `ingester` instance.
@@ -136,6 +173,10 @@ pub enum InitError {
     #[error("failed to pre-warm partition cache: {0}")]
     PreWarmPartitions(iox_catalog::interface::Error),
 
+    /// A catalog error occurred while fetching the old-style partitions for the bloom filter.
+    #[error("failed to fetch old-style partitions: {0}")]
+    FetchOldStylePartitions(iox_catalog::interface::Error),
+
     /// An error initialising the WAL.
     #[error("failed to initialise write-ahead log: {0}")]
     WalInit(#[from] wal::Error),
@@ -143,6 +184,10 @@ pub enum InitError {
     /// An error replaying the entries in the WAL.
     #[error(transparent)]
     WalReplay(Box<dyn std::error::Error>),
+
+    /// An error binding the UDP socket for gossip communication.
+    #[error("failed to bind udp gossip socket: {0}")]
+    GossipBind(std::io::Error),
 }
 
 /// Initialise a new `ingester` instance, returning the gRPC service handler
@@ -229,6 +274,7 @@ pub async fn new<F>(
     persist_queue_depth: usize,
     persist_hot_partition_cost: usize,
     object_store: ParquetStorage,
+    gossip: GossipConfig,
     shutdown: F,
 ) -> Result<IngesterGuard<impl IngesterRpcInterface>, InitError>
 where
@@ -243,13 +289,15 @@ where
             persist_background_fetch_time,
             Arc::clone(&catalog),
             BackoffConfig::default(),
+            Arc::clone(&metrics),
         ));
 
-    // Initialise the deferred table name resolver.
-    let table_name_provider: Arc<dyn TableNameProvider> = Arc::new(TableNameResolver::new(
+    // Initialise the deferred table metadata resolver.
+    let table_provider: Arc<dyn TableProvider> = Arc::new(TableResolver::new(
         persist_background_fetch_time,
         Arc::clone(&catalog),
         BackoffConfig::default(),
+        Arc::clone(&metrics),
     ));
 
     // Read the most recently created partitions.
@@ -265,16 +313,35 @@ where
         .await
         .map_err(InitError::PreWarmPartitions)?;
 
-    // Build the partition provider, wrapped in the partition cache and request
-    // coalescer.
+    // Fetch all the currently-existing old-style partitions to be put into a bloom filter that
+    // determines if we need to resolve a partition (potentially making a catalog query) or not.
+    let old_style = catalog
+        .repositories()
+        .await
+        .partitions()
+        .list_old_style()
+        .await
+        .map_err(InitError::FetchOldStylePartitions)?;
+
+    // Build the partition provider, wrapped in the old partition bloom filter, partition cache,
+    // and request coalescer.
     let partition_provider = CatalogPartitionResolver::new(Arc::clone(&catalog));
     let partition_provider = CoalescePartitionResolver::new(Arc::new(partition_provider));
+    let partition_provider = OldPartitionBloomFilter::new(
+        partition_provider,
+        Arc::clone(&catalog),
+        BackoffConfig::default(),
+        persist_background_fetch_time,
+        Arc::clone(&metrics),
+        old_style,
+    );
     let partition_provider = PartitionCache::new(
         partition_provider,
         recent_partitions,
         persist_background_fetch_time,
         Arc::clone(&catalog),
         BackoffConfig::default(),
+        Arc::clone(&metrics),
     );
     let partition_provider: Arc<dyn PartitionProvider> = Arc::new(partition_provider);
 
@@ -282,6 +349,15 @@ where
     // between subsystems such that they cause an error to be returned in the
     // write path.
     let ingest_state = Arc::new(IngestState::default());
+
+    // Initialise the WAL
+    let wal = Wal::new(wal_directory.clone())
+        .await
+        .map_err(InitError::WalInit)?;
+
+    // Prepare the WAL segment reference tracker
+    let (wal_reference_handle, wal_reference_actor) =
+        WalReferenceHandle::new(Arc::clone(&wal), &metrics);
 
     // Spawn the persist workers to compact partition data, convert it into
     // Parquet files, and upload them to object storage.
@@ -293,8 +369,9 @@ where
         object_store,
         Arc::clone(&catalog),
         // Register a post-persistence observer that emits Parquet file
-        // attributes as metrics.
-        ParquetFileInstrumentation::new(NopObserver::default(), &metrics),
+        // attributes as metrics, and notifies the WAL segment reference tracker of
+        // completed persist actions.
+        ParquetFileInstrumentation::new(wal_reference_handle.clone(), &metrics),
         &metrics,
     );
     let persist_handle = Arc::new(persist_handle);
@@ -316,14 +393,22 @@ where
 
     let buffer = Arc::new(BufferTree::new(
         namespace_name_provider,
-        table_name_provider,
+        table_provider,
         partition_provider,
         Arc::new(hot_partition_persister),
         Arc::clone(&metrics),
     ));
 
-    // Initialise the WAL
-    let wal = Wal::new(wal_directory).await.map_err(InitError::WalInit)?;
+    // Start the WAL reference actor and then replay the WAL log files, if any.
+    // The tokio handle does not need retained here as the actor handle is
+    // responsible for aborting the actor's run loop when dropped.
+    tokio::spawn(wal_reference_actor.run());
+
+    // Initialize disk metrics to emit disk capacity / free statistics for the
+    // WAL directory.
+    let (disk_metric_task, _snapshot_rx) = DiskSpaceMetrics::new(wal_directory, &metrics)
+        .expect("failed to resolve WAL directory to disk");
+    let disk_metric_task = tokio::task::spawn(disk_metric_task.run());
 
     // Replay the WAL log files, if any.
     let max_sequence_number =
@@ -343,6 +428,7 @@ where
                         &metrics,
                     ),
                     Arc::clone(&wal),
+                    wal_reference_handle.clone(),
                 ),
                 "wal",
             ),
@@ -363,6 +449,7 @@ where
     let rotation_task = tokio::spawn(periodic_rotation(
         Arc::clone(&wal),
         wal_rotation_period,
+        wal_reference_handle.clone(),
         Arc::clone(&buffer),
         Arc::clone(&persist_handle),
     ));
@@ -374,9 +461,7 @@ where
     // ingester, but they are only used for internal ordering of operations at
     // runtime.
     let timestamp = Arc::new(TimestampOracle::new(
-        max_sequence_number
-            .map(|v| u64::try_from(v.get()).expect("sequence number overflow"))
-            .unwrap_or(0),
+        max_sequence_number.map(|v| v.get()).unwrap_or(0),
     ));
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -386,8 +471,32 @@ where
         Arc::clone(&ingest_state),
         Arc::clone(&buffer),
         Arc::clone(&persist_handle),
-        wal,
+        Arc::clone(&wal),
+        wal_reference_handle,
     ));
+
+    // Optionally start the gossip subsystem
+    let gossip_handle = match gossip {
+        GossipConfig::Disabled => {
+            info!("gossip disabled");
+            None
+        }
+        GossipConfig::Enabled { bind_addr, peers } => {
+            // Start the gossip sub-system, which logs during init.
+            let handle = gossip::Builder::<_, Topic>::new(
+                peers,
+                NopDispatcher::default(),
+                Arc::clone(&metrics),
+            )
+            // Configure the ingester to ignore all user payloads, only acting
+            // as a gossip peer exchange.
+            .with_topic_filter(TopicInterests::default())
+            .bind(bind_addr)
+            .await
+            .map_err(InitError::GossipBind)?;
+            Some(handle)
+        }
+    };
 
     Ok(IngesterGuard {
         rpc: GrpcDelegate::new(
@@ -402,7 +511,9 @@ where
             persist_handle,
         ),
         rotation_task,
+        disk_metric_task,
         graceful_shutdown_handler: shutdown_task,
         shutdown_complete: shutdown_rx.shared(),
+        gossip_handle,
     })
 }
