@@ -1,49 +1,63 @@
-//! A deserialiser and dispatcher of [`gossip`] messages.
+//! A deserialiser and dispatcher of [gossip] messages for the
+//! [`Topic::NewParquetFiles`] topic.
 
-use std::fmt::Debug;
+use std::{fmt::Debug, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use generated_types::influxdata::iox::gossip::{
-    v1::{schema_message::Event, SchemaMessage},
-    Topic,
+use generated_types::influxdata::iox::{
+    catalog::v1::ParquetFile,
+    gossip::{v1::NewParquetFile, Topic},
 };
 use generated_types::prost::Message;
 use observability_deps::tracing::{info, warn};
 use tokio::{sync::mpsc, task::JoinHandle};
 
-/// A handler of [`Event`] received via gossip.
+/// A [`ParquetFile`] notification handler received via gossip.
 #[async_trait]
-pub trait GossipMessageHandler: Send + Sync + Debug {
+pub trait ParquetFileEventHandler: Send + Sync + Debug {
     /// Process `message`.
-    async fn handle(&self, message: Event);
+    async fn handle(&self, event: ParquetFile);
+}
+
+#[async_trait]
+impl<T> ParquetFileEventHandler for Arc<T>
+where
+    T: ParquetFileEventHandler,
+{
+    async fn handle(&self, event: ParquetFile) {
+        T::handle(self, event).await
+    }
 }
 
 /// An async gossip message dispatcher.
 ///
-/// This type is responsible for deserialising incoming gossip payloads and
-/// passing them off to the provided [`GossipMessageHandler`] implementation.
+/// This type is responsible for deserialising incoming gossip
+/// [`Topic::NewParquetFiles`] payloads and passing them off to the provided
+/// [`ParquetFileEventHandler`] implementation.
+///
 /// This decoupling allow the handler to deal strictly in terms of messages,
 /// abstracting it from the underlying message transport / format.
 ///
-/// This type provides a buffer between incoming events, and processing,
+/// This type also provides a buffer between incoming events, and processing,
 /// preventing processing time from blocking the gossip reactor. Once the buffer
 /// is full, incoming events are dropped until space is made through processing
-/// of outstanding events.
+/// of outstanding events. Dropping the [`ParquetFileRx`] stops the background
+/// event loop.
 #[derive(Debug)]
-pub struct GossipMessageDispatcher {
+pub struct ParquetFileRx {
     tx: mpsc::Sender<Bytes>,
     task: JoinHandle<()>,
 }
 
-impl GossipMessageDispatcher {
+impl ParquetFileRx {
     /// Initialise a new dispatcher, buffering up to `buffer` number of events.
     ///
     /// The provided `handler` does not block the gossip reactor during
     /// execution.
     pub fn new<T>(handler: T, buffer: usize) -> Self
     where
-        T: GossipMessageHandler + 'static,
+        T: ParquetFileEventHandler + 'static,
     {
         // Initialise a buffered channel to decouple the two halves.
         let (tx, rx) = mpsc::channel(buffer);
@@ -56,9 +70,9 @@ impl GossipMessageDispatcher {
 }
 
 #[async_trait]
-impl gossip::Dispatcher<Topic> for GossipMessageDispatcher {
+impl gossip::Dispatcher<Topic> for ParquetFileRx {
     async fn dispatch(&self, topic: Topic, payload: Bytes) {
-        if topic != Topic::SchemaChanges {
+        if topic != Topic::NewParquetFiles {
             return;
         }
         if let Err(e) = self.tx.try_send(payload) {
@@ -67,7 +81,7 @@ impl gossip::Dispatcher<Topic> for GossipMessageDispatcher {
     }
 }
 
-impl Drop for GossipMessageDispatcher {
+impl Drop for ParquetFileRx {
     fn drop(&mut self) {
         self.task.abort();
     }
@@ -75,11 +89,11 @@ impl Drop for GossipMessageDispatcher {
 
 async fn dispatch_loop<T>(mut rx: mpsc::Receiver<Bytes>, handler: T)
 where
-    T: GossipMessageHandler,
+    T: ParquetFileEventHandler,
 {
     while let Some(payload) = rx.recv().await {
         // Deserialise the payload into the appropriate proto type.
-        let event = match SchemaMessage::decode(payload).map(|v| v.event) {
+        let event = match NewParquetFile::decode(payload).map(|v| v.file) {
             Ok(Some(v)) => v,
             Ok(None) => {
                 warn!("valid frame contains no message");
